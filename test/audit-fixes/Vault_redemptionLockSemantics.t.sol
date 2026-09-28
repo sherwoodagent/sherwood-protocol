@@ -58,6 +58,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
         // factory.governor() returns the mock governor address.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         // Default: no active proposal anywhere — deposits/withdraws unlocked.

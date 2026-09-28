@@ -63,11 +63,11 @@ The governor SHALL bind at most one non-terminal proposal lifecycle to its vault
 - **THEN** that proposal's settlement SHALL use the rates and recipients snapshotted at propose time, not the changed values
 
 ### Requirement: Voting timeline and vote snapshot
-A non-collaborative proposal SHALL enter `Pending` immediately at propose; a collaborative proposal enters `Pending` on the final co-proposer approval. On entering Pending the governor SHALL set: `snapshotTimestamp = block.timestamp - 1` (closing the same-block flash-delegate window), `voteEnd = now + votingPeriod`, `reviewEnd = voteEnd + reviewPeriod` (read from the guardian registry), and `executeBy = reviewEnd + executionWindow`. When `reviewEnd > voteEnd` the governor SHALL push the review window to the guardian registry via `registerReview` under exactly that predicate; a collapsed window (`reviewPeriod == 0`) is treated as no review configured.
+A non-collaborative proposal SHALL enter `Pending` immediately at propose; a collaborative proposal enters `Pending` on the final co-proposer approval. On entering Pending the governor SHALL set: `snapshotTimestamp = block.timestamp - 1` (closing the same-block acquisition window), `votableSupply` (below), `voteEnd = now + votingPeriod`, `reviewEnd = voteEnd + reviewPeriod` (read from the guardian registry), and `executeBy = reviewEnd + executionWindow`. When `reviewEnd > voteEnd` the governor SHALL push the review window to the guardian registry via `registerReview` under exactly that predicate; a collapsed window (`reviewPeriod == 0`) is treated as no review configured.
 
 #### Scenario: Vote weight from checkpointed shares
 - **WHEN** a shareholder votes on a Pending proposal
-- **THEN** their vote weight SHALL be `getPastVotes(voter, snapshotTimestamp)` from the vault's ERC20Votes checkpoints, and a zero weight SHALL revert with `NoVotingPower`
+- **THEN** their vote weight SHALL be the lesser of `getPastVotes(voter, snapshotTimestamp)` and `getPastVotes(voter, snapshotTimestamp + 1)` (the end of the propose second), so shares redeemed ahead of `propose` in its second carry no weight; a vote inside the propose second SHALL revert with `NotWithinVotingPeriod`, and a zero weight SHALL revert with `NoVotingPower`
 
 #### Scenario: One vote per address
 - **WHEN** an address that has already voted on a proposal votes again
@@ -78,14 +78,18 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 - **THEN** the call SHALL revert with `NotWithinVotingPeriod`
 
 ### Requirement: Optimistic passage with veto threshold
-The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= pastTotalSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `pastTotalSupply` is the vault supply at `snapshotTimestamp`. When `pastTotalSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
+The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= votableSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `votableSupply` is the electorate recorded on entering Pending. On BOTH paths `votableSupply` SHALL be `min(snapshotSupply - snapshotQueued, liveSupply - min(snapshotQueued, liveQueued))`, where `snapshotSupply = getPastTotalSupply(snapshotTimestamp)`, `snapshotQueued = getPastVotes(withdrawalQueue, snapshotTimestamp)`, `liveSupply = totalSupply()` and `liveQueued = balanceOf(withdrawalQueue)`, every subtraction clamped at zero and both queue terms skipped when no queue is wired. The snapshot electorate is clamped at the live one, so the recorded electorate SHALL NEVER exceed the unqueued shares still in the vault, while the live queue term capped at the snapshot's keeps an escrow made after `snapshotTimestamp` from shrinking the bar. A holder who acquires shares in the propose block is outside both the electorate and the vote; a holder who exits in the propose block keeps its snapshot vote weight but leaves the electorate. When `votableSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
 
 #### Scenario: Veto threshold reached
-- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of past total supply
+- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of the recorded `votableSupply`
 - **THEN** the proposal SHALL resolve to `Rejected` without traversing guardian review, and no registry economic commit SHALL fire for it
 
+#### Scenario: Share flow in the propose block never inflates the veto bar
+- **WHEN** a deposit or an instant redeem is ordered ahead of `propose` in the same block
+- **THEN** the recorded `votableSupply` SHALL NOT exceed the live unqueued supply — the deposit is outside both the electorate and the vote, and the exit leaves the electorate even though its snapshot weight can still be cast
+
 #### Scenario: Silence passes the vote
-- **WHEN** voting ends with zero votes cast and a nonzero past total supply
+- **WHEN** voting ends with zero votes cast and a nonzero `votableSupply`
 - **THEN** the proposal SHALL proceed to `GuardianReview` (or directly toward Approved if no review window is configured)
 
 ### Requirement: Guardian review gate and economic commit
@@ -136,6 +140,10 @@ After a passed vote the proposal SHALL sit in `GuardianReview` until `reviewEnd`
 #### Scenario: Interim LP flow excluded from P&L
 - **WHEN** depositors add or remove principal while a strategy is live
 - **THEN** the settlement P&L SHALL exclude that interim net flow, so fees are charged only on strategy performance
+
+#### Scenario: Settlement leg that does not unwind the strategy
+- **WHEN** the settlement calls leave the proposal's strategy answering `executed() == true`
+- **THEN** `settleProposal` and `unstick` SHALL revert with `StrategyNotSettled`; only the guardian-reviewed, owner-bonded `finalizeEmergencySettle` MAY close the proposal with the strategy still executed
 
 ### Requirement: Fee distribution waterfall
 On a positive P&L, unless the proposal's snapshotted `selfManagesFees` flag is true (which skips the entire governor fee waterfall), the governor SHALL distribute, in order: (1) protocol fee = gross profit × snapshotted `protocolFeeBps` to the snapshotted protocol recipient; (2) guardian fee = gross profit × snapshotted `guardianFeeBps` to the snapshotted guardians recipient, emitting `GuardianFeeAccrued` only when the transfer actually delivers; (3) agent performance fee = net profit × the propose-time performance fee, re-clamped at settle to the live `maxPerformanceFeeBps` (emitting `FeeClamped` when the clamp fires), split across active co-proposers by their `splitBps` with the remainder to the lead proposer; (4) management fee = remaining net × the vault's live `managementFeeBps` to the vault owner. Any individual fee transfer that reverts (e.g. a blacklisted recipient) SHALL be escrowed against `(vault, recipient, token)` instead of reverting settlement, emitting `FeeTransferFailed`; recipients pull escrowed amounts later via `claimUnclaimedFees`, which SHALL zero the escrow slot before transferring and only pay from the vault that owes it.
@@ -259,7 +267,7 @@ Every per-vault governor SHALL be deployed as a `BeaconProxy` reading its implem
 - **THEN** the call SHALL revert
 
 ### Requirement: Factory creation of syndicates
-`SyndicateFactory.createSyndicate(creatorAgentId, config)` SHALL, in one transaction: validate the config (non-zero asset, non-empty name/symbol/metadataURI, subdomain of at least 3 characters not already taken); require the creator to have a prepared owner stake in sWOOD (`canCreateVault`); collect the creation fee if configured; verify the creator owns the ERC-8004 agent identity when an agent registry is configured; deploy the vault as an immutable `ERC1967Proxy` plus its withdrawal queue; deploy the per-vault governor as a `BeaconProxy` initialized with the vault, guardian registry, protocol config, factory address, and the factory's default governor parameters; record the vault-to-governor mapping (the sole vault↔governor wiring); authorize the governor on the guardian registry via `addGovernor`; push the factory's current tier registry, exposure ledger, and bond escrow into the fresh governor, skipping unset slots rather than writing zero; and bind the creator's prepared owner stake to the vault atomically. ENS subname registration SHALL be best-effort: any registrar failure (including a reverting `available()` view) SHALL emit `EnsRegistrationFailed` and never revert the creation; the subdomain-to-syndicate mapping is written unconditionally as the logical name reservation.
+`SyndicateFactory.createSyndicate(creatorAgentId, config)` SHALL, in one transaction: validate the config (non-zero asset, non-empty name/symbol/metadataURI, subdomain of at least 3 characters not already taken); require the creator to have a prepared owner stake in sWOOD (`canCreateVault`); collect the creation fee if configured, unless the factory owner has sponsored the caller (`setCreationSponsored`), in which case the single-use credit is consumed and no fee is transferred; verify the creator owns the ERC-8004 agent identity when an agent registry is configured; deploy the vault as an immutable `ERC1967Proxy` plus its withdrawal queue; deploy the per-vault governor as a `BeaconProxy` initialized with the vault, guardian registry, protocol config, factory address, and the factory's default governor parameters; record the vault-to-governor mapping (the sole vault↔governor wiring); authorize the governor on the guardian registry via `addGovernor`; push the factory's current tier registry, exposure ledger, and bond escrow into the fresh governor, skipping unset slots rather than writing zero; and bind the creator's prepared owner stake to the vault atomically. The factory SHALL NOT register ENS subnames; the subdomain-to-syndicate mapping is the syndicate's logical name reservation.
 
 #### Scenario: Creation without prepared stake rejected
 - **WHEN** a caller without a prepared owner stake calls `createSyndicate`
@@ -269,13 +277,13 @@ Every per-vault governor SHALL be deployed as a `BeaconProxy` reading its implem
 - **WHEN** a syndicate is created
 - **THEN** its governor SHALL initialize with the factory defaults (votingPeriod 24h, executionWindow 24h, vetoThresholdBps 2_000, maxPerformanceFeeBps 2_000 (`FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS`), cooldownPeriod 1h, collaborationWindow 24h, maxCoProposers 10, strategyDuration bounds [1h, 30d]), all within the governor's own bounds validation
 
-#### Scenario: ENS failure does not brick creation
-- **WHEN** the ENS registrar is paused, faults, or the label was front-run
-- **THEN** the syndicate SHALL still be created fully operational and `EnsRegistrationFailed` SHALL be emitted for out-of-band retry
-
 #### Scenario: Duplicate subdomain rejected
 - **WHEN** `config.subdomain` already maps to an existing syndicate
 - **THEN** the call SHALL revert with `SubdomainTaken`
+
+#### Scenario: Sponsored creation waives one fee
+- **WHEN** the factory owner has called `setCreationSponsored(creator, true)` and a creation fee is configured
+- **THEN** `creator`'s next `createSyndicate` SHALL transfer no fee and clear the credit, and any later creation by `creator` SHALL pay the fee; a credit SHALL waive nothing for any other caller
 
 ### Requirement: Factory lifecycle-gated administration
 The factory SHALL gate structural changes on the governor's lifecycle state. `rotateOwner(vault, newOwner)` SHALL require the caller to be the current vault owner or the original creator, the old owner stake to be fully withdrawn, both `getActiveProposal() == 0` and `openProposalCount() == 0`, and the incoming owner's prior vault-specific consent to the stake binding (recorded on sWOOD by `newOwner` via `approveOwnerStakeBinding(vault)` — adversary: a current owner of an empty-slot vault must not be able to spend a third party's escrowed prepared stake by rotating the vault onto them); it SHALL transfer vault ownership, rebind the owner-stake slot on sWOOD (consuming the consent), and update the creator record. The signature and single-call semantics of `rotateOwner` SHALL be unchanged — consent is enforced at the sWOOD spend site, not by a new factory entrypoint. `upgradeVault(vault, expectedImpl)` SHALL require upgrades enabled, the caller to be the creator, `vaultImpl == expectedImpl` (so a factory-owner impl swap cannot land an implementation the creator did not opt into), and the same two lifecycle gates. `pushWiring(governor)` SHALL be factory-owner-only, SHALL verify the target is a governor this factory deployed (via the unforgeable `governor.vault()` → `governorOf` round-trip), and SHALL push only the factory's currently-set tier registry / exposure ledger / bond escrow — never writing zero, so wiring can be added but never silently removed. `setGuardianRegistry` SHALL fail-closed unless the new registry advertises this factory (or address(0) for a stateless stub).

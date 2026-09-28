@@ -112,6 +112,7 @@ contract SyndicateGovernorTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
@@ -397,23 +398,20 @@ contract SyndicateGovernorTest is Test {
         assertEq(p.snapshotTimestamp, tsBefore - 1);
     }
 
-    /// @notice G-C1: a delegation that lands in the same block as propose()
-    ///         must NOT count toward voting weight. Exercises the full path
-    ///         via governor.vote(): the voter holds shares but only delegates
-    ///         in the propose block, so getPastVotes at snapshotTimestamp
-    ///         (= block.timestamp - 1) returns 0 and the vote reverts as
-    ///         NoVotingPower.
+    /// @notice G-C1: a delegation checkpoint that lands in the same block as
+    ///         propose() must NOT count toward voting weight. Exercises the full
+    ///         path via governor.vote(): flashVoter's shares -- and with them the
+    ///         vault's auto-self-delegation -- arrive in the propose block, so
+    ///         getPastVotes at snapshotTimestamp (= block.timestamp - 1) returns 0
+    ///         and the vote reverts as NoVotingPower.
     function test_flashDelegate_sameBlock_notCounted() public {
         address flashVoter = makeAddr("flashVoter");
 
-        // flashVoter receives shares via transfer so auto-delegation in
-        // _deposit() does not fire -- delegates(flashVoter) stays at zero.
+        // Same block as propose. The transfer writes flashVoter's first delegation
+        // checkpoint: _update self-delegates any delegate-less receiver. Receipt is
+        // the only way in -- the vault refuses an explicit delegate().
         vm.prank(lp1);
         vault.transfer(flashVoter, 10_000e6);
-
-        // Same block: flashVoter delegates to self AND agent proposes.
-        vm.prank(flashVoter);
-        vault.delegate(flashVoter);
 
         vm.prank(agent);
         uint256 proposalId = governor.propose(
@@ -429,9 +427,10 @@ contract SyndicateGovernorTest is Test {
             _emptyCoProposers()
         );
 
-        // Snapshot is block.timestamp - 1; delegation checkpoint was written
+        // Snapshot is block.timestamp - 1; the delegation checkpoint was written
         // at block.timestamp, so getPastVotes returns 0 and vote() reverts.
         vm.prank(flashVoter);
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
     }
@@ -782,8 +781,8 @@ contract SyndicateGovernorTest is Test {
     /// @notice A settle driven from inside a flash loan that empties Morpho's
     ///         idle balance cannot freeze a depressed price: the strategy is
     ///         all-or-revert (SHE-255) so nothing is delivered partially, and a
-    ///         strategy that delivers nothing still meets the price floor. The
-    ///         honest retry after the frame settles at par.
+    ///         leg that never unwinds the strategy is refused. The honest retry
+    ///         after the frame settles at par.
     function test_flashLoanedSettleRevertsInsteadOfFreezingADepressedPrice() public {
         MockIrm irm = new MockIrm();
         MockMorpho morpho = new MockMorpho();
@@ -844,13 +843,14 @@ contract SyndicateGovernorTest is Test {
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
 
-        // Frame 2: a strategy that delivers NOTHING (the pre-SHE-255 clamp
-        // shape) is stopped by the price floor alone.
+        // Frame 2: a leg whose `settle()` delivers NOTHING (the pre-SHE-255 clamp
+        // shape) leaves the strategy Executed and is refused before the price floor.
         vm.mockCall(address(strat), abi.encodeCall(strat.settle, ()), "");
-        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, address(strat)));
         governor.settleProposal(pid);
         vm.clearMockedCalls(); // also drops setUp's `governorOf` mock; re-arm it
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
 
         // The frame ends and the honest retry settles at par.

@@ -40,6 +40,11 @@ contract FizzFactory {
         return _governorOf[vault];
     }
 
+    /// @notice The factory-wide deposit restriction the vault reads; never set here.
+    function depositsRestricted() external pure returns (bool) {
+        return false;
+    }
+
     /// @notice Forward an arbitrary call so factory-gated setters
     ///         (`setWithdrawalQueue`, `SyndicateGovernor.set*`,
     ///         `GuardianRegistry.addGovernor`) run with this contract as

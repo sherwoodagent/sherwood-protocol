@@ -3,89 +3,47 @@ pragma solidity 0.8.28;
 
 import {console} from "forge-std/Script.sol";
 import {ScriptBase} from "../ScriptBase.sol";
+import {DeploySalts} from "../DeploySalts.sol";
+import {Create3Factory} from "../utils/Create3Factory.sol";
+import {Inputs, Stack} from "./DeployTypes.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {UniswapSwapAdapter} from "../../src/adapters/UniswapSwapAdapter.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 
-/**
- * @notice Deploy the UniswapSwapAdapter + PortfolioStrategy template to Robinhood
- *         Chain mainnet (chain 4663).
- *
- *         Uses the official Uniswap v3 deployment (SwapRouter02 + QuoterV2) plus
- *         the Uniswap v4 PoolManager + V4Quoter (mode-2 hookless pools carry the
- *         tokenized-stock liquidity). Addresses are read from chains/4663.json.
- *
- *   Prerequisites:
- *     - Core stack already deployed via Deploy.s.sol.
- *     - chains/4663.json seeded with UNISWAP_SWAP_ROUTER + UNISWAP_QUOTER_V2 +
- *       UNISWAP_V4_POOL_MANAGER + UNISWAP_V4_QUOTER.
- *
- *   Usage:
- *     forge script script/robinhood-mainnet/DeployPortfolioStrategy.s.sol:DeployPortfolioStrategy \
- *       --rpc-url robinhood --account sherwood-deployer --broadcast
- */
-contract DeployPortfolioStrategy is ScriptBase {
-    function run() external {
-        // Accept Robinhood mainnet (4663) OR a Tenderly-fork chain id via
-        // ROBINHOOD_FORK_CHAIN_ID so the byte-same phase runs against the fork.
-        uint256 forkChainId = vm.envOr("ROBINHOOD_FORK_CHAIN_ID", uint256(0));
-        require(
-            block.chainid == 4663 || (forkChainId != 0 && block.chainid == forkChainId),
-            "wrong chain: expected Robinhood mainnet 4663 or ROBINHOOD_FORK_CHAIN_ID"
+/// @notice UniswapSwapAdapter + PortfolioStrategy template phase.
+///         An abstract mixin — `DeployAll` owns `run()`, the broadcast and the address book.
+///         Uniswap v3 (SwapRouter02 + QuoterV2) plus the v4 PoolManager + V4Quoter, which
+///         is where the tokenized-stock liquidity sits on 4663.
+abstract contract DeployPortfolioStrategy is ScriptBase {
+    function _deployPortfolio(Stack memory s, Inputs memory i) internal {
+        Create3Factory c3 = Create3Factory(s.create3Factory);
+
+        s.uniswapSwapAdapter = _c3(
+            c3,
+            DeploySalts.UNISWAP_SWAP_ADAPTER,
+            abi.encodePacked(
+                type(UniswapSwapAdapter).creationCode,
+                abi.encode(i.uniswapSwapRouter, i.uniswapQuoterV2, i.uniswapV4PoolManager, i.uniswapV4Quoter)
+            )
         );
+        s.portfolioTemplate = _c3(c3, DeploySalts.PORTFOLIO_TEMPLATE, type(PortfolioStrategy).creationCode);
 
-        address swapRouter = _readAddress("UNISWAP_SWAP_ROUTER");
-        address quoterV2 = _readAddress("UNISWAP_QUOTER_V2");
-        address v4PoolManager = _readAddress("UNISWAP_V4_POOL_MANAGER");
-        address v4Quoter = _readAddress("UNISWAP_V4_QUOTER");
-
-        vm.startBroadcast();
-        address deployer = msg.sender;
-        console.log("Deployer:", deployer);
-        console.log("Network: Robinhood Chain (chain ID 4663)");
-
-        UniswapSwapAdapter adapter = new UniswapSwapAdapter(swapRouter, quoterV2, v4PoolManager, v4Quoter);
-        PortfolioStrategy template = new PortfolioStrategy();
-
-        _attestAdapter(deployer, address(adapter));
-
-        vm.stopBroadcast();
-
-        _patchAddress("UNISWAP_SWAP_ADAPTER", address(adapter));
-        // PORTFOLIO_TEMPLATE (not the testnet-era PORTFOLIO_STRATEGY key) so
-        // DeployStrategyFactory._templateKeys() picks it up for approval.
-        _patchAddress("PORTFOLIO_TEMPLATE", address(template));
-
-        console.log("UniswapSwapAdapter:", address(adapter));
-        console.log("PortfolioStrategy template:", address(template));
+        _attestAdapter(s.core.deployer, s.core.tierRegistry, s.uniswapSwapAdapter);
+        console.log("UniswapSwapAdapter:", s.uniswapSwapAdapter);
+        console.log("PortfolioStrategy template:", s.portfolioTemplate);
     }
 
-    /// @dev Attest the adapter this script just minted, in the same broadcast.
-    ///
-    ///      `PortfolioStrategy._initialize` binds the swap adapter through
-    ///      `isCounterpartyAllowed`, so an unattested adapter makes the template
-    ///      INERT: the failure surfaces a governance cycle later at clone-init.
-    ///
-    ///      This address cannot be seeded by `Deploy.s.sol` because it does not
-    ///      exist until this phase runs. `TierRegistry` is `Ownable2Step`, so
-    ///      the core deploy's `transferOwnership` only ARMED the handoff —
-    ///      the deployer is still owner until the multisig calls
-    ///      `acceptOwnership()`, which is the window this writes in. Run the
-    ///      strategy phases BEFORE that acceptance; afterwards this degrades to
-    ///      a runbook line and the multisig owes one transaction per adapter.
-    function _attestAdapter(address deployer, address adapter) internal {
-        address registry = _optionalAddress("TIER_REGISTRY");
-        if (registry == address(0)) {
-            console.log("RUNBOOK: no TIER_REGISTRY in the address book - adapter NOT attested.");
-            console.log("RUNBOOK: the registry owner must call setCounterpartyAllowed(<adapter>, true):", adapter);
-            return;
+    /// @dev REQUIRED, not a runbook line: `PortfolioStrategy._initialize` binds the adapter
+    ///      through `isCounterpartyAllowed`, so an unattested adapter makes the template INERT
+    ///      and the failure surfaces a governance cycle later, at clone-init.
+    function _attestAdapter(address deployer, address registry, address adapter) internal {
+        require(registry != address(0), "TIER_REGISTRY missing from the address book: run Deploy first");
+        require(
+            TierRegistry(registry).owner() == deployer,
+            "PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - attest the swap adapter before the Safe accepts"
+        );
+        if (!TierRegistry(registry).isCounterpartyAllowed(adapter)) {
+            TierRegistry(registry).setCounterpartyAllowed(adapter, true);
         }
-        if (TierRegistry(registry).owner() != deployer) {
-            console.log("RUNBOOK: deployer no longer owns TIER_REGISTRY - adapter NOT attested.");
-            console.log("RUNBOOK: the owner must call setCounterpartyAllowed(<adapter>, true):", adapter);
-            return;
-        }
-        TierRegistry(registry).setCounterpartyAllowed(adapter, true);
-        console.log("UniswapSwapAdapter attested on TierRegistry:", registry);
     }
 }

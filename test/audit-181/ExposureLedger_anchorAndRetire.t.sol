@@ -200,6 +200,18 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         return usd18 / 1e12;
     }
 
+    /// @dev SHE-240. The approve-side slot floor values the declared lock at
+    ///      the SAME anchored basis `requireApproveQuorum` uses, and
+    ///      `slashableStakeAt` deliberately excludes a checkpoint pushed in the
+    ///      anchor's own instant (see `MockSwoodAnchored`). A guardian's stake
+    ///      therefore has to predate the vote it underwrites — which it always
+    ///      does in production, where the registry reads `getPastStake` at a
+    ///      review snapshot strictly earlier than the vote.
+    function _stakeAheadOfTheVote(uint256 amount) internal {
+        swood.setStake(guardian, amount);
+        vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // FINDING 4 — requireApproveQuorum must not certify a same-block top-up
     // ══════════════════════════════════════════════════════════════════
@@ -214,12 +226,13 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         Before the fix, `requireApproveQuorum` read live stake
     ///         (`anchor = 0`) and would have seen $1,000,000 — passing a gate
     ///         a conviction could only ever collect $500,000 against. This
-    ///         test asserts the FIXED behaviour: the gate must revert, because
-    ///         `min(max(500_000e18, 500_000e18), 1_000_000e18) = 500,000e18`
-    ///         is short of the $1,000,000 requirement.
+    ///         test asserts the FIXED behaviour: the gate must report only
+    ///         `min(max(500_000e18, 500_000e18), 1_000_000e18) = 500,000e18`,
+    ///         short of the $1,000,000 requirement.
     ///
-    ///         Fails against the pre-fix code (which returns normally here —
-    ///         `vm.expectRevert` would see no revert), passes against the fix.
+    ///         Fails against the pre-fix code, which reads live stake and so
+    ///         certifies the full $1,000,000 — the `assertEq(raised, 500_000e18)`
+    ///         below is what catches it.
     function test_requireApproveQuorum_sameBlockTopUp_doesNotCertifyPhantomCoverage() public {
         uint256 proposalId = 1;
         uint256 needUsd = 1_000_000e18;
@@ -227,7 +240,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
 
         // 500,000e18 WOOD @ $2.00 = $1,000,000 slashable — exactly enough to
         // reserve the whole requirement.
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(requiredCoverage6);
 
         vm.prank(registry);
@@ -248,11 +261,21 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         // this is the exact same-block sequence the finding describes.
         swood.setStake(guardian, 1_000_000e18);
 
-        // The gate must now revert: the anchored basis excludes the top-up,
+        // The gate must not certify the top-up: the anchored basis excludes it,
         // so the covering approver can only be shown to back $500,000 of the
-        // $1,000,000 requirement.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), proposalId, usdgAsset, requiredCoverage6);
+        // $1,000,000 requirement, and that shortfall is what the gate reports.
+        //
+        // SHE-240 note: this assertion used to be `expectRevert`, and it held
+        // for the wrong reason — the guardian's only checkpoint sat at the
+        // anchor instant, so the anchored basis read 0 and the gate took its
+        // zero-aggregate revert. Staking one second earlier (the shape the
+        // sibling test below already uses, and the only shape the approve-side
+        // slot floor can book at all) exposes the real anchored figure.
+        (uint256 raisedUsd, uint256 requiredUsd) =
+            ledger.requireApproveQuorum(address(mgov), proposalId, usdgAsset, requiredCoverage6);
+        assertEq(requiredUsd, needUsd, "the requirement is the full $1,000,000");
+        assertEq(raisedUsd, 500_000e18, "and only the PRE-top-up $500,000 is certified");
+        assertLt(raisedUsd, requiredUsd, "the gate reports a shortfall, it does not certify the top-up");
     }
 
     /// @notice The other half of the same property: the gate DOES pass when
@@ -265,7 +288,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         uint256 fullNeedUsd = 1_000_000e18;
         uint256 anchoredNeedUsd = 500_000e18;
 
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(_requiredCoverage6(fullNeedUsd));
         vm.prank(registry);
         ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
@@ -312,7 +335,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         // 500,000e18 WOOD @ $2.00 = $1,000,000 slashable, held flat through
         // the whole test — no top-up, no crash. Only wall-clock and the sweep
         // move anything.
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
 
         // P1 locks half the guardian's stake and is never touched again.
         mgov.set(_requiredCoverage6(500_000e18));
@@ -373,7 +396,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         have aged out.
     function test_retireApproval_revertsWhileFrozen() public {
         uint256 p1 = 30;
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(_requiredCoverage6(500_000e18));
         vm.prank(registry);
         ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
@@ -398,7 +421,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         early would release capital a conviction could still reach.
     function test_retireApproval_revertsBeforeChallengeWindowElapses() public {
         uint256 p1 = 40;
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(_requiredCoverage6(500_000e18));
         vm.prank(registry);
         ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);

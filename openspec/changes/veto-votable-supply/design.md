@@ -18,7 +18,9 @@ the earlier attempts.
 
 Recording the number at propose removes the reconstruction entirely: at that
 instant both facts are directly observable, and neither has to be inferred from
-the other.
+the other. (Decision 3's shipped clamp resolves the ambiguity above: a queue claim
+drops live supply and the live queue balance by the same amount, so subtracting
+`min(snapshotQueued, liveQueued)` never double-counts it.)
 
 ## Decision 1: the queue term is read live at propose, not at the snapshot
 
@@ -142,3 +144,8 @@ exit, and a `t − 1` read lets a Draft-window deposit `X` exit in the approve b
 and leave a bar of `0.4 (G + X)` that only `G` can reach. (c) holds only because
 the Draft keeps the redeem lock, so every share in the recorded set is capital at
 risk for the cycle.
+
+**SHIPPED: (c) plus a live clamp (v1 audit F1).** (c) alone let a redeem ordered
+ahead of the stamp raise the bar above every share still in the vault, re-opening
+NM 6.4-F2. The electorate is now `min(S - Q, L - min(Q, lq))` (snapshot vs live, each less
+its queue), with the live queue term capped at the snapshot's so the front-run (c) closed stays closed.

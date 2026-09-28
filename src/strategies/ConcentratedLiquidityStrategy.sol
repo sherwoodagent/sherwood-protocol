@@ -602,7 +602,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     /// @dev The `vault() -> governor() -> tierRegistry()` walk. `address(0)`
     ///      when unresolved (no `governor()` surface, a governor predating the
-    ///      getter, or `tierRegistry() == 0`); `_initialize` treats that as
+    ///      getter, or `tierRegistry() == 0`); every caller treats that as
     ///      fatal rather than as a skip.
     function _resolveTierRegistry() private view returns (address registry) {
         address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
@@ -612,7 +612,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     function _requireCounterpartiesStillAllowed() private view {
         address registry = _resolveTierRegistry();
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
         _requireAllowedCounterparty(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));

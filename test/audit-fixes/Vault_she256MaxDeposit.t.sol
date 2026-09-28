@@ -45,6 +45,7 @@ contract Vault_she256MaxDepositTest is Test {
 
         governor = new MockProposalStatus();
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         vm.prank(owner);
         vault.approveDepositor(alice);

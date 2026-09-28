@@ -88,6 +88,7 @@ contract SyndicateVaultTest is Test {
         // getActiveProposal → 0 so deposits/withdrawals stay unlocked by default.
         // `redemptionsLocked()` fails closed on governor == address(0).
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
@@ -337,6 +338,7 @@ contract SyndicateVaultTest is Test {
     function test_redemptionsLocked_revertsIfGovernorZero() public {
         // Re-mock the factory to return address(0) as governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(0)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         vm.expectRevert(ISyndicateVault.GovernorNotSet.selector);
         vault.redemptionsLocked();
@@ -1177,6 +1179,7 @@ contract SyndicateVaultTest is Test {
 
         // Route the vault's `onlyGovernor` through the reentrant target.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(target)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
         vm.mockCall(

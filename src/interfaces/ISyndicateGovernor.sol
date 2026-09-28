@@ -160,12 +160,9 @@ interface ISyndicateGovernor {
         ///         written on EVERY execute path, so a stored zero never means
         ///         unset on an `Executed` proposal.
         uint256 effectiveMaxCapital;
-        /// @notice Shares that can vote on this proposal: `totalSupply()` minus
-        ///         the withdrawal queue's balance, both read LIVE at the
-        ///         Draft -> Pending transition, after any same-block burns.
-        ///         The veto bar is a fraction of this. Reconstructing it later
-        ///         from a snapshot cannot be exact — `totalSupply()` does not
-        ///         say whether a burn was a voter's redemption or a queued one.
+        /// @notice Shares that can vote, recorded on entering Pending: min(S - Q, L - min(Q, lq)),
+        ///         snapshot supply/queue votes vs live supply/queue balance — a same-block exit
+        ///         shrinks it, a same-block entry cannot raise it.
         uint256 votableSupply;
     }
 
@@ -193,7 +190,6 @@ interface ISyndicateGovernor {
     // ── Errors ──
 
     error VaultNotRegistered();
-    error VaultAlreadyRegistered();
     error NotRegisteredAgent();
     /// @notice `propose` named a `strategy` the protocol's `StrategyFactory` does not hold as a
     ///         registered, code-unchanged strategy.
@@ -207,7 +203,6 @@ interface ISyndicateGovernor {
     error AlreadyVoted();
     error ProposalNotFound();
     error ProposalNotApproved();
-    error ExecutionWindowExpired();
     /// @notice Fail-safe: revert at execute if the proposal's live tier,
     ///         re-resolved from its stored execute calls, is WORSE than the
     ///         `envelopeTier` snapshotted at propose. A certified tier-0/1 adapter
@@ -241,13 +236,10 @@ interface ISyndicateGovernor {
     error InvalidMaxPerformanceFeeBps();
     error InvalidStrategyDurationBounds();
     error InvalidCooldownPeriod();
-    error InvalidVault();
     error ZeroAddress();
     error NotVaultOwner();
     error NotFactory();
     error StrategyDurationNotElapsed();
-    error InvalidProtocolFeeBps();
-    error InvalidProtocolFeeRecipient();
     /// @notice `_bondEscrow` and `_exposureLedger` are two independently
     ///         factory-settable slots with no on-chain pairing guarantee, and
     ///         ledger rotation can outpace escrow rotation in ordinary operation.
@@ -309,6 +301,8 @@ interface ISyndicateGovernor {
     ///         what may be FROZEN as the price every queued deposit and redeem is
     ///         paid at; not waivable by the declared drawdown.
     error SettlePriceBelowFloor(uint256 ppsNow, uint256 ppsFloor);
+    /// @notice `settleProposal` ran a leg that left the proposal's strategy still `Executed`.
+    error StrategyNotSettled(address strategy);
     /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
     ///         proposal is currently Executed. An escrowed fee leaving the
     ///         vault mid-strategy is indistinguishable from a strategy loss to
@@ -347,22 +341,17 @@ interface ISyndicateGovernor {
     error EmergencyNotProposed();
 
     // ── Guardian-review lifecycle errors ──
-    error NotInGuardianReview();
-    error EmergencySettleNotReady();
-    error RegistryNotSet();
 
     // ── Collaborative proposal errors ──
     error NotCoProposer();
     error CollaborationExpired();
     error AlreadyApproved();
-    error InvalidSplits();
     error TooManyCoProposers();
     error SplitTooLow();
     error LeadSplitTooLow();
     error DuplicateCoProposer();
     error NotDraftState();
     error InvalidCollaborationWindow();
-    error NotAuthorized();
     error InvalidMaxCoProposers();
     error Reentrancy();
     /// @notice Revert if lead tries to cancel a Draft once all-but-one
@@ -376,16 +365,7 @@ interface ISyndicateGovernor {
     /// @notice Revert when `getVoteWeight` is called on a Draft proposal
     ///         whose snapshotTimestamp hasn't been stamped yet.
     error ProposalInDraft();
-    /// @notice Revert if an active co-proposer's rounded share is 0.
-    /// @dev Prevents silent routing of zero-rounded shares to the lead.
-    error CoProposerShareUnderflow();
 
-    error InvalidGuardianFeeBps();
-    /// @notice Raised when `guardianFeeBps > 0` would coexist with an unset
-    ///         `guardiansFeeRecipient` — at initialize, on `setGuardianFeeBps`
-    ///         raising the fee, or on `setGuardiansFeeRecipient(address(0))`
-    ///         while the fee is on. Mirrors the protocol-fee recipient coupling.
-    error InvalidGuardiansFeeRecipient();
     error ParamsFrozenDuringProposal();
 
     // ── Events ──
@@ -446,8 +426,6 @@ interface ISyndicateGovernor {
 
     event ProposalVetoed(uint256 indexed proposalId, address indexed vetoedBy);
 
-    event EmergencySettled(uint256 indexed proposalId, address indexed vault, int256 pnl, uint256 customCallCount);
-
     // There is no setter for the guardian registry. The slot is write-only
     // at `initialize`; migration happens through a governor UUPS upgrade.
 
@@ -481,8 +459,6 @@ interface ISyndicateGovernor {
     // ── Guardian-review lifecycle events ──
     event GuardianReviewResolved(uint256 indexed proposalId, bool blocked);
 
-    event VaultAdded(address indexed vault);
-    event VaultRemoved(address indexed vault);
     // All parameter updates (votingPeriod / executionWindow / vetoThresholdBps /
     // maxPerformanceFeeBps / minStrategyDuration / maxStrategyDuration /
     // cooldownPeriod / collaborationWindow / maxCoProposers / protocolFeeBps /
@@ -733,7 +709,7 @@ interface ISyndicateGovernor {
     /// @notice Address of the guardian registry (zero if not yet wired).
     function guardianRegistry() external view returns (address);
 
-    /// @notice Address of the tier registry (zero if not wired — tier 2 default).
+    /// @notice Address of the tier registry (never zero: `initialize` and `setTierRegistry` require code).
     function tierRegistry() external view returns (address);
 
     /// @notice Address of the exposure ledger (zero if not wired — gates skipped).

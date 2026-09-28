@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {ExposureLedgerTest, MockGovernorForLedger} from "../ExposureLedger.t.sol";
+import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 
 /// @title ExposureLedger — SHE-212 phantom capacity, pinned as "cannot happen"
 /// @notice THE ATTACK, AS FILED. The ledger used to track coverage in two
@@ -81,8 +82,10 @@ contract ExposureLedgerShe212PhantomCapacityTest is ExposureLedgerTest {
         _wireAttack();
         MockGovernorForLedger mgovB = _secondGovernor(1_000e6, 3 days);
 
-        // 1. Immediately: no free budget.
+        // 1. Immediately: no free budget. SHE-240 makes the refusal explicit
+        //    rather than a silent zero booking; the pin is otherwise unchanged.
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         ledger.recordApproval(address(mgovB), 1, guardian, type(uint256).max);
         assertEq(ledger.lockOf(address(mgovB), 1, guardian), 0, "B locks nothing: the stake is committed to A");
         (address[] memory listedB,) = ledger.approversOf(address(mgovB), 1);
@@ -100,6 +103,7 @@ contract ExposureLedgerShe212PhantomCapacityTest is ExposureLedgerTest {
 
         mgovB.setSchedule(block.timestamp + 1 days, 3 days);
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         ledger.recordApproval(address(mgovB), 1, guardian, type(uint256).max);
         assertEq(ledger.lockOf(address(mgovB), 1, guardian), 0, "still nothing: no pass exists that could free room");
         assertEq(ledger.openExposure(guardian), 20_000e18, "the budget is exactly the one live lock");

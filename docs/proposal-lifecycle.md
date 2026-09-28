@@ -43,7 +43,7 @@ stateDiagram-v2
 Deadlines derived at proposal creation (`src/SyndicateGovernor.sol:1067-1093`):
 
 ```
-snapshotTimestamp = now − 1            // closes same-block flash-delegate
+snapshotTimestamp = now − 1            // closes same-block acquisition
 voteEnd   = now + votingPeriod
 reviewEnd = voteEnd + registry.reviewPeriod()
 executeBy = reviewEnd + executionWindow
@@ -117,11 +117,8 @@ Cross-contract timing invariants (all enforced at the setters):
   checkpoints; snapshot is `now − 1` so same-block flash-delegation cannot vote).
 - **Optimistic:** the proposal passes by default when `voteEnd` arrives; it is
   rejected only if AGAINST votes reach `vetoThresholdBps` (20–80%) of the
-  proposal's `votableSupply` — total supply minus the withdrawal queue's
-  balance, recorded at the Draft → Pending transition: live on the direct path
-  (nothing can move between the read and the stamp), at `snapshotTimestamp` on
-  the collaborative path (the redeem lane is open for the whole Draft, so a live
-  queue term could be shrunk by a same-block `requestRedeem` that keeps its weight).
+  proposal's `votableSupply` — supply minus the withdrawal queue, each term the
+  min of its snapshot and live value, recorded at the Draft → Pending transition.
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
   (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
 

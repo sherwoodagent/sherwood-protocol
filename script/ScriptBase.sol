@@ -1,15 +1,76 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console, Script} from "forge-std/Script.sol";
+
+import {DeploySalts} from "./DeploySalts.sol";
+import {Create3} from "./utils/Create3.sol";
+import {Create3Factory} from "./utils/Create3Factory.sol";
 
 /// @notice Shared helpers for deploy and admin scripts.
 ///         - Assertion helpers (_checkAddr, _checkUint)
-///         - JSON address persistence (_writeAddresses, _readAddress)
+///         - CREATE3 minting (_c3Factory, _c3, _predict)
+///         - JSON address persistence (_patchAddress, _readAddress)
 ///
-///         Chain addresses live in contracts/chains/{chainId}.json with
+///         Chain addresses live in chains/{chainId}.json with
 ///         CAPS_SNAKE_CASE keys matching contract names.
 abstract contract ScriptBase is Script {
+    /// @notice Deterministic deployment proxy, same address on every EVM chain.
+    address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    // ── CREATE3 ──
+
+    /// @notice Bootstrap (or adopt) the Create3Factory at its CREATE2 address.
+    /// @dev Address = f(CREATE2_DEPLOYER, salt, initcode), so it is the same for
+    ///      any deployer that pins the same `deployer` constructor arg; the
+    ///      initcode-hash assert turns a solc/optimizer drift into a loud failure
+    ///      instead of silently moving every CREATE3 address downstream.
+    function _c3Factory(address deployer) internal returns (Create3Factory) {
+        require(CREATE2_DEPLOYER.code.length != 0, "CREATE2 deployer not on this chain");
+        require(
+            keccak256(type(Create3Factory).creationCode) == DeploySalts.CREATE3_FACTORY_INITCODE_HASH,
+            "Create3Factory initcode hash drift"
+        );
+        bytes memory initcode = abi.encodePacked(type(Create3Factory).creationCode, abi.encode(deployer));
+        address predicted = address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(
+                            bytes1(0xff), CREATE2_DEPLOYER, DeploySalts.CREATE3_FACTORY, keccak256(initcode)
+                        )
+                    )
+                )
+            )
+        );
+        if (predicted.code.length == 0) {
+            (bool ok,) = CREATE2_DEPLOYER.call(abi.encodePacked(DeploySalts.CREATE3_FACTORY, initcode));
+            require(ok, "Create3Factory bootstrap reverted");
+            require(predicted.code.length != 0, "Create3Factory bootstrap produced no code");
+        }
+        Create3Factory c3 = Create3Factory(predicted);
+        require(c3.owner() == deployer, "Create3Factory owned by a different deployer");
+        return c3;
+    }
+
+    /// @notice Address this factory mints `salt` at. Depends on (factory, salt) only.
+    function _predict(Create3Factory c3, bytes32 salt) internal pure returns (address) {
+        return Create3.addressOf(address(c3), salt);
+    }
+
+    /// @notice Mint `initcode` at the salt's address, or adopt it if already there.
+    /// @dev ADOPTION DOES NOT RE-CHECK BYTECODE: CREATE3 addresses depend on (factory, salt)
+    ///      alone, so a re-run at a different commit keeps the code that is already there.
+    ///      The console line is what makes an adoption visible in the ceremony's own output.
+    function _c3(Create3Factory c3, bytes32 salt, bytes memory initcode) internal returns (address deployed) {
+        deployed = _predict(c3, salt);
+        if (deployed.code.length != 0) {
+            console.log("CREATE3 ADOPTED (not minted by this run, bytecode not re-checked): %s", deployed);
+            return deployed;
+        }
+        require(c3.deploy(salt, initcode) == deployed, "CREATE3 address mismatch");
+    }
+
     // ── Assertions ──
 
     function _checkAddr(string memory label, address actual, address expected) internal pure {
@@ -35,71 +96,12 @@ abstract contract ScriptBase is Script {
         }
     }
 
-    /// @notice Write core deployed addresses to chains/{chainId}.json.
-    /// @dev When the file already exists, patches the core keys IN PLACE so
-    ///      pre-existing keys (templates, ENS, PRICE_ROUTER, WOOD_TOKEN written
-    ///      by other phases) survive — the deploy phases are order-independent
-    ///      and re-runnable. Only a first-ever deploy on a novel chain serializes
-    ///      a fresh object. (Previously this overwrote the whole file, silently
-    ///      dropping every key it didn't own.)
-    function _writeAddresses(
-        string memory name,
-        address deployer,
-        address factory,
-        address governor,
-        address executorLib,
-        address vaultImpl
-    ) internal {
-        string memory path = _chainsPath();
-        if (_fileExists(path)) {
-            _patchAddress("BATCH_EXECUTOR_LIB", executorLib);
-            _patchAddress("DEPLOYER", deployer);
-            _patchAddress("SYNDICATE_FACTORY", factory);
-            _patchAddress("SYNDICATE_GOVERNOR", governor);
-            _patchAddress("SYNDICATE_VAULT_IMPL", vaultImpl);
-            vm.writeJson(vm.toString(block.chainid), path, ".chainId");
-            vm.writeJson(string.concat("\"", name, "\""), path, ".name");
-        } else {
-            string memory obj = "deploy";
-            vm.serializeAddress(obj, "BATCH_EXECUTOR_LIB", executorLib);
-            vm.serializeAddress(obj, "DEPLOYER", deployer);
-            vm.serializeAddress(obj, "SYNDICATE_FACTORY", factory);
-            vm.serializeAddress(obj, "SYNDICATE_GOVERNOR", governor);
-            vm.serializeAddress(obj, "SYNDICATE_VAULT_IMPL", vaultImpl);
-            vm.serializeUint(obj, "chainId", block.chainid);
-            string memory json = vm.serializeString(obj, "name", name);
-            vm.writeJson(json, path);
-        }
-        console.log("Addresses written to %s", path);
-    }
-
     /// @notice Patch a single address into chains/{chainId}.json at a top-level
     ///         key, preserving any existing keys (uses `vm.writeJson` path mode).
     /// @dev Writes the address as a flat JSON string at `.key`. The path-mode
     ///      `writeJson` value must already be valid JSON, so quote the address.
     function _patchAddress(string memory key, address value) internal {
         vm.writeJson(string.concat("\"", vm.toString(value), "\""), _chainsPath(), string.concat(".", key));
-    }
-
-    /// @notice Patch a key ONLY when this chain already has an address book.
-    /// @dev    For phases whose `run()` is also driven by a test suite. The
-    ///         pre-flight suites call `run()` under `vm.setEnv` on the default
-    ///         test chain id, where `_patchAddress` would CREATE
-    ///         `chains/31337.json` — a junk file committed into the repo by the
-    ///         act of running the tests.
-    ///
-    ///         Silence is correct here rather than a revert: a chain with no
-    ///         address book is not a chain this key belongs to, and the deploy
-    ///         phases that matter all run against a book the core ceremony
-    ///         wrote several phases earlier. A missing book on a real deploy
-    ///         target is caught long before this, by the `_readAddress` calls
-    ///         that every one of those phases opens with.
-    function _patchAddressIfBook(string memory key, address value) internal {
-        if (!_fileExists(_chainsPath())) {
-            console.log("address book absent for this chain - %s not persisted", key);
-            return;
-        }
-        _patchAddress(key, value);
     }
 
     /// @notice Read a deployed address from chains/{chainId}.json
@@ -114,8 +116,6 @@ abstract contract ScriptBase is Script {
     ///         the core deploy cannot ask "is TIER_REGISTRY in the book yet?"
     ///         without a tolerant read. Returns `address(0)` for a missing
     ///         file, key, or value; callers treat zero as "not on this chain".
-    ///         (`Deploy.s.sol` predates this and keeps its own equivalent —
-    ///         a differently-named helper here avoids shadowing that one.)
     function _optionalAddress(string memory key) internal view returns (address) {
         string memory path = _chainsPath();
         if (!_fileExists(path)) return address(0);
@@ -124,26 +124,5 @@ abstract contract ScriptBase is Script {
         } catch {
             return address(0);
         }
-    }
-
-    /// @notice Write tokenomics addresses to chains/{chainId}.json (appends to existing)
-    function _writeTokenomicsAddresses(
-        address woodToken,
-        address votingEscrow,
-        address voter,
-        address minter,
-        address rewardsDistributor,
-        address voteIncentive
-    ) internal {
-        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-
-        vm.writeJson(vm.serializeAddress("", "", woodToken), path, ".WOOD_TOKEN");
-        vm.writeJson(vm.serializeAddress("", "", votingEscrow), path, ".VOTING_ESCROW");
-        vm.writeJson(vm.serializeAddress("", "", voter), path, ".VOTER");
-        vm.writeJson(vm.serializeAddress("", "", minter), path, ".MINTER");
-        vm.writeJson(vm.serializeAddress("", "", rewardsDistributor), path, ".REWARDS_DISTRIBUTOR");
-        vm.writeJson(vm.serializeAddress("", "", voteIncentive), path, ".VOTE_INCENTIVE");
-
-        console.log("Tokenomics addresses written to %s", path);
     }
 }

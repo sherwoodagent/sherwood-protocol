@@ -7,8 +7,6 @@ interface ISyndicateVault {
     // ── Errors ──
     error InvalidOwner();
     error InvalidExecutorImpl();
-    error NotActiveAgent();
-    error SimulationFailed();
     error InvalidDepositor();
     error DepositorAlreadyApproved();
     error DepositorNotApproved();
@@ -19,13 +17,10 @@ interface ISyndicateVault {
     ///         `MAX_AGENTS_PER_VAULT` — bound for the `rotateOwnership`
     ///         deactivation loop.
     error AgentCapExceeded();
-    error InvalidAgentRegistry();
     error NotAgentOwner();
     error NotGovernor();
     error RedemptionsLocked();
     error DepositsLocked();
-    error InvalidAgentAddress();
-    error TransferFailed();
     error ZeroAddress();
     error CannotRescueAsset();
     error NotFactory();
@@ -71,6 +66,9 @@ interface ISyndicateVault {
     /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
     ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
     error MalformedAssetCall(bytes4 selector);
+    /// @notice `delegate` or `delegateBySig` was called. The vault self-delegates every
+    ///         receiver, so delegation is fixed and both entrypoints are refused.
+    error DelegationDisabled();
 
     // ── Init Params ──
     struct InitParams {

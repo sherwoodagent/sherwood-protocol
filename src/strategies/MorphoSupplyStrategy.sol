@@ -125,7 +125,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
 
     function _requireAllowedMorpho(address morpho_) private view {
         address registry = _resolveTierRegistry();
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
         if (!_isCounterpartyAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
     }
 
