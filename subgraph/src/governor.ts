@@ -1,11 +1,9 @@
-import { BigInt } from "@graphprotocol/graph-ts";
 import {
   ProposalCreated,
   VoteCast,
   ProposalExecuted,
   ProposalSettled,
   ProposalCancelled,
-  EmergencySettled,
   ProposalVetoed,
   CollaborativeProposalCreated,
   CollaborationApproved,
@@ -137,30 +135,6 @@ export function handleProposalCancelled(event: ProposalCancelled): void {
   proposal.save();
 
   // Unlock redemptions after cancellation
-  let vaultAddress = proposal.vault.toHexString();
-  let lookup = VaultLookup.load(vaultAddress);
-  if (lookup != null) {
-    let syndicate = Syndicate.load(lookup.syndicate);
-    if (syndicate != null) {
-      syndicate.redemptionsLocked = false;
-      syndicate.save();
-    }
-  }
-}
-
-export function handleEmergencySettled(event: EmergencySettled): void {
-  let proposalId = event.params.proposalId.toString();
-  let proposal = Proposal.load(proposalId);
-  if (proposal == null) return;
-
-  proposal.state = "Settled";
-  proposal.finalPnl = event.params.pnl;
-  proposal.performanceFee = BigInt.zero();
-  proposal.settledAt = event.block.timestamp;
-
-  proposal.save();
-
-  // Unlock redemptions after emergency settlement
   let vaultAddress = proposal.vault.toHexString();
   let lookup = VaultLookup.load(vaultAddress);
   if (lookup != null) {

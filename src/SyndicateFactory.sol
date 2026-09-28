@@ -38,7 +38,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error TierRegistryNotWired();
     error InvalidExecutorImpl();
     error InvalidVaultImpl();
-    error InvalidAgentRegistry();
     error NotAgentOwner();
     /// @notice `rotateOwner` restricted to vault owner / creator.
     error NotVaultOwnerOrCreator();
@@ -47,7 +46,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error NotCreator();
     error InvalidBeacon();
     error InvalidProtocolConfig();
-    error InsufficientCreationFee();
     error InvalidFeeToken();
     error ManagementFeeTooHigh();
     error UpgradesDisabled();

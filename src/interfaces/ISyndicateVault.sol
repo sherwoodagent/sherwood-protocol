@@ -7,8 +7,6 @@ interface ISyndicateVault {
     // ── Errors ──
     error InvalidOwner();
     error InvalidExecutorImpl();
-    error NotActiveAgent();
-    error SimulationFailed();
     error InvalidDepositor();
     error DepositorAlreadyApproved();
     error DepositorNotApproved();
@@ -19,13 +17,10 @@ interface ISyndicateVault {
     ///         `MAX_AGENTS_PER_VAULT` — bound for the `rotateOwnership`
     ///         deactivation loop.
     error AgentCapExceeded();
-    error InvalidAgentRegistry();
     error NotAgentOwner();
     error NotGovernor();
     error RedemptionsLocked();
     error DepositsLocked();
-    error InvalidAgentAddress();
-    error TransferFailed();
     error ZeroAddress();
     error CannotRescueAsset();
     error NotFactory();
