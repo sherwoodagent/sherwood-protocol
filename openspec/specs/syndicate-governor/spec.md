@@ -78,7 +78,7 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 - **THEN** the call SHALL revert with `NotWithinVotingPeriod`
 
 ### Requirement: Optimistic passage with veto threshold
-The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= votableSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `votableSupply` is the electorate recorded on entering Pending. On BOTH paths `votableSupply` SHALL be `min(snapshotSupply - snapshotQueued, liveSupply - min(snapshotQueued, liveQueued))`, where `snapshotSupply = getPastTotalSupply(snapshotTimestamp)`, `snapshotQueued = getPastVotes(withdrawalQueue, snapshotTimestamp)`, `liveSupply = totalSupply()` and `liveQueued = balanceOf(withdrawalQueue)`, every subtraction clamped at zero and both queue terms skipped when no queue is wired. The snapshot electorate is clamped at the live one, so the recorded electorate SHALL NEVER exceed the unqueued shares still in the vault, while the live queue term capped at the snapshot's keeps an escrow made after `snapshotTimestamp` from shrinking the bar. A holder who acquires shares in the propose block is outside both the electorate and the vote; a holder who exits in the propose block keeps its snapshot vote weight but leaves the electorate. When `votableSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
+The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= votableSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `votableSupply` is the electorate recorded on entering Pending. On BOTH paths `votableSupply` SHALL be `min(snapshotSupply - snapshotQueued, liveSupply - min(snapshotQueued, liveQueued))`, where `snapshotSupply = getPastTotalSupply(snapshotTimestamp)`, `snapshotQueued = getPastVotes(withdrawalQueue, snapshotTimestamp)`, `liveSupply = totalSupply()` and `liveQueued = balanceOf(withdrawalQueue)`, every subtraction clamped at zero and both queue terms skipped when no queue is wired. The snapshot electorate is clamped at the live one, so the recorded electorate SHALL NEVER exceed the unqueued shares still in the vault, while the live queue term capped at the snapshot's keeps an escrow made after `snapshotTimestamp` from shrinking the bar. A holder who acquires shares in the propose block is outside both the electorate and the vote; a holder who exits in the propose block leaves both the electorate and the vote. When `votableSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
 
 #### Scenario: Veto threshold reached
 - **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of the recorded `votableSupply`
@@ -86,7 +86,7 @@ The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `vot
 
 #### Scenario: Share flow in the propose block never inflates the veto bar
 - **WHEN** a deposit or an instant redeem is ordered ahead of `propose` in the same block
-- **THEN** the recorded `votableSupply` SHALL NOT exceed the live unqueued supply — the deposit is outside both the electorate and the vote, and the exit leaves the electorate even though its snapshot weight can still be cast
+- **THEN** the recorded `votableSupply` SHALL NOT exceed the live unqueued supply — the deposit is outside both the electorate and the vote, and so is the exit
 
 #### Scenario: Silence passes the vote
 - **WHEN** voting ends with zero votes cast and a nonzero `votableSupply`
@@ -301,7 +301,7 @@ The factory SHALL gate structural changes on the governor's lifecycle state. `ro
 - **THEN** the call SHALL revert with `NotFactoryGovernor`
 
 ### Requirement: Status surface for the vault and observers
-The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes — `getActiveProposal()` (id of the executing proposal, 0 if none), `openProposalCount()` (count of proposals binding the vault; nonzero gates instant deposits), and `strategyOf(proposalId)` (scalar strategy adapter, address(0) = none) — plus full read views (`getProposal` with the authoritative resolved state overlaid, `getProposalState`, execute/settlement calls, vote weight and hasVoted, risk envelope, tier, required coverage, cooldown end, capital snapshot, and co-proposers). `getVoteWeight` on a Draft whose snapshot is unset SHALL revert with `ProposalInDraft` rather than silently returning zero.
+The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes — `getActiveProposal()` (id of the executing proposal, 0 if none), `openProposalCount()` (count of proposals binding the vault; nonzero gates instant deposits), and `strategyOf(proposalId)` (scalar strategy adapter, address(0) = none) — plus full read views (`getProposal` with the authoritative resolved state overlaid, `getProposalState`, execute/settlement calls, vote weight and hasVoted, risk envelope, tier, required coverage, cooldown end, capital snapshot, and co-proposers). `getVoteWeight` on a Draft whose snapshot is unset SHALL revert with `ProposalInDraft` rather than silently returning zero; otherwise it SHALL return the weight `vote` would record — the same end-of-propose-second cap — and zero while `block.timestamp <= snapshotTimestamp + 1`, when no vote can be cast yet.
 
 #### Scenario: getProposal reports resolved state
 - **WHEN** `getProposal` is read for a proposal whose stored state lags its time-determined state
@@ -310,4 +310,8 @@ The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes �
 #### Scenario: Draft vote weight query rejected
 - **WHEN** `getVoteWeight` is called for a proposal still in Draft
 - **THEN** the call SHALL revert with `ProposalInDraft`
+
+#### Scenario: Vote weight view agrees with vote
+- **WHEN** `getVoteWeight` is read for a holder who redeemed ahead of `propose` in its second, after that second has ended
+- **THEN** it SHALL return zero, matching `vote` reverting with `NoVotingPower`; for any other holder it SHALL equal the weight `vote` records
 

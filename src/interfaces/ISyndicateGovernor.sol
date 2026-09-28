@@ -659,6 +659,8 @@ interface ISyndicateGovernor {
         external
         view
         returns (uint256[] memory executeCallCaps, uint256[] memory settlementCallCaps);
+    /// @notice The weight `vote()` would record: snapshot votes capped at the end of the propose
+    ///         second, and 0 inside that second, when no vote can be cast yet.
     function getVoteWeight(uint256 proposalId, address voter) external view returns (uint256);
     function hasVoted(uint256 proposalId, address voter) external view returns (bool);
     function proposalCount() external view returns (uint256);

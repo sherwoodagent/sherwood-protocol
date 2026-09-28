@@ -205,7 +205,8 @@ contract GovernorHardeningTest is Test {
         vm.prank(co1);
         governor.approveCollaboration(proposalId);
 
-        // Pending now — snapshotTimestamp is stamped.
+        // Pending now — snapshotTimestamp is stamped; weight reads once the stamp second ends.
+        vm.warp(vm.getBlockTimestamp() + 1);
         assertGt(governor.getVoteWeight(proposalId, lp1), 0);
     }
 
