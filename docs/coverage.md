@@ -125,7 +125,8 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   in-range `liquidity()` floor instead. **Both legs are averaged from
   accumulator readings the keeper snapshots** — the pair's cumulative price and
   the pool's `observe([0])` tick cumulative — so neither leg depends on history
-  anyone else stores. A backward `observe([window])` would: the observation ring
+  anyone else stores. The V3 leg's near end is the pool's live `observe([0])`,
+  so a crash there is tracked between rolls, not hidden until the next one. A backward `observe([window])` would: the observation ring
   is written by ANY swapper, one slot per SECOND in which the pool is touched,
   and `observationCardinality` is a `uint16`, so the longest ring anyone can pay
   for reaches 18h12m against a per-second writer and no ring size can serve a 24h
@@ -147,7 +148,7 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   up just before the read passes it. Accepted: neither leg carries a staleness
   gate of its own, so a pool that stops trading keeps averaging its last tick,
   and the pair keeps averaging its last synced spot. `updatedAt` is the
-  snapshot's — the older of the two legs, which roll together — so
+  V2 leg's latest snapshot — the older of the two legs, the V3 leg being live — so
   `WOOD_FEED_MAX_DELAY` at the ledger is what bounds the whole feed's age. A
   stale or shallow reading yields no price at all — `NoWoodPrice` — rather than
   a wrong one.

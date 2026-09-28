@@ -286,22 +286,27 @@ Pre-flights, all PRE-broadcast:
 - **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
 - **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
 
-### Requirement: The WOOD feed's second leg is a Uniswap V3 pool, averaged from snapshots of its tick accumulator
+### Requirement: The WOOD feed's second leg is a Uniswap V3 pool, averaged from a stored snapshot of its tick accumulator to the live one
 
-Chain 4663 carries ONE Uniswap-V2-style WOOD/WETH pair, so the second leg of the two-leg WOOD/USD feed SHALL be a Uniswap **V3** WOOD/WETH pool rather than a second V2 pair. `chains/{chainId}.json` SHALL carry it under `WOOD_WETH_UNISWAP_V3_POOL` together with the factory that created it under `WOOD_WETH_UNISWAP_V3_FACTORY` — chain 4663 carries TWO Uniswap V3 deployments and the canonical `UNISWAP_V3_FACTORY`'s WOOD/WETH pools are empty — and `script/DeployWoodPoolFeed.s.sol:DeployWoodPoolFeed` SHALL read both keys — environment override first, address book second — with NO `WOOD_WETH_SUSHI_V2_PAIR` reference remaining. BOTH legs SHALL be averaged from accumulator readings `update()` stores — the pair's cumulative price and the pool's `observe([0])` tick cumulative — over the same window. The V3 leg SHALL NOT read the pool's observation ring backwards: that ring is written by any swapper, one slot per SECOND in which the pool is touched, and `observationCardinality` is a `uint16`, so no ring anyone can pay for spans a 24h window against a per-second writer and a backward read is an availability lever held by the market (v1 audit F2). Its depth floor is the pool's in-range `liquidity()` (`MIN_V3_LIQUIDITY`), the V3 equivalent of the V2 leg's WETH reserve floor.
+Chain 4663 carries ONE Uniswap-V2-style WOOD/WETH pair, so the second leg of the two-leg WOOD/USD feed SHALL be a Uniswap **V3** WOOD/WETH pool rather than a second V2 pair. `chains/{chainId}.json` SHALL carry it under `WOOD_WETH_UNISWAP_V3_POOL` together with the factory that created it under `WOOD_WETH_UNISWAP_V3_FACTORY` — chain 4663 carries TWO Uniswap V3 deployments and the canonical `UNISWAP_V3_FACTORY`'s WOOD/WETH pools are empty — and `script/DeployWoodPoolFeed.s.sol:DeployWoodPoolFeed` SHALL read both keys — environment override first, address book second — with NO `WOOD_WETH_SUSHI_V2_PAIR` reference remaining. `update()` SHALL store accumulator readings for BOTH legs — the pair's cumulative price and the pool's `observe([0])` tick cumulative. The V2 leg SHALL be averaged between its two stored readings. The V3 leg SHALL be averaged from a stored reading (the latest one once it is at least `window` old, else the previous one) to the pool's LIVE `observe([0])` accumulator, over a span of at least `window`, so a crash in the pool is tracked between rolls rather than hidden until the next one. The V3 leg SHALL NOT read the pool's observation ring backwards: that ring is written by any swapper, one slot per SECOND in which the pool is touched, and `observationCardinality` is a `uint16`, so no ring anyone can pay for spans a 24h window against a per-second writer and a backward read is an availability lever held by the market (v1 audit F2). Its depth floor is the pool's in-range `liquidity()` (`MIN_V3_LIQUIDITY`), the V3 equivalent of the V2 leg's WETH reserve floor.
 
 Pre-flights on the pool, all PRE-broadcast: it has code, it holds exactly `{WOOD, WETH}`, `fee()` answers, `liquidity() >= MIN_V3_LIQUIDITY`, the booked factory's `getPool(token0, token1, fee())` resolves back to the booked pool and the pool names that same factory, and `observe([0])` answers — the read the leg actually makes, which any initialised pool serves whatever its ring holds. `MIN_V3_LIQUIDITY` SHALL be refused rather than truncated above the `uint128` width a pool reports liquidity in — a silent truncation there REMOVES the floor instead of raising it.
 
 There SHALL be no cardinality-growing ceremony step and no ring-sizing derivation: with the leg snapshotting the accumulator forward, the ring's length is irrelevant to the feed.
 
-#### Scenario: The lower of the two legs is served, both from stored snapshots
+#### Scenario: The lower of the two legs is served, the V3 leg's near end live
 - **WHEN** `latestRoundData()` answers after the window has been spanned
-- **THEN** the V3 leg is the arithmetic-mean tick between the two stored tick cumulatives, converted into the V2 leg's orientation and scale, the LOWER of the two legs is served, and `updatedAt` is the older of the two snapshots
+- **THEN** the V3 leg is the arithmetic-mean tick from a stored tick cumulative at least `window` old to the live `observe([0])` cumulative, converted into the V2 leg's orientation and scale, the LOWER of the two legs is served, and `updatedAt` is the V2 leg's latest snapshot
+
+#### Scenario: A V3 crash is tracked between rolls
+- **GIVEN** the V3 pool falls and stays down after the keeper's last roll
+- **WHEN** `latestRoundData()` is read before the next roll, while its `updatedAt` is still within the ledger's `WOOD_FEED_MAX_DELAY`
+- **THEN** the V3 leg already carries the fall, weighted by its share of the averaged span
 
 #### Scenario: A market that evicts the pool's observation ring cannot halt the feed
 - **GIVEN** dust swaps have written every slot of the V3 pool's observation ring, so `observe([window, 0])` reverts `OLD`
 - **WHEN** `latestRoundData()` is read and `update()` is called
-- **THEN** both answer from the stored accumulator readings, and no WOOD-priced path — `propose`, `voteOnProposal`, `requireApproveQuorum`, `ChallengeGame.file` — halts
+- **THEN** both answer, because the far end is a stored reading and the near end is `observe([0])`, which the pool synthesises from its newest observation whatever the ring holds, and no WOOD-priced path — `propose`, `voteOnProposal`, `requireApproveQuorum`, `ChallengeGame.file` — halts
 
 #### Scenario: A pool that will not serve the live accumulator is refused pre-broadcast
 - **GIVEN** the V3 pool's `observe([0])` reverts or answers malformed

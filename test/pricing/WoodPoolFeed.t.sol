@@ -212,16 +212,17 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         assertApproxEqRel(_answer(), HALF_ANSWER_X8, 1e15, "the cheaper leg still sets the mark");
     }
 
-    /// @notice A crash IS tracked: the min follows the market down, which is the
-    ///         direction where a stale mark over-values guardian bonds.
+    /// @notice A crash IS tracked with no roll: the V3 leg's near end is live, so
+    ///         the min follows the market down as it happens.
     function test_aSustainedCrashInTheV3PoolIsTracked() public {
         _prime();
+        uint256 primedAt = vm.getBlockTimestamp();
         assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "control: the V2 pair is the mark");
 
         v3.setTicks(TICK_QUARTER_V2, TICK_QUARTER_V2);
-        _advance(WINDOW + 1);
-        feed.update();
+        _advance(WINDOW);
 
+        assertEq(_updatedAt(), primedAt, "no snapshot has rolled since the crash");
         assertApproxEqRel(_answer(), QUARTER_ANSWER_X8, 1e15, "the lower leg is what the mark follows");
     }
 
@@ -247,15 +248,15 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         feed.latestRoundData();
     }
 
-    /// @notice An `observe` the pool refuses cannot take the price down: reads
-    ///         are served from stored snapshots, so only the NEXT snapshot is
-    ///         lost, and losing it is a loud revert in `update()` (v1 audit F2).
-    function test_anObserveThatRevertsCannotMakeTheFeedUnavailable() public {
+    /// @notice A pool that refuses even `observe([0])` fails loudly on read and
+    ///         on roll, never with a stale price; an evicted ring still serves it.
+    function test_aPoolThatRefusesTheLiveAccumulatorMakesTheFeedUnavailable() public {
         _prime();
-        uint256 before = _answer();
+        _answer(); // control
 
         v3.setObserveReverts(true);
-        assertEq(_answer(), before, "the stored snapshots still price WOOD");
+        vm.expectRevert(bytes("OLD"));
+        feed.latestRoundData();
 
         _advance(WINDOW + 1);
         vm.expectRevert(bytes("OLD"));
@@ -366,9 +367,9 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         assertEq(_answer(), before, "so its price never entered the average");
     }
 
-    /// @notice `updatedAt` is the OLDER of the two legs. Both roll together, so
-    ///         the snapshot is what dates the reading — a consumer's staleness
-    ///         bound binds on it, never on the block.
+    /// @notice `updatedAt` is the OLDER of the two legs. The V3 leg's near end is
+    ///         live, so the V2 snapshot is what dates the reading — a consumer's
+    ///         staleness bound binds on it, never on the block.
     function test_updatedAtIsTheOlderOfTheTwoLegs() public {
         _prime();
         uint256 snapshotAt = vm.getBlockTimestamp();
@@ -567,14 +568,13 @@ contract WoodPoolFeedLedgerTest is WoodPoolFeedFixture {
         ledger.woodPriceX8();
     }
 
-    /// @notice A V3 pool whose observation ring can no longer serve the window
-    ///         does NOT halt the propose path: the leg is priced off snapshots
-    ///         the feed already took, so the ring cannot starve it (v1 audit F2).
-    function test_aV3RingThatCannotServeTheWindowDoesNotHaltTheProposePath() public {
+    /// @notice A V3 pool that refuses even `observe([0])` halts the propose path
+    ///         on the ledger's no-price error, never a stale fallback.
+    function test_aV3PoolThatRefusesObserveHaltsTheProposePath() public {
         v3.setObserveReverts(true);
 
-        assertApproxEqRel(ledger.woodPriceX8(), V2_ANSWER_X8, 1e13, "the ring cannot take the price down");
-        assertGt(ledger.proposerBondWood(usdgAsset, 1_000e6), 0, "and the propose path still sizes a bond");
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
     }
 
     /// @notice A reading older than the ledger's own `maxDelay` is rejected

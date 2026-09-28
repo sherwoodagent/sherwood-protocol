@@ -25,7 +25,8 @@ interface IAggregatorMinimal {
  *         two WOOD/WETH pool TWAPs over a window of at least 24h, each pool held
  *         to a depth floor. One leg is a Uniswap-V2-style pair, synced before
  *         every snapshot so tails are zero; the other is a Uniswap V3 pool. Both
- *         legs are averaged from accumulators this contract snapshots itself.
+ *         legs average from accumulators this contract snapshots; the V3 leg's
+ *         near end is the pool's live accumulator.
  */
 contract WoodPoolFeed {
     error InvalidParameter();
@@ -212,25 +213,25 @@ contract WoodPoolFeed {
         return (avgX112, latest.timestamp);
     }
 
-    /// @dev Priced off the accumulator readings `update()` stored, so a ring the
-    ///      market writes cannot make this leg unavailable; live liquidity is
-    ///      read as a depth gate, never as a price.
+    /// @dev Far end a stored snapshot the market cannot rewrite, near end the live
+    ///      accumulator, so a crash is tracked between rolls; live liquidity is a
+    ///      depth gate, never a price.
     function _poolTwapX112() internal view returns (uint256 avgX112, uint32 updatedAt) {
         if (IUniswapV3Pool(pool).liquidity() < minV3Liquidity) revert PriceUnavailable();
 
-        PoolObservation memory previous = previousPoolObservation;
-        PoolObservation memory latest = latestPoolObservation;
-        if (previous.timestamp == 0 || latest.timestamp == 0) revert PriceUnavailable();
-
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint32 nowTs = uint32(block.timestamp);
+        PoolObservation memory from = latestPoolObservation;
         uint32 span;
         unchecked {
-            span = latest.timestamp - previous.timestamp;
+            if (nowTs - from.timestamp < window) from = previousPoolObservation;
+            span = nowTs - from.timestamp;
         }
-        if (span < window || span > MAX_SNAPSHOT_SPAN) revert PriceUnavailable();
+        if (from.timestamp == 0 || span < window || span > MAX_SNAPSHOT_SPAN) revert PriceUnavailable();
 
-        avgX112 = _tickToX112(_meanTick(previous.tickCumulative, latest.tickCumulative, span));
+        avgX112 = _tickToX112(_meanTick(from.tickCumulative, _currentTickCumulative(), span));
         if (avgX112 == 0) revert PriceUnavailable();
-        return (avgX112, latest.timestamp);
+        return (avgX112, nowTs);
     }
 
     /// @dev `observe([0])` reads the LIVE accumulator: it is synthesised from the
@@ -241,7 +242,7 @@ contract WoodPoolFeed {
         return cumulatives[0];
     }
 
-    /// @dev Arithmetic-mean tick over the snapshots' span, rounded toward
+    /// @dev Arithmetic-mean tick over `spanSeconds`, rounded toward
     ///      NEGATIVE INFINITY: truncating division rounds a negative delta up,
     ///      which would report a WOOD price one tick better than the pool held.
     function _meanTick(int56 previous, int56 latest, uint32 spanSeconds) internal pure returns (int24) {
