@@ -86,7 +86,7 @@ abstract contract ChallengeGameHandler is Properties {
         uint256 count = game.challengeCount();
         if (count == 0) return;
         challengeId = clampBetween(challengeId, 1, count);
-        challengeGame_resolve(challengeId);
+        _resolveAndCheckGL53(challengeId);
     }
 
     /// @dev Secondary tier. Every rate is bounded to its own setter's legal
@@ -172,11 +172,10 @@ abstract contract ChallengeGameHandler is Properties {
         // is needed here — a guardian staked inside this call would carry zero
         // weight and be refused.
         //
-        // Stops at quorum rather than polling the whole cohort: `resolve`
-        // settles the moment the tally crosses, so the remaining ballots would
-        // be `WrongStatus` no-ops, and leaving them uncast keeps the ACQUIT side
-        // reachable for the clamped handler.
-        for (uint256 i; i < GUARDIAN_COUNT && !_quorumReached(challengeId); i++) {
+        // Stops once decided rather than polling the whole cohort: `resolve`
+        // settles a decided tally at once, and leaving the rest uncast keeps the
+        // ACQUIT side reachable for the clamped handler.
+        for (uint256 i; i < GUARDIAN_COUNT && !_decided(challengeId); i++) {
             if (game.hasVotedOn(challengeId, actors[i])) continue;
             vm.prank(actors[i]);
             try game.voteOnChallenge(challengeId, true) {}
@@ -185,25 +184,36 @@ abstract contract ChallengeGameHandler is Properties {
             }
         }
 
-        // Quorum settles immediately; short of it the challenge can only fail,
-        // and only once its clock runs out. The clock is the one THIS challenge
-        // received, not the live parameter — the secondary dispatcher can move
-        // the latter after filing.
-        if (!_quorumReached(challengeId)) {
+        // A decided tally settles immediately; otherwise the challenge waits out
+        // the clock THIS challenge received (not the live parameter) and then
+        // settles on quorum plus majority or fails.
+        if (!_decided(challengeId)) {
             skipTime(game.challengeOf(challengeId).voteWindowAtFiling + 1);
         }
-        try game.resolve(challengeId) {} catch {}
+        _resolveAndCheckGL53(challengeId);
     }
 
-    /// @dev `resolve`'s own settle test, asked of the same four numbers — the
-    ///      quorum against the total stake AND a convict majority.
-    ///      `BPS_DENOMINATOR` is inlined because the constant is `internal`. A
-    ///      zero denominator is not quorum: `resolve` reads it as a challenge
-    ///      nobody could decide and fails it.
-    function _quorumReached(uint256 challengeId) internal view returns (bool) {
-        (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake, uint256 quorumBps) =
-            game.challengeTallyOf(challengeId);
-        return totalStake != 0 && convictWeight * 10_000 >= quorumBps * totalStake && convictWeight > acquitWeight;
+    /// @dev `resolve`'s early-settle test: quorum against the total stake AND a
+    ///      convict side no castable acquit ballot can catch. A zero denominator
+    ///      is not quorum.
+    function _decided(uint256 challengeId) internal view returns (bool) {
+        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
+        return c.totalStakeAtFiling != 0 && c.convictWeight * 10_000 >= c.quorumBpsAtFiling * c.totalStakeAtFiling
+            && 2 * c.convictWeight > c.votableAtFiling;
+    }
+
+    /// @dev GL-53: a settlement inside the vote window carries a convict weight
+    ///      above every acquit ballot still castable. Only the handler sees WHEN
+    ///      a settle landed, so the check lives here rather than in `Properties`.
+    function _resolveAndCheckGL53(uint256 challengeId) internal {
+        try game.resolve(challengeId) {}
+        catch {
+            return;
+        }
+        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
+        if (c.status == IChallengeGame.Status.Settled && block.timestamp < c.filedAt + c.voteWindowAtFiling) {
+            t(2 * c.convictWeight > c.votableAtFiling, "GL-53: settled before the convict side was decided");
+        }
     }
 
     /// @dev First proposal that `file` would currently accept: executed, still

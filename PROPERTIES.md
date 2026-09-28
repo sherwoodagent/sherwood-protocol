@@ -52,16 +52,18 @@ Checked after every call sequence.
 - [x] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
   `pledgedOf` entries. `_livePledgedUsd` has no accessor; needs a ghost (x-ray I-5, second clause).
 - [x] **GL-14** `SHOULD-HOLD` — for every challenge,
-  `convictWeight + acquitWeight <= totalStakeAtFiling`. The quorum test is
-  `convictWeight * 10_000 >= quorumBpsAtFiling * totalStakeAtFiling`, so a tally
-  that could outgrow its own denominator would convict on less than the fraction it
-  claims. Both tallies are checked against the one denominator because each voter's
-  weight lands in exactly one of them and `totalStakeAtFiling` is the whole staked
-  set those weights were drawn from (x-ray I-6). NOTE THIS IS THE LOOSER OF TWO TRUE
-  BOUNDS: with the accused, challenger, proposer and co-proposers all barred, the
-  tight one is `convict + acquit <= total − accused`, under which a same-basis double
-  count could still hide. The struct stores only the total, so the tight bound needs
-  an accessor that does not exist.
+  `convictWeight + acquitWeight <= votableAtFiling <= totalStakeAtFiling`, where
+  `votableAtFiling` is the total less the accused cohort's stake at `filedAt - 1`.
+  Each voter's weight lands in exactly one tally and the accused cannot vote, so the
+  tallies are drawn from the votable set (x-ray I-6). `resolve`'s early settle leans on
+  the tight bound: `2 * convictWeight > votableAtFiling` proves the acquit side cannot
+  catch up only while the two tallies stay under it.
+- [x] **GL-53** `SHOULD-HOLD` — a settlement's convict weight exceeds every acquit ballot
+  still castable: a challenge that reaches `Settled` before `filedAt + voteWindowAtFiling`
+  has `2 * convictWeight > votableAtFiling`. Quorum is final once reached but the
+  majority is not, so settling on quorum plus a momentary majority let a quorum bloc
+  convict in the filing block before the rest of the electorate could vote. Checked in
+  the handler after each `resolve`, the only place that sees when a settle landed.
 - [x] **GL-52** `SHOULD-HOLD` — the exact clause GL-12 relaxes: while nothing can yet
   have expired (`block.timestamp - epochGenesis <= challengeWindow`), a guardian's
   bucketed `openExposure` EQUALS the sum of its locks. Inside that span every bucket
@@ -109,10 +111,10 @@ Checked after every call sequence.
 - [ ] **GL-29** `SHOULD-HOLD` — `swood.verdictSlashed(caseKey, approver)` is one-shot
   (x-ray I-27). Twin of GL-28 across the contract boundary.
 - [x] **GL-31** `SHOULD-HOLD` — `game.hasVotedOn(challengeId, voter)` is one-shot and
-  never returns to false. There is no un-vote, and `resolve` leans on exactly that:
-  it settles the instant the convict tally crosses quorum without waiting for the
-  window, because a tally that can only grow cannot be walked back under a verdict
-  already executed (x-ray I-26).
+  never returns to false. There is no un-vote, and `resolve` leans on exactly that: it
+  settles before the window closes only once the convict side is decided (quorum AND
+  `2 * convictWeight > votableAtFiling`, see GL-53), because a tally that can only grow
+  cannot be walked back under a verdict already executed (x-ray I-26).
 - [x] **GL-34** `SHOULD-HOLD` — a queue request's `claimed` and `cancelled` are mutually
   exclusive and each one-shot.
 - [x] **GL-35** `SHOULD-HOLD` — `_settlePrice[pid].stamped` is one-shot (x-ray G-19).

@@ -104,6 +104,9 @@ interface IChallengeGame {
         /// @dev The challenged proposal's proposer, pinned at filing so the vote
         ///      can refuse it. Appended for tuple-position stability.
         address proposer;
+        /// @dev `totalStakeAtFiling` less the accused cohort's stake: the ceiling
+        ///      on `convictWeight + acquitWeight`. Appended for tuple-position stability.
+        uint256 votableAtFiling;
     }
 
     // ── Errors ──
@@ -171,7 +174,7 @@ interface IChallengeGame {
     ///         equivalent.
     error RenounceDisabled();
     /// @dev One vote per guardian per challenge; there is no un-vote and no
-    ///      re-vote, which is what lets a reached quorum settle on the spot.
+    ///      re-vote, which is what lets a decided tally settle on the spot.
     error AlreadyVoted();
     /// @dev The voter is one of the approvers this challenge accuses. Its
     ///      weight is out of the denominator, so it cannot be in the numerator.
@@ -301,10 +304,11 @@ interface IChallengeGame {
     function voteOnChallenge(uint256 challengeId, bool convict) external;
 
     // Resolution
-    /// @notice Permissionless resolution. A challenge whose convict side has
-    ///         reached the quorum and outweighs the acquit side settles at once;
-    ///         otherwise resolution waits for the decision window to close and
-    ///         reverts `DelayNotElapsed` until then.
+    /// @notice Permissionless resolution. A challenge settles at once when its
+    ///         convict side has reached the quorum and exceeds every acquit ballot
+    ///         still castable (`2 * convictWeight > votableAtFiling`). Otherwise it
+    ///         reverts `DelayNotElapsed` until the window closes, then settles on
+    ///         quorum plus a convict majority and fails on anything short of it.
     function resolve(uint256 challengeId) external;
 
     // ── Views ──
@@ -336,8 +340,8 @@ interface IChallengeGame {
     function voteWindow() external view returns (uint256);
     function challengeQuorumBps() external view returns (uint256);
     /// @notice This challenge's two tallies, the total staked WOOD they are
-    ///         measured against, and its pinned quorum — every number `resolve`
-    ///         reads, so a caller can reproduce its decision exactly.
+    ///         measured against, and its pinned quorum. `resolve` also reads
+    ///         `votableAtFiling` and the window, both on `challengeOf`.
     function challengeTallyOf(uint256 challengeId)
         external
         view

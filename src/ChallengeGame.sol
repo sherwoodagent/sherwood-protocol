@@ -475,7 +475,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             quorumBpsAtFiling: challengeQuorumBps,
             convictWeight: 0,
             acquitWeight: 0,
-            proposer: p.proposer
+            proposer: p.proposer,
+            votableAtFiling: votable
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -564,19 +565,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
-        // Both tallies are monotone, so a quorum the convict side carries is
-        // already final and settles at once. A convict majority is required on
-        // top of it: a minority must not convict over a larger acquit side.
         uint256 totalStake = c.totalStakeAtFiling;
-        if (
-            totalStake != 0 && c.convictWeight * BPS_DENOMINATOR >= c.quorumBpsAtFiling * totalStake
-                && c.convictWeight > c.acquitWeight
-        ) {
+        bool quorum = totalStake != 0 && c.convictWeight * BPS_DENOMINATOR >= c.quorumBpsAtFiling * totalStake;
+        // Early only once decided: convict outweighs every acquit ballot still castable.
+        if (quorum && 2 * c.convictWeight > c.votableAtFiling) {
             _settle(challengeId, c);
             return;
         }
         if (block.timestamp < c.filedAt + c.voteWindowAtFiling) revert DelayNotElapsed();
-        _fail(challengeId, c);
+        if (quorum && c.convictWeight > c.acquitWeight) _settle(challengeId, c);
+        else _fail(challengeId, c);
     }
 
     function _settle(uint256 challengeId, Challenge storage c) private {

@@ -112,20 +112,17 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return sum == swood.totalGuardianStake();
     }
 
-    /// @notice GL-14 — a challenge's convict tally never exceeds the stake that
-    ///         was eligible to cast it.
-    /// @dev The quorum test is `convictWeight * BPS >= quorumBps * totalStake`,
-    ///      so a tally that could outgrow its own denominator would let a filing
-    ///      convict on less than the fraction it claims. Both tallies are
-    ///      checked against the one denominator because each voter's weight is
-    ///      counted into exactly one of them, and `totalStakeAtFiling` is the
-    ///      whole staked set those weights were drawn from.
+    /// @notice GL-14 — a challenge's two tallies together never exceed the stake
+    ///         that was eligible to cast them.
+    /// @dev The tight bound, `votableAtFiling` (total less the accused), is what
+    ///      `resolve`'s early settle leans on: `2 * convict > votable` only proves
+    ///      the acquit side cannot catch up if the tallies stay under it.
     function property_GL14_convictWeightNeverExceedsVotableStake() public view returns (bool) {
         uint256 n = game.challengeCount();
         for (uint256 id = 1; id <= n; id++) {
-            (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake,) = game.challengeTallyOf(id);
-            if (convictWeight > totalStake) return false;
-            if (acquitWeight + convictWeight > totalStake) return false;
+            IChallengeGame.Challenge memory c = game.challengeOf(id);
+            if (c.votableAtFiling > c.totalStakeAtFiling) return false;
+            if (c.acquitWeight + c.convictWeight > c.votableAtFiling) return false;
         }
         return true;
     }

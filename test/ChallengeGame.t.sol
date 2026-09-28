@@ -2770,6 +2770,8 @@ contract ChallengeGameTest is Test {
         assertGe(convictWeight * 10_000, 3_000 * totalStake, "fixture: over the pinned bar");
         assertLt(convictWeight * 10_000, game.challengeQuorumBps() * totalStake, "and under the live one");
 
+        // Not decided early (acquit ballots remain castable), so it settles at the window's close.
+        vm.warp(game.challengeOf(id).filedAt + game.challengeOf(id).voteWindowAtFiling);
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "the pinned quorum stands");
     }
