@@ -92,3 +92,25 @@ contract ChallengeDecidedSettlementTest is ChallengeEndToEndBase {
         assertEq(_status(cid), uint8(IChallengeGame.Status.Settled), "quorum and majority at the close");
     }
 }
+
+/// @notice An accused approver's post-execution top-up does not count toward the challenge denominator.
+contract ChallengeAccusedTopUpTest is ChallengeEndToEndBase {
+    /// @notice A 64k top-up by the accused after execution neither blocks the filing nor raises the quorum bar.
+    function test_accusedTopUpAfterExecutionDoesNotBuyImmunity() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+        vm.warp(vm.getBlockTimestamp() + 1);
+        _stakeGuardian(g1, 64_000e18, 1);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        assertEq(swood.slashableStakeAt(g1, executedAt), G1_STAKE, "fixture: the top-up is outside the slash basis");
+
+        uint256 cid = _file(challenger, pid, "ipfs://evidence");
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        assertEq(c.totalStakeAtFiling, G1_STAKE + 2 * FILLER_STAKE, "g1 counts at its execution-time stake");
+        assertEq(c.votableAtFiling, 2 * FILLER_STAKE, "votable excludes all of g1");
+
+        _convict(cid);
+        game.resolve(cid);
+        assertEq(uint8(game.challengeOf(cid).status), uint8(IChallengeGame.Status.Settled), "the rest convict");
+    }
+}

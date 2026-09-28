@@ -89,10 +89,9 @@ interface IChallengeGame {
         ///      bond, which the settle path treats as nothing-to-forfeit rather
         ///      than an error. Appended for tuple-position stability.
         address proposerBondEscrow;
-        /// @dev The whole staked WOOD at `filedAt - 1`, the denominator both the
-        ///      convict quorum and the acquit quorum are measured against. The
-        ///      accused cohort cannot vote but stays in it, so a wide approving
-        ///      cohort raises the bar a conviction clears rather than lowering it.
+        /// @dev Staked WOOD at `filedAt - 1`, the quorum denominator. The accused stay in
+        ///      it (a wide cohort raises the bar) but each counts at most its stake at
+        ///      `executedAt - 1`: a post-execution top-up is unslashable and adds nothing.
         uint256 totalStakeAtFiling;
         /// @dev The quorum in force at filing, pinned like every other rate.
         uint256 quorumBpsAtFiling;

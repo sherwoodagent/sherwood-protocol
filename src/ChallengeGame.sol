@@ -428,15 +428,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         IStakedWood swood = stakedWood;
         if (address(swood) == address(0)) revert ZeroAddress();
         uint256 snapshotAt = block.timestamp - 1;
-        uint256 totalStake = swood.getPastTotalVotes(snapshotAt);
-        // The accused keep their weight in the denominator and lose only their
-        // ballot, so a wide approving cohort raises the bar rather than lowering
-        // it. This local sum is the ceiling on either side's tally.
-        uint256 votable = totalStake;
+        uint256 votable = swood.getPastTotalVotes(snapshotAt);
+        uint256 accusedAtExecution;
         for (uint256 i = 0; i < accused.length; i++) {
             uint256 w = swood.getPastStake(accused[i], snapshotAt);
             votable = votable > w ? votable - w : 0;
+            // The accused stay in the denominator only up to their stake at execution:
+            // a later top-up is outside the slash basis and must not raise the bar.
+            uint256 atExec = swood.getPastStake(accused[i], executedAt - 1);
+            accusedAtExecution += atExec < w ? atExec : w;
         }
+        uint256 totalStake = votable + accusedAtExecution;
         // No conviction could clear the quorum, so the filing is refused rather
         // than taking a bond that can only burn. Same value the challenge pins
         // below, so the door and the bar cannot drift apart.
