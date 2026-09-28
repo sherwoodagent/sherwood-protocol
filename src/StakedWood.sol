@@ -667,17 +667,16 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///         `_ageFactorBps` on top, so it is WOOD-scaled but is not a term of
     ///         the total.
     ///
-    ///         `TokenCourt._participationFloor` subtracts the accused cohort from
-    ///         the electorate using this getter rather than `getPastVotes`, so the
-    ///         accused sum can never exceed the total AT THE SAME TIMESTAMP — both
-    ///         traces are pushed in the same transaction at every mutation site.
-    ///         The raw basis also denies the accused a lever on its own conviction
-    ///         threshold: an aged basis would let an accused approver call
-    ///         `requestUnstakeGuardian` between the drain and `refer`, re-anchoring
-    ///         its `stakedAt` and flooring its own contribution — shrinking the
-    ///         subtrahend, raising the participation floor, and pushing a case the
-    ///         accused was certain to lose into `Inconclusive`. This getter reads
-    ///         the checkpointed amount directly, with no re-anchorable factor.
+    ///         Subtracting an accused cohort out of the electorate takes this
+    ///         getter rather than `getPastVotes`, so the accused sum can never
+    ///         exceed the total AT THE SAME TIMESTAMP — both traces are pushed in
+    ///         the same transaction at every mutation site. The raw basis also
+    ///         denies the accused a lever on its own conviction threshold: an aged
+    ///         basis would let an accused approver call `requestUnstakeGuardian`,
+    ///         re-anchor its `stakedAt` and floor its own contribution — shrinking
+    ///         the subtrahend and raising the bar its accusers must clear. This
+    ///         getter reads the checkpointed amount directly, with no
+    ///         re-anchorable factor.
     function getPastStake(address guardian, uint256 timestamp) public view returns (uint256) {
         return _stakeCheckpoints[guardian].upperLookupRecent(uint32(timestamp));
     }

@@ -12,8 +12,6 @@ pragma solidity 0.8.28;
 ///      coverage and adjudication state machines, not strategy execution; a
 ///      value-moving batch target would add outflow-accounting noise to every
 ///      proposal without exercising anything the selected entry points cover.
-///      Mirrors `TCE2EAdapter` in `test/TokenCourtEndToEnd.t.sol`, which the
-///      repo's own end-to-end suite uses for exactly this purpose.
 contract FizzAdapter {
     uint256 public pokes;
     uint256 public bumps;

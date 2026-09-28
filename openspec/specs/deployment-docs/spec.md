@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Requirements on the Sherwood deployment process: the mainnet-faithful Robinhood fork environment (Tenderly vnet, chain 9994663), the core deploy ceremony and its wiring order, the guardian-econ layered deployments (Plan B ledger, Plan D challenge game, TokenCourt) with their pre-flight checks, and chain-specific constraints. Scenarios are the verification steps an operator runs to prove each requirement held.
+Requirements on the Sherwood deployment process: the mainnet-faithful Robinhood fork environment (Tenderly vnet, chain 9994663), the core deploy ceremony and its wiring order, the guardian-econ layered deployments (Plan B ledger, Plan D challenge game) with their pre-flight checks, and chain-specific constraints. Scenarios are the verification steps an operator runs to prove each requirement held.
 
 ## Requirements
 
@@ -56,17 +56,17 @@ The fork ceremony SHALL run five scripts in order, each broadcast with the flags
 
 `DeployWood` SHALL be skipped — WOOD is already live on the fork. CREATE3 makes the core addresses order-independent. With handoff skipped, the deployer retains ownership of beacon / factory / registry / sWOOD / ProtocolConfig (needed for fork admin); on the real mainnet ceremony `SKIP_MULTISIG_HANDOFF` SHALL NOT be used and `OWNER_MULTISIG` MUST be a contract (Safe), not an EOA.
 
-The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `DeployPlanD` and `WireTokenCourt` both read that key as an env address, so omitting it leaves the later phases with nothing to read and forces the operator to recover the address from broadcast logs.
+The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `DeployPlanD` reads that key as an env address, so omitting it leaves the later phases with nothing to read and forces the operator to recover the address from broadcast logs.
 
-`DeployPlanB` SHALL likewise persist `EXPOSURE_LEDGER` and `PROPOSER_BOND_ESCROW`, `DeployPlanD` SHALL persist `CHALLENGE_GAME`, and `DeployTokenCourt` SHALL persist `TOKEN_COURT` — each is read as an env address by a later phase, and the reasoning is identical to `TIER_REGISTRY`'s. These writes SHALL happen in `run()`, never in the `deploy(AddressBook)` entry point the Plan B / Plan D pre-flight suites drive. They SHALL further go through `ScriptBase._patchAddressIfBook`, which no-ops when the chain has no address book: `DeployTokenCourt.run()` IS driven by its pre-flight suite under `vm.setEnv`, so an unguarded patch creates a junk `chains/31337.json` in the repo every time the tests run.
+`DeployPlanB` SHALL likewise persist `EXPOSURE_LEDGER` and `PROPOSER_BOND_ESCROW`, and `DeployPlanD` SHALL persist `CHALLENGE_GAME` — each is read as an env address by a later phase, and the reasoning is identical to `TIER_REGISTRY`'s. These writes SHALL happen in `run()`, never in the `deploy(AddressBook)` entry point the Plan B / Plan D pre-flight suites drive. They SHALL further go through `ScriptBase._patchAddressIfBook`, which no-ops when the chain has no address book, so a suite driving `run()` under `vm.setEnv` cannot create a junk `chains/31337.json` in the repo every time the tests run.
 
 #### Scenario: TierRegistry reaches the address book
 - **WHEN** the core ceremony completes
 - **THEN** `chains/{chainId}.json` carries `TIER_REGISTRY`, and it equals `factory.tierRegistry()`
 
 #### Scenario: Guardian-econ phases hand each other their addresses
-- **WHEN** Plan B, Plan D and the court phases complete
-- **THEN** `chains/{chainId}.json` carries `EXPOSURE_LEDGER`, `PROPOSER_BOND_ESCROW`, `CHALLENGE_GAME` and `TOKEN_COURT`, and the operator can run each phase straight out of the address book rather than off the previous phase's broadcast log
+- **WHEN** Plan B and Plan D complete
+- **THEN** `chains/{chainId}.json` carries `EXPOSURE_LEDGER`, `PROPOSER_BOND_ESCROW` and `CHALLENGE_GAME`, and the operator can run each phase straight out of the address book rather than off the previous phase's broadcast log
 
 ### Requirement: The Robinhood ceremony seats every owner-gated write before handoff
 `DeployRobinhoodMainnet` reimplements `run()` rather than extending the canonical `DeploySherwood.run()`, so every write the canonical run makes between `deployCore` and the multisig handoff SHALL be restated in it. Those writes SHALL be collected in ONE internal method (`_seatOwnerWrites`) rather than scattered inline, so the set can be asserted as a set: each is an `onlyOwner` call on a contract the handoff then transfers, so each has exactly one window in which it is cheap and an eternity afterwards in which it is a multisig chore.
@@ -335,7 +335,7 @@ The script SHALL refuse to run anywhere but the chain id named by `ROBINHOOD_FOR
 - Drift guard: `game.challengeWindow() == ledger.challengeWindow()`.
 - Post-conditions: all four roles verified to land on THIS game, plus the game's `exposureLedger`/`tierRegistry` constructor pointers.
 
-The broadcaster MUST already own the ledger, tier registry, and sWOOD. Manual follow-ups are load-bearing: the OFF-CHAIN bug-bounty program (on-chain a successful challenger only gets its bond back), `autoSlashDelay` review against real guardian response capability, and Ownable2Step handoff of game ownership.
+The broadcaster MUST already own the ledger, tier registry, and sWOOD. `game.setStakedWood(swood)` is doubly load-bearing: without it `file` itself reverts `ZeroAddress`, because the game reads the challenge electorate off sWOOD. Manual follow-ups are load-bearing too: the OFF-CHAIN bug-bounty program (on-chain a successful challenger gets its bond back less the settle burn, plus the prosecutor fee from the convicted proposer's bond), review of `voteWindow` and `challengeQuorumBps` against the real guardian cohort's size and response capability, and Ownable2Step handoff of game ownership.
 
 #### Scenario: Role theft refused
 - **WHEN** `DeployPlanD` runs against a chain where a previous ChallengeGame already holds `coverageFreezer`
@@ -345,23 +345,18 @@ The broadcaster MUST already own the ledger, tier registry, and sWOOD. Manual fo
 - **WHEN** the raw `woodUsdPriceX8` scalar is set but the composed `woodPriceX8()` is zero (or vice versa)
 - **THEN** the pre-flight follows the composed value — the figure `file()` actually divides by
 
-### Requirement: TokenCourt deploy/wire split and its five pre-flights
-The token court SHALL ship as two transactions: `DeployTokenCourt` (deploy + `setChallengeGame` + `setStakedWood` + start the Ownable2Step handoff to `PROTOCOL_OWNER`) and, separately, `WireTokenCourt` (`game.setCourt(court)`), so every pre-flight runs against the finished pair before the game's `court` slot is touched. The fail-safe if wiring refuses is benign: an unwired game times disputed challenges out in favour of the accused. `WireTokenCourt` SHALL check:
-1. PRE-FLIGHT 1: `court.challengeGame() == CHALLENGE_GAME` and `court.stakedWood() == STAKED_WOOD`.
-2. PRE-FLIGHT 2: `game.stakedWood() == STAKED_WOOD` — sWOOD identity must match on BOTH contracts, or the electorate that votes is not the cohort that gets slashed.
-3. PRE-FLIGHT 3 (cross-contract window invariant): `game.autoSlashDelay() + court.voteWindow() + court.FINALIZE_BUFFER() <= game.disputeTimeout()`, or the referral window is negative and every disputed challenge free-wins for the accused. Both contracts enforce this against each other's live state on later reconfiguration, but the very FIRST wiring of a fresh pair has nothing to validate against — this script is that external check. Defaults: 7d + 5d + 1d = 13d ≤ 30d.
-4. PRE-FLIGHT 4 (launch math): `court.participationFloorBps() < swood.ageFloorBps()` — turnout is AGED weight while the floor's base is RAW stake, so with all stake young a floor at or above the age-floor fraction is unclearable. Defaults: 1,000 < 2,500 (implying 40% of raw stake must vote at launch).
-5. PRE-FLIGHT 5 (Plan D wiring intact): `ledger.coverageFreezer() == CHALLENGE_GAME`, `tiers.authorizedDemoter() == CHALLENGE_GAME`, `swood.authorizedSlasher() == CHALLENGE_GAME` — or a Guilty verdict dead-ends at `_settle`.
+### Requirement: The challenge vote's launch parameters are an operator decision
+`voteWindow` (7 d, floored at `MIN_VOTE_WINDOW` = 2 d) and `challengeQuorumBps` (3,000 of the votable stake, bounded to [1,000, 10,000]) SHALL be reviewed against the live guardian cohort before the game is handed off, because together they decide whether an honest filing can be carried at all: the quorum's denominator is total staked WOOD at `filedAt - 1` less the accused cohort's stake, so a network whose stake concentrates in a few large guardians can leave the bar unreachable by everyone else the moment one of them is accused. The deploy phase SHALL verify `game.stakedWood() == STAKED_WOOD`, or the electorate that votes is not the cohort that gets slashed, and SHALL verify the Plan D roles are intact (`ledger.coverageFreezer()`, `tiers.authorizedDemoter()`, `swood.authorizedSlasher()` all equal to the game) — or a conviction dead-ends at `_settle`. These values await an economics run; the launch set is a decision, not a default to inherit.
 
-Manual follow-ups: an sWOOD upgrade touching `slashVerdict`'s ABI and any ChallengeGame redeploy that calls it MUST ship as ONE atomic governance batch (a selector mismatch makes every `resolve()` revert with coverage frozen); monitor `AutoReferFailed` (referral is automatic but best-effort — permissionless `TokenCourt.refer` is the fallback); off-chain voter incentives are an operational commitment without which the participation floor may never clear.
+Manual follow-ups: an sWOOD upgrade touching `slashVerdict`'s ABI and any ChallengeGame redeploy that calls it MUST ship as ONE atomic governance batch (a selector mismatch makes every `resolve()` revert with coverage frozen); monitor the rate of filings that reach quorum against those that lapse in silence, since a cohort that never votes turns the whole accountability tail into a time delay.
 
-#### Scenario: Negative referral window refused
-- **WHEN** `autoSlashDelay + voteWindow + FINALIZE_BUFFER > disputeTimeout` on the pair being wired
-- **THEN** `WireTokenCourt` reverts PRE-FLIGHT 3 before calling `setCourt`
+#### Scenario: Mismatched sWOOD identity refused
+- **WHEN** `game.stakedWood()` is unset or differs from `STAKED_WOOD`
+- **THEN** the phase refuses before handoff — an unwired game cannot even accept a filing, and a mismatched one measures its electorate against the wrong book of stake
 
 #### Scenario: Broken Plan D wiring refused
 - **WHEN** any of the three Plan D roles no longer points at the challenge game
-- **THEN** `WireTokenCourt` reverts PRE-FLIGHT 5 — the court must not be granted ruling authority over a game whose verdicts cannot execute
+- **THEN** the phase refuses — a challenge that reaches its convict quorum must be able to execute the verdict
 
 ### Requirement: Chain-specific factory identity configuration
 On Robinhood Chain (no ENS/Durin registrar, no ERC-8004 identity registry) the factory SHALL be deployed with `address(0)` for both `ensRegistrar` and `agentRegistry` (identity + subname registration disabled), and validation SHALL assert both read back as zero.

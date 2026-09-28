@@ -847,8 +847,8 @@ contract ExposureLedgerTest is Test {
     /// @notice ONLY EVER RAISES, mirroring `ChallengeGame.challengeableUntil`'s
     ///         own monotonic-raise semantics one layer up. A smaller, later pin
     ///         must not shadow a larger, earlier one still in effect — the exact
-    ///         property `ChallengeGame._refundAll` relies on across repeated
-    ///         Inconclusive rounds.
+    ///         property `ChallengeGame`'s failure path relies on across repeated
+    ///         failed rounds.
     function test_pinCoverageUntil_onlyEverRaises() public {
         _wireRecording();
         mgov.set(1_000e6);
@@ -899,7 +899,7 @@ contract ExposureLedgerTest is Test {
     }
 
     /// @notice THE FIX'S WHOLE PURPOSE: the pin outlives `unfreezeCoverage`.
-    ///         This is the exact sequence `ChallengeGame._refundAll` performs —
+    ///         This is the exact sequence `ChallengeGame`'s failure path performs —
     ///         release the live freeze, then pin through the re-armed
     ///         deadline — proven directly against the ledger rather than only
     ///         through `ChallengeGame`'s own call.
@@ -959,7 +959,7 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 100_000e18, "B did not overlap A");
     }
 
-    /// @notice The pin variant of the reproduction: an `Inconclusive` round
+    /// @notice The pin variant of the reproduction: a failed round
     ///         pins A through day 55 (re-challengeable, so still slashable);
     ///         on day 43 bucket 0 has aged out. Same adversary, same refusal.
     function test_pinCoverageUntil_pinnedLockCannotBeRelockedAfterItsBucketAgesOut() public {

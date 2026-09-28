@@ -24,7 +24,7 @@
   <rect x="20.0" y="84.0" width="855.1" height="40.0" rx="5" fill="#EDEEF2"/>
   <text x="872.1" y="89.0" text-anchor="end" font-size="3.5" fill="#94A3B8" font-weight="500">Syndicate Lane</text>
   <rect x="20.0" y="146.0" width="855.1" height="40.0" rx="5" fill="#EDEEF2"/>
-  <text x="872.1" y="151.0" text-anchor="end" font-size="3.5" fill="#94A3B8" font-weight="500">Collateral, Tiers &amp; Dispute</text>
+  <text x="872.1" y="151.0" text-anchor="end" font-size="3.5" fill="#94A3B8" font-weight="500">Collateral, Tiers &amp; Accountability</text>
   <path d="M103.6,46.0 C103.6,70.0 132.9,70.0 132.9,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M223.0,46.0 C223.0,70.0 260.1,70.0 260.1,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M339.5,46.0 C339.5,70.0 382.6,70.0 382.6,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
@@ -44,7 +44,6 @@
   <path d="M637.1,114.0 C637.1,135.0 467.5,135.0 467.5,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M637.1,114.0 C637.1,135.0 586.3,135.0 586.3,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M637.1,114.0 C637.1,135.0 697.9,135.0 697.9,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
-  <path d="M637.1,114.0 C637.1,135.0 815.5,135.0 815.5,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M110.2,176.0 C110.2,197.0 108.4,197.0 108.4,218.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M586.3,176.0 C586.3,197.0 568.6,197.0 568.6,218.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
   <path d="M697.9,176.0 C697.9,197.0 680.2,197.0 680.2,218.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
@@ -97,7 +96,7 @@
     <rect x="595.9" y="94.0" width="82.4" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
     <rect x="598.9" y="97.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
     <text x="637.1" y="103.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">ChallengeGame</text>
-    <text x="637.1" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">Bonded Disputes</text>
+    <text x="637.1" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">Bonded Challenge + Guardian Vote</text>
   </g>
   <g filter="url(#shadow)">
     <rect x="30.0" y="156.0" width="160.4" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
@@ -128,12 +127,6 @@
     <rect x="654.9" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
     <text x="697.9" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">StakedWood</text>
     <text x="697.9" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">Stake Custody + Burn</text>
-  </g>
-  <g filter="url(#shadow)">
-    <rect x="765.9" y="156.0" width="99.2" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
-    <rect x="768.9" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
-    <text x="815.5" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">TokenCourt</text>
-    <text x="815.5" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">Verdicts, Zero Custody</text>
   </g>
   <g filter="url(#shadow)">
     <rect x="30.0" y="218.0" width="156.8" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
@@ -191,8 +184,6 @@
   <text x="611.7" y="127.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">freeze coverage</text>
   <rect x="649.9" y="130.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
   <text x="667.5" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">verdict slash</text>
-  <rect x="708.7" y="130.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
-  <text x="726.3" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">refer dispute</text>
   <rect x="91.7" y="192.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
   <text x="109.3" y="197.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">swap / supply</text>
   <rect x="563.5" y="192.0" width="28.0" height="6.0" rx="1" fill="#F8F9FB"/>

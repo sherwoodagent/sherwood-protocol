@@ -12,7 +12,7 @@
 - **Core flow**: agent proposes a batch of calls → shareholders vote (veto-threshold, not FOR-quorum) → guardians review and book USD coverage against their bond → `executeProposal` dispatches the batch through the vault under coverage-scaled per-call caps → `settleProposal` runs the pre-committed closing batch and charges fees.
 - **Key mechanism**: optimistic governance over pre-committed call batches, collateralized by a USD-denominated guardian coverage ledger and priced by a challenge game whose only enforcement is economic.
 - **Token model**: WOOD (governance/stake, external ERC-20), sWOOD (`StakedWood` — sole custodian of guardian stake and vault-owner bonds; non-transferable, checkpointed for vote weight), vault shares (ERC-4626 + ERC20Votes).
-- **Admin model**: `SyndicateFactory` owner (protocol admin) deploys and wires everything; each of `ExposureLedger`, `ChallengeGame`, `TierRegistry`, `TokenCourt`, `ProtocolConfig`, `WoodTwapOracle` carries its own `Ownable`/`Ownable2Step` owner with instant setters. Per-vault governance belongs to the vault owner, expected off-chain to be a multisig — there is no on-chain timelock on the operational surface.
+- **Admin model**: `SyndicateFactory` owner (protocol admin) deploys and wires everything; each of `ExposureLedger`, `ChallengeGame`, `TierRegistry`, `ProtocolConfig`, `WoodTwapOracle` carries its own `Ownable`/`Ownable2Step` owner with instant setters. Per-vault governance belongs to the vault owner, expected off-chain to be a multisig — there is no on-chain timelock on the operational surface.
 
 For a visual overview of the protocol's architecture, see the [architecture diagram](architecture.svg).
 
@@ -24,7 +24,7 @@ For a visual overview of the protocol's architecture, see the [architecture diag
 | Governance | SyndicateGovernor, GovernorParameters, GovernorEmergency, GovernorBeacon, ProposalLifecycle | 1298 | Proposal state machine, voting, execution, settlement, fee distribution, emergency unwind |
 | Factory & Config | SyndicateFactory, ProtocolConfig, FeeConstants | 493 | Deploys vault/governor/queue triples; protocol-wide fee splits and ceilings |
 | Guardian economics | GuardianRegistry, StakedWood, ExposureLedger, ProposerBondEscrow | 1927 | Guardian review + slash, WOOD custody, USD coverage accounting, proposer bonds |
-| Dispute | ChallengeGame, TokenCourt, TierRegistry | 1023 | Bonded challenges, WOOD-weighted verdicts, call-tier certification and adapter allowlist |
+| Accountability | ChallengeGame, TierRegistry | 944 | Bonded challenges decided by a guardian convict quorum, call-tier certification and adapter allowlist |
 | Strategies & routing | BaseStrategy, PortfolioStrategy, MorphoSupplyStrategy, StrategyFactory, UniswapSwapAdapter, SynthraSwapAdapter, SynthraDirectAdapter | 1246 | Strategy clone lifecycle and the DEX/lending adapters batches route through |
 | Pricing | WoodTwapOracle, ChainlinkReader, LiquidityAmounts, TickMath | 466 | WOOD/USD TWAP with a Chainlink ETH leg; math helpers |
 | Vesting | TokenVesting, VestingFactory | 153 | Standalone linear vesting wallets; no coupling to the rest of the protocol |
@@ -89,14 +89,19 @@ Challenger → ChallengeGame.file(pid, predicate, adapterTarget, selector, evide
   ├─ bond = coverageUsd × challengerBondBps, pulled in WOOD
   └─ ExposureLedger.freezeCoverage(governor, pid)   ← locks every approver's stake
 
-  ├─ [silence past autoSlashDelay] → resolve() → _settle
-  └─ [dispute() funds counter-bond to target] → TokenCourt.refer
-        └─ TokenCourt.vote (WOOD-weighted at executedAt-1) → finalize → ChallengeGame.rule
-              ├─ Guilty     → _settle  → StakedWood.slashVerdict → burn
-              │                        → ProposerBondEscrow.forfeitBond → fee + burn
-              │                        → TierRegistry.demoteByChallenge (best-effort)
-              ├─ NotGuilty  → _fail    → burn a slice of the challenger's bond
-              └─ Inconclusive → _refundAll → escalating burn, re-arm the window
+  Guardian → ChallengeGame.voteOnChallenge(id, convict)   ← weight = getPastStake(voter, filedAt-1)
+                                                          ← challenger, proposer and
+                                                            accused approvers refused
+
+  anyone → ChallengeGame.resolve(id)
+  ├─ [convictWeight*1e4 >= quorumBpsAtFiling * totalStakeAtFiling && convictWeight > acquitWeight]
+  │    → _settle → StakedWood.slashVerdict → burn
+  │              → ProposerBondEscrow.forfeitBond → prosecutor fee + burn
+  │              → TierRegistry.demoteByChallenge (best-effort)
+  │              → challenger paid bond − settleBurn
+  └─ [at filedAt + voteWindowAtFiling, short of quorum]
+       → _fail  → burn forfeitBurnBps of the bond, remainder to the challenger
+               → re-arm the window iff acquitWeight == 0 and not already re-armed
 ```
 
 ---
@@ -115,7 +120,7 @@ ERC-4626 share accounting, a strategy pattern with `execute`/`settle`, and `tota
 |-------|-------------|-------------|
 | Protocol admin (factory owner) | Trusted | 16 instant setters: vault + executor impls, beacon, `protocolConfig`, `guardianRegistry`, `tierRegistry`, `exposureLedger`, `bondEscrow`, management-fee cap, `upgradesEnabled`; plus `forceSetParams` on any governor and `pushExecutor`/`pushWiring`. No on-chain delay on any of it. |
 | ExposureLedger owner | Trusted | 12 instant setters incl. `setWoodUsdPrice` (the cap every coverage number derives from), `setCoverageFreezer`, `setKNumerator`, `setCoveredTvlCapUsd`, `setChallengeWindow`. Not pausable. |
-| ChallengeGame owner | Trusted | 13 instant setters incl. all five economic knobs (`settleBurnBps`, `forfeitBurnBps`, `inconclusiveBurnBps`, `challengerBondBps`, `prosecutorFeeBps`) and `setFilingsPaused`. `renounceOwnership` disabled. |
+| ChallengeGame owner | Trusted | Instant setters incl. the economic knobs (`settleBurnBps`, `forfeitBurnBps`, `challengerBondBps`, `prosecutorFeeBps`), the decision clock and bar (`setVoteWindow` floored at `MIN_VOTE_WINDOW`, `setChallengeQuorumBps` bounded to [1000, 10000]), and `setFilingsPaused`. All of them are pinned onto a challenge at filing, so none can re-rate or re-time one in flight. `renounceOwnership` disabled. |
 | StakedWood owner | Trusted | 10 instant setters incl. `setAuthorizedSlasher`, `setMinSlashBps`/`setMaxSlashBps`, `setAgeFloorBps`, `setCooldownPeriod`; also the UUPS upgrade authority over all guardian WOOD custody. |
 | GuardianRegistry owner | Trusted | `setReviewPeriod`, `setBlockQuorumBps`, `setExposureLedger`, `pause`, `fundSlashAppealReserve`, `refundSlash`; UUPS upgrade authority. `unpause` becomes permissionless after `DEADMAN_UNPAUSE_DELAY`. |
 | TierRegistry owner | Trusted | `certify`, `setAdapterAllowed` and `demote` are all **instant** owner calls. Ownable2Step. |
@@ -123,8 +128,8 @@ ERC-4626 share accounting, a strategy pattern with `execute`/`settle`, and `tota
 | Agent (proposer) | Bounded (must be vault-registered; posts a WOOD bond per proposal) | `propose`, `cancelProposal` before `voteEnd`, `rejectCollaboration`; on a live strategy clone, `rebalance` / `rebalanceDelta` / `updateParams`. |
 | Guardian | Bounded (stake is slashable; weight is age-floored and lookback-gated) | `voteOnProposal` (approve books USD coverage against their bond; block counts toward the veto quorum), `voteBlockEmergencySettle`. Cannot unstake while coverage is open or frozen. |
 | LP / shareholder | Untrusted | Deposit/redeem (whitelist-gated unless `openDeposits`), vote on proposals by share weight, queue requests during a live proposal. |
-| Challenger | Untrusted (bonded) | `file` against any executed proposal, `dispute` any live filing, `resolve`, `claimContribution`. |
-| WOOD holder | Untrusted (weight snapshotted pre-execution) | `TokenCourt.vote` on disputed cases, unless accused or the challenger. |
+| Challenger | Untrusted (bonded) | `file` against any executed proposal (one live slot per challenger per proposal), `resolve`. |
+| Voting guardian | Bounded (weight snapshotted at `filedAt - 1`) | `voteOnChallenge` on any live challenge, unless in the accused cohort, which is also struck from the quorum denominator. |
 
 **Adversary Ranking** (ordered by threat level for this protocol type, adjusted by git evidence):
 
@@ -164,7 +169,7 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 
 - **Guardian slash accounting branches on unstake state** &nbsp;&#91;[I-3](invariants.md#i-3)&#93; — `StakedWood._slashOne:1665-1673` decrements `totalGuardianStake` only when `unstakeRequestedAt == 0`, and separately clears the request stamp when a slash empties the stake. Worth tracing the interleaving of `requestUnstakeGuardian`, `cancelUnstakeGuardian`, and a slash landing between them.
 
-- **Five independent economic knobs decide whether anyone files** &nbsp;&#91;[I-13](invariants.md#i-13), [E-2](invariants.md#e-2)&#93; — the `inconclusiveBurnBps ≤ settleBurnBps` cross-check was deliberately removed (second-audit finding C); rounds 1–3 are still clamped inside `_inconclusiveBurnBpsForRound`, round 4+ is not. Worth confirming the honest-filer payoff stays positive across the full escalation ladder.
+- **Four independent economic knobs decide whether anyone files** &nbsp;&#91;[I-13](invariants.md#i-13), [E-2](invariants.md#e-2)&#93; — `challengerBondBps`, `settleBurnBps` and `prosecutorFeeBps` here, `proposerBondBps` on a separately-owned ledger, and `honestFilingBreaksEven()` gates none of them. The reported margin covers only the quorum-reached path, so the filer's true expectation is that margin discounted by the odds a guardian quorum convicts, and `forfeitBurnBps` prices the other branch. Worth confirming the payoff stays positive once that discount is applied.
 
 - **Adapter certification is blind to proxy upgrades** &nbsp;&#91;[X-9](invariants.md#x-9), [X-8](invariants.md#x-8)&#93; — `TierRegistry` pins `target.codehash`, which for a proxy never changes. The spec's answer is a governance rule, not code. Worth checking what happens if an allowlisted adapter is, or becomes, a proxy.
 
@@ -257,7 +262,7 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 - Vault asset: no fee-on-transfer check — `BatchExecutorLib` meters outflow via `balanceOf` deltas, but `_deposit`/`_withdraw` use OZ ERC-4626 defaults. Impact if violated: internal share accounting exceeds the real balance.
 - Vault asset: no rebase handling — `totalAssets()` reads a live balance, so a rebasing asset moves share price with no deposit. Impact if violated: unearned high-water-mark movement and performance fees.
 - Vault asset: blocklist tokens (USDC/USDT) can freeze the vault or the queue mid-settlement, since `settleRedeem` pushes assets to a recorded owner address.
-- WOOD: assumed hook-free; a callback-bearing WOOD would reach `ChallengeGame.dispute` and `claimContribution` — both are CEI-ordered, which is the mitigation.
+- WOOD: assumed hook-free; a callback-bearing WOOD would reach `ChallengeGame.file` and both terminal paths — all are CEI-ordered, which is the mitigation.
 
 **Shared State Exposure:**
 - Strategy batches route through public Uniswap/Synthra pools; a large `executeGovernorBatch` moves the same pool prices other protocols read.
@@ -361,8 +366,7 @@ Two humans, four git identities. Combined, Ana's two identities account for **85
 | `src/SyndicateVault.sol` | 35 | High churn — also the delegatecall host and the asset custodian |
 | `src/SyndicateGovernor.sol` | 34 | High churn — the largest contract at 927 nSLOC |
 | `src/StakedWood.sol` | 33 | High churn — sole custodian of all staked WOOD |
-| `src/ChallengeGame.sol` | 30 | High churn — the entire economic-enforcement path |
-| `src/TokenCourt.sol` | 25 | High churn — verdict authority |
+| `src/ChallengeGame.sol` | 30 | High churn — the entire economic-enforcement path, filing through verdict |
 | `src/ExposureLedger.sol` | 23 | High churn — 699 nSLOC of shared-collateral accounting |
 | `src/GuardianRegistry.sol` | 16 | Moderate churn |
 | `src/TierRegistry.sol` | 12 | Moderate churn |
@@ -391,7 +395,7 @@ Two humans, four git identities. Combined, Ana's two identities account for **85
 | access_control | 182 | SyndicateVault, SyndicateGovernor, StakedWood |
 | fund_flows | high | SyndicateVault, ChallengeGame, ProposerBondEscrow, StakedWood |
 | oracle_price | moderate | ExposureLedger, WoodTwapOracle, PortfolioStrategy |
-| state_machines | moderate | ProposalLifecycle, ChallengeGame, TokenCourt |
+| state_machines | moderate | ProposalLifecycle, ChallengeGame |
 | signatures | moderate | SyndicateVault (Permit2 / ERC1363 / DSToken selector guards) |
 
 The analyzer's raw file lists for these areas are dominated by `lib/` vendored code; only `src/` files are named above.

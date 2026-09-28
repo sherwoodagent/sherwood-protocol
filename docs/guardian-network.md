@@ -16,7 +16,7 @@ run through these contracts:
 | `GuardianRegistry.sol` | review lifecycle + slash-appeal reserve; holds **zero assets** |
 | `ExposureLedger.sol` | the exposure book — how much guardian stake backs which strategy |
 | `TierRegistry.sol` | adapter-selector certification + the vault's adapter allowlist |
-| `ChallengeGame.sol` + `TokenCourt.sol` | post-execution accountability: challenge, dispute, adjudicate, slash |
+| `ChallengeGame.sol` | post-execution accountability: challenge, guardian vote, slash |
 
 ## Becoming a guardian
 
@@ -144,24 +144,24 @@ shrink or grow it.
   or inflate a guardian's capacity, and an approve vote never depends on a price.
   Budget recycles when a bucket ages past `bucketEnd + challengeWindow`, or
   earlier on release or retirement.
-- **Frozen and pinned locks keep counting (SHE-213).** A challenge freezes a lock
-  and an `Inconclusive` round pins it, and both keep it slashable past its
+- **Frozen and pinned locks keep counting.** A challenge freezes a lock, and a
+  re-armed challenge window pins it, and both keep it slashable past its
   bucket's wall-clock expiry — so the freeze and the pin *move* the lock
-  (`_rebucket`) into the bucket containing the challenge's pinned worst-case end
-  (`filedAt + disputeTimeoutAtFiling`, sent on EVERY filing so a later
-  concurrent challenge extends it) or the pin deadline, raise-only. The
+  (`_rebucket`) into the bucket containing the challenge's worst-case end
+  (`filedAt + voteWindow`, sent on EVERY filing so a later concurrent challenge
+  extends it) or the pin deadline, raise-only. The
   unfreeze returns it to ordinary decay: the later of the bucket it was booked
   into and any standing pin — never earlier than the bucket covering
   settlement, and never held past the last legal filing. Release and retirement unwind from the bucket the
   lock currently occupies. `openExposure` is unchanged and there is no second
   accumulator; the scan simply sees the lock where its liability actually ends.
-  That end is HARD (SHE-246): from `filedAt + disputeTimeoutAtFiling` on, a
-  filing can no longer convict — `rule` reverts `WindowClosed` and `resolve` on
-  a still-undisputed filing unwinds it (`Inconclusive`, bond back net of the
-  round burn) instead of settling — so a filing nobody resolves stops being
-  slashable exactly when its bucket stops counting. With concurrent filings the
-  key is slashable until the latest live filing's deadline, which is what the
-  raise-only freeze booked.
+  That end is HARD: from `filedAt + voteWindowAtFiling` on, no further ballot is
+  accepted (`voteOnChallenge` reverts `WindowClosed`), so a filing that has not
+  reached the convict quorum by then can only fail — `resolve` returns the bond
+  net of `forfeitBurnBps` instead of settling — and a filing nobody resolves
+  stops being slashable exactly when its bucket stops counting. With concurrent
+  filings the key is slashable until the latest live filing's window end, which
+  is what the raise-only freeze booked.
   Residual: a move target past the 60-day horizon is clamped to the horizon's
   edge (a bucket outside the scan would un-count the lock), so a challenge at
   the game's 60-day ceiling stops counting at the edge rather than its true
@@ -232,79 +232,136 @@ Governance discipline: never certify proxied or storage-mutable adapters at tier
 ## Post-execution accountability — ChallengeGame
 
 Anyone can challenge an executed proposal during the challenge window by posting a
-bond. The game is a two-stage bond battle with a court backstop:
+bond. A filing freezes the accused cohort's coverage and opens a guardian vote; the
+vote decides it.
 
 ```
-file (bond = 1.5% of liability) ─┬─ nobody disputes within autoSlashDelay (7 d)
-                                │    → SILENCE CONVICTION: approvers' locks burned,
-                                │      proposer bond forfeited, adapter demoted
-                                └─ counter-bond pool fills to exactly bondWood
-                                     → Disputed → referred to TokenCourt
-                                          ├─ Guilty: slash + challenger takes pool
-                                          ├─ NotGuilty / timeout: challenger bond
-                                          │    forfeited (20% burned, rest to funders)
-                                          └─ Inconclusive: everyone refunded minus a
-                                               burn; window re-arms
+file (bond = 1.5% of liability)
+  → coverage frozen, guardians vote convict/acquit for voteWindow (7 d)
+      ├─ convict weight reaches the quorum (30% of the TOTAL staked WOOD)
+      │  and outweighs the acquit side
+      │    → SETTLED: approvers' locks burned, proposer bond forfeited,
+      │      adapter demoted, challenger paid bond − settleBurn
+      │      plus the prosecutor fee out of the proposer's bond
+      └─ the window closes short of that
+           → FAILED: forfeitBurnBps (20%) of the bond burns, the rest returns.
+             An acquittal that itself reached the quorum spends the
+             proposal's challenge window; anything less is silence and
+             re-arms it, once.
 ```
+
+`resolve` is permissionless and exercises no discretion. It settles the instant
+`convictWeight × 10 000 ≥ quorumBpsAtFiling × totalStakeAtFiling` **and**
+`convictWeight > acquitWeight` — there is no un-vote, so a quorum the convict side
+carries is already final — and otherwise waits for `filedAt + voteWindowAtFiling`
+and fails. The majority clause matters on its own: 30% convict against 70% acquit
+convicts nobody. Settling a reached quorum has no deadline
+of its own: `resolve` is permissionless and the challenger, whose bond returns only
+on settlement, is the party paid to call it, while the ledger freeze covers only
+`filedAt + voteWindow` — so a settlement left until after that may find the
+approvers' locks already retired. No transfer anywhere in the game reaches
+an approver or the proposer: the challenger's burns go to `0x…dEaD`, the slash
+burns inside sWOOD, and the prosecutor fee comes out of the convicted proposer's
+own escrowed bond.
+
+### The vote
+
+- **Entrypoint:** `voteOnChallenge(challengeId, convict)`.
+  One ballot per guardian per challenge, no changes, and only while the challenge is
+  `Filed` and inside its pinned window.
+- **Weight:** the voter's staked WOOD at `filedAt − 1`
+  (`swood.getPastStake`). The stamp is one second back because an sWOOD checkpoint
+  is keyed on the second a stake changes and a same-second push overwrites — reading
+  the filing instant itself would let stake planted in that very block count in the
+  numerator while the denominator missed it.
+- **Denominator:** pinned once, at filing, to `getPastTotalVotes(filedAt − 1)` — the
+  TOTAL staked WOOD, accused included. Subtracting the accused made a conviction
+  cheaper the wider the cohort that had approved, so a proposal 90% of the stake
+  approved could be convicted by a few percent of it. The accused lose their ballot,
+  not their weight.
+- **Who cannot vote:** the challenger (`ChallengerCannotVote`), the challenged
+  proposal's pinned proposer and each of its co-proposers (`ProposerCannotVote`), and
+  the accused approvers (`AccusedCannotVote`). Co-proposers are named on-chain and
+  take a share of the performance fee, so they are the same interested party as the
+  lead. The identity checks are floors, not ceilings — a second, unlinked address
+  defeats all of them — but they close the plain case where a filer convicts its own
+  accusation, or a proposer votes on the challenge that would take its bond. What
+  BOUNDS a sybil is the denominator: it must hold 30% of the TOTAL staked WOOD and
+  outweigh the acquit side.
+- **Quorum:** `challengeQuorumBps` of that pinned total, and the convict side must
+  also outweigh the acquit side. Abstention still adds nothing to either tally, so a
+  challenge carries on an active convicting majority reaching the bar, or not at all.
+  A filing no conviction could clear is refused at `file` (`NoVotableStake`) rather
+  than opened on a verdict that was never reachable — see below.
+
+D6 parameters. These are launch defaults and await an economics run:
+
+| Parameter | Value | Bounds | Pinned at filing |
+|---|---|---|---|
+| `voteWindow` (`setVoteWindow`) | 7 d | `MIN_VOTE_WINDOW` = 2 d – `MAX_VOTE_WINDOW` = 60 d (the ledger's `MAX_COVERAGE_HORIZON`) | yes |
+| `challengeQuorumBps` (`setChallengeQuorumBps`) | 3 000 bps (30%) of the TOTAL staked WOOD | owner-set in [1 000, 10 000] | yes |
+| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, accused included | `file` reverts `NoVotableStake` when the total less the accused cohort is under `challengeQuorumBps` of the total — no conviction could clear the quorum | yes |
+| convict majority | `convictWeight > acquitWeight`, required on top of the quorum | — | — |
+| `forfeitBurnBps` — no conviction (`setForfeitBurnBps`) | 20% of the challenger bond burns, the remainder returns | 0 – 50% | yes |
+| `settleBurnBps` — conviction (`setSettleBurnBps`) | 5% burns; the challenger takes `bond − settleBurn` | 0 – 50% | yes |
+| `prosecutorFeeBps` — conviction (`setProsecutorFeeBps`) | 20% of the convicted proposer's forfeited bond, paid to the challenger | 0 – 20% (`MAX_PROSECUTOR_FEE_BPS`; the paying escrow enforces its own) | yes |
+| per-approver slash | `min(lock, basis)` expressed as bps of the basis, clamped into `[minSlashBps, maxSlashBps]` | sWOOD's bounds | basis anchors at `executedAt` |
+
+Whether `minSlashBps` must be at least as large as the ledger's WOOD haircut is a
+separate question with its own ticket; nothing above assumes an answer to it.
+
+Filing parameters:
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `challengeWindow` | 14 d | > 0 | ≤ ledger's window | `ChallengeGame.sol:2088` |
-| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.sol:2104` |
-| `autoSlashDelay` (silence → conviction) | 7 d | 2 d | < `disputeTimeout` | `ChallengeGame.sol:2176` |
-| `disputeTimeout` | 30 d | > `autoSlashDelay` | 60 d | `ChallengeGame.sol:2187` |
-| `settleBurnBps` (win burn) | 5% | 0 | 50% | `ChallengeGame.sol:2203` |
-| `forfeitBurnBps` (loss burn) | 20% | 0 | 50% | `ChallengeGame.sol:2114` |
-| `inconclusiveBurnBps` (round 4+) | 10% | 0 | 50% | `ChallengeGame.sol:2234` |
-| `prosecutorFeeBps` (slice of proposer bond) | 20% | 0 | 20% | `ChallengeGame.sol:2217` |
+| `challengeWindow` | 14 d | > 0 | ≤ ledger's window | `ChallengeGame.sol:828` |
+| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.sol:837` |
+
+### What the vote guarantees
+
+- **A challenge no conviction could clear is never opened.** The stake outside the
+  accused cohort is the ceiling on either tally, so once that cohort holds more than
+  `1 − quorum` of the total — 70% at the 3 000 bps default — every filing against the
+  proposal is guaranteed to fail as silence. `file` reverts `NoVotableStake` rather
+  than taking a bond that could only burn, freezing a window of coverage and spending
+  the proposal's one re-arm for a verdict that was never reachable. A cohort that
+  large already controls the stake; what this refuses is selling it an unwinnable
+  accusation.
+- **An acquittal ends the matter only at the quorum.** An acquit side that clears the
+  same bar a conviction must has decided, so the challenge fails *and* the proposal's
+  challenge window is spent. Below that bar nothing was adjudicated: the failure
+  counts as silence and re-arms the window, so one dust ballot cannot foreclose it.
+  This holds for a substantial minority too — 25% acquit against 20% convict at a
+  30% quorum still reads as silence — because the bar is the quorum, not the balance
+  of the two sides.
+- **A proposal's window re-arms at most once.** The re-arm flag is one-shot per
+  proposal, so a filer cycling addresses cannot keep a cohort's coverage pinned
+  indefinitely: repeated silent failures let the window lapse and the proposal stops
+  being challengeable.
+- **Break-even is the best case, not a floor.** `honestFilingBreaksEven()` compares
+  `challengerBondBps × settleBurnBps` against `proposerBondBps × prosecutorFeeBps`,
+  which is the payoff on the quorum-reached path alone; a filing that misses quorum
+  pays `forfeitBurnBps` of the bond and collects nothing, so a filer's real
+  expectation is that margin discounted by the odds the cohort convicts.
 
 Anti-griefing details:
 
-- All rates are **pinned at filing** — no owner change can re-rate a live challenge.
-- Inconclusive retries burn on an escalating schedule per proposal:
-  round 1 = 2.5% (`INCONCLUSIVE_BURN_ROUND1_BPS`, `ChallengeGame.sol:192` — a free
-  first round let a filer freeze coverage at no cost), round 2 = 5%, round 3 =
-  10%, round 4+ = `inconclusiveBurnBps` (10%), each clamped to `settleBurnBps`
-  on earlier rounds.
-- One live challenge per challenger per proposal; conviction is once-per-accused
-  (survives even a game redeploy via an sWOOD-side flag).
+- All rates **and the clock** are **pinned at filing** — no owner change can re-rate
+  or re-time a live challenge. `filingsPaused` gates `file` alone and is never read
+  in `resolve`, so the owner can stop new challenges but never strand a live one.
+- One live challenge per challenger per proposal. The slot is per *challenger*
+  precisely so an accused cohort cannot buy immunity by self-filing to occupy the
+  only one; the coverage freeze is refcounted so concurrent filings cannot unfreeze
+  each other, and conviction is once-per-accused (surviving even a game redeploy via
+  an sWOOD-side flag).
 - Verdict slashing burns each approver's **lock** for the proposal
   (`slashBpsFor`, clamped into `[minSlashBps, maxSlashBps]` by sWOOD) and anchors
   at **`executedAt`**, not filing time — requesting unstake after execution cannot
   zero the slash basis, and staking more after execution cannot dilute it. A
   released or zero lock owes nothing and is skipped.
-- The slash transaction carries a gas floor (`180 000 × approvers + 2 000 000`) so an
-  under-gassed caller cannot burn a verdict.
-
-## TokenCourt — adjudication
-
-Single-layer WOOD-vote court. One referral opens one vote window; one tally produces
-the verdict. No panel, no appeal.
-
-| Parameter | Default | Min | Max |
-|---|---|---|---|
-| `voteWindow` | 5 d | > 0 | 14 d (`MAX_VOTE_WINDOW`) |
-| `FINALIZE_BUFFER` | 1 d | const | const |
-| `participationFloorBps` | 10% | > 0 | < `sWOOD.ageFloorBps` (25%) |
-
-- Electorate: all sWOOD stakers **except the accused** (accused = guardians whose
-  locks back the challenged proposal). No vote changes.
-- Verdict: turnout below the participation floor → `Inconclusive`; strict majority
-  guilty → `Guilty`; tie or majority not-guilty → `NotGuilty` (fails safe).
-- Referral is only accepted if a full vote + finalize buffer fits before the
-  challenge's pinned `disputeTimeout` (`InsufficientClock`) — a case that exists is
-  always one that can finish. The deadline is hard on the game side too
-  (SHE-246): a `finalize` that only lands at or after
-  `filedAt + disputeTimeoutAtFiling` finds `rule` shut (`WindowClosed` bubbles;
-  the case stays in `Voting`), the challenge times out to the accused through
-  `resolve`, and the case then closes as already-terminal with the verdict
-  recorded but undelivered.
-- Cross-contract invariant, enforced at the setters on both sides plus
-  per-referral:
-  `autoSlashDelay + voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK ≤ disputeTimeout`
-  (7 d + 5 d + 1 d + 1 h ≈ 13 d ≤ 30 d at defaults). `MIN_REFERRAL_SLACK`
-  (1 h, `ChallengeGame.sol:98`) reserves referral headroom so a case cannot be
-  opened with too little clock left to finish.
+- The slash transaction carries a gas floor (`180 000 × approvers + 2 000 000`, plus
+  `200 000` when the filing names an adapter to demote) so an under-gassed caller
+  cannot burn a verdict or silently starve the demotion.
 
 ## Emergency paths
 

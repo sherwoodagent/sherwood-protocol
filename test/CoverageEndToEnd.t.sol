@@ -688,8 +688,8 @@ contract CoverageEndToEndTest is Test {
     /// @notice PR #25 review F2/F6: expiry alone is NOT the exit condition while
     ///         an accusation is live. `openExposure` sums epoch buckets on
     ///         pure wall-clock, so coverage ages out on a timer that does not
-    ///         pause for a challenge — and the challenge game's disputed tail
-    ///         (up to `disputeTimeout`, 30d) outlives it by design. The accused
+    ///         pause for a challenge — and the challenge game's live tail
+    ///         (up to `voteWindow`) outlives it by design. The accused
     ///         could therefore request at execution, wait, and walk the whole
     ///         bond out before the challenge could resolve; the conviction then
     ///         priced maximum guilt (`live == 0` saturates `slashBpsFor` at
