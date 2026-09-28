@@ -81,10 +81,12 @@ contract VaultAsyncRedeemTest is Test {
         usdc.approve(address(vault), type(uint256).max);
     }
 
+    /// @dev An executing proposal is also an open one: `redemptionsLocked()` reads
+    ///      `openProposalCount()` (SHE-258), so both selectors move together.
     function _setProposalActive(bool active) internal {
-        vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(active ? uint256(1) : uint256(0))
-        );
+        uint256 pid = active ? uint256(1) : uint256(0);
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(pid));
     }
 
     /// @dev Simulate the governor settling proposal 1: clear the lock and stamp

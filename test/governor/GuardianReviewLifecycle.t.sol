@@ -18,6 +18,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {MockLedgerFullLocks} from "../mocks/MockLedgerFullLocks.sol";
 
 /// @title GuardianReviewLifecycle.t
 /// @notice End-to-end tests for the Task 25 guardian-review proposal lifecycle.
@@ -184,6 +185,14 @@ contract GuardianReviewLifecycleTest is Test {
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(owner);
         swood.setRegistry(address(registry));
+        // Declared coverage locks: the review-path slash burns each approver's
+        // LOCK RATE x severity, and with no ledger wired every rate is zero.
+        // Wire the whole-stake stand-in so the severity arithmetic this suite
+        // pins lands on real balances exactly as before.
+        MockLedgerFullLocks fullLocks = new MockLedgerFullLocks();
+        fullLocks.setGuardianRegistry(address(registry));
+        vm.prank(owner);
+        registry.setExposureLedger(address(fullLocks));
 
         // LPs
         usdc.mint(lp1, 100_000e6);
@@ -296,9 +305,9 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Optional Approve votes — don't matter for the outcome, but exercise the path.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         // Review ends → the view resolves to Approved IMMEDIATELY. Pre-refactor
         // it reported GuardianReview here until a mutating call poked
@@ -418,7 +427,7 @@ contract GuardianReviewLifecycleTest is Test {
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         // An ordinary, SHORT incident pause partway through the review window.
         uint256 pauseSpan = 1 hours;
@@ -485,15 +494,15 @@ contract GuardianReviewLifecycleTest is Test {
         // g1, g2 Approve; g3, g4, g5 Block.
         // Total stake at open = 100k. Block weight = 60k → 60% ≥ 30% quorum → BLOCKED.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g4);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g5);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -615,14 +624,6 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Age-weighted voting: mature the freshly staked blockers to par so
         // their block votes carry full weight against the raw denominator.
-        //
-        // 31 days, not 30, and the extra day is load-bearing. Vote weight is
-        // now read at the PROPOSE-time snapshot rather than at review-open, so
-        // the growth gate's `snapshot - FLOOR_LOOKBACK` lookback lands a
-        // voting period earlier than it used to. At exactly 30 days that
-        // lookback falls just BEFORE these guardians staked, so the gate reads
-        // their stake as having grown from zero and clamps them to zero —
-        // `NotActiveGuardian`. That is the gate working, not a regression.
         skip(31 days);
 
         uint256 pid = _propose();
@@ -639,21 +640,21 @@ contract GuardianReviewLifecycleTest is Test {
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
 
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g6);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g7);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g8);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g9);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g10);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -694,9 +695,9 @@ contract GuardianReviewLifecycleTest is Test {
         uint256 expectedBurn = 3 * ((GUARDIAN_STAKE * 1074) / 10_000); // 3 × 2_148e18
         assertEq(burnAfter - burnBefore, expectedBurn, "burn == 3 * (20_000e18 * 1074/10_000)");
 
-        // V1.5: blocker epoch attribution is emitted as `BlockerAttributed` and
-        // attributed off-chain via Merkl. Event inspection is covered in
-        // Phase 3 dedicated tests.
+        // Blocker attribution is derived off-chain from `GuardianVoteCast` /
+        // `GuardianVoteChanged` joined with `ReviewResolved` (SHE-207); there
+        // is no on-chain blocker list or per-blocker emit any more.
     }
 
     /// @notice Vote-change path: first-vote stake snapshot is preserved when a
@@ -710,23 +711,23 @@ contract GuardianReviewLifecycleTest is Test {
 
         // g1 initially approves.
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         // Still well before the 10% lockout window — flip to Block.
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         // Four more guardians also block so the quorum is hit (5 × 20k = 100k,
         // well above 30% of 100k total).
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g4);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g5);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
         bool blocked = registry.resolveReview(address(governor), pid);
@@ -737,8 +738,8 @@ contract GuardianReviewLifecycleTest is Test {
         // keep their stake).
         assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 not slashed - ended as blocker");
 
-        // V1.5: blocker attribution emitted via BlockerAttributed event, not
-        // queryable on-chain. See Phase 3 event-inspection tests.
+        // Blocker attribution is off-chain (SHE-207): `GuardianVoteCast` /
+        // `GuardianVoteChanged` joined with `ReviewResolved`. Not queryable on-chain.
     }
 
     /// @notice No keeper ever calls `openReview`. After `reviewEnd`, anyone calls

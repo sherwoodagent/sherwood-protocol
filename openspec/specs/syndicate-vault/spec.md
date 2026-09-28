@@ -75,11 +75,12 @@ so pay-on-behalf funding is permitted.
 - **WHEN** `openDeposits` is false and the receiver is not an approved depositor
 - **THEN** the deposit reverts `NotApprovedDepositor`
 
-#### Scenario: maxDeposit reflects pause only
+#### Scenario: maxDeposit reflects every deposit gate
 
-- **WHEN** the vault is paused
-- **THEN** `maxDeposit`/`maxMint` return 0; otherwise they return
-  `type(uint256).max` (proposal and whitelist gating is not reflected in these views)
+- **WHEN** the vault is paused, `depositsLocked()` is true, or the receiver is
+  not an approved depositor in closed mode
+- **THEN** `maxDeposit(receiver)`/`maxMint(receiver)` return 0; otherwise they
+  return `type(uint256).max`
 
 ### Requirement: Depositor access control
 The vault owner SHALL control deposit access via an open/closed mode flag (`setOpenDeposits`) and an approved-depositor whitelist (`approveDepositor`, `approveDepositors`, `removeDepositor`), all owner-only. Approving the zero address SHALL revert `InvalidDepositor`; re-approving via the single-address path SHALL revert `DepositorAlreadyApproved`; removing an unapproved depositor SHALL revert `DepositorNotApproved`. Whitelist membership SHALL be readable via `isApprovedDepositor` and paginated via `approvedDepositorsPaginated`, with page size hard-clamped to `MAX_PAGE_LIMIT` (100).

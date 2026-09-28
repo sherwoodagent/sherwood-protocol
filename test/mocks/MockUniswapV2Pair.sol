@@ -5,7 +5,7 @@ pragma solidity 0.8.28;
 /// @notice The accumulator half of `UniswapV2Pair`, reproduced exactly.
 ///
 /// @dev    `_update` IS COPIED VERBATIM, and that is the point of this mock
-///         rather than a stub returning a canned TWAP. `WoodTwapOracle`'s
+///         rather than a stub returning a canned TWAP. `WoodPoolFeed`'s
 ///         correctness is entirely a claim about this arithmetic — UQ112x112
 ///         encoding, accumulation at the OLD reserves for the elapsed span,
 ///         wrapping `uint32` timestamps, unchecked `uint256` accumulators — so a
@@ -36,10 +36,12 @@ contract MockUniswapV2Pair {
         return (_reserve0, _reserve1, _blockTimestampLast);
     }
 
-    /// @dev `UniswapV2Pair._update`. Accumulates the price that was standing for
-    ///      the elapsed span BEFORE writing the new reserves, which is why a
-    ///      swap in the same block as a read cannot move the accumulator.
-    function sync(uint112 reserve0_, uint112 reserve1_) public {
+    /// @dev `UniswapV2Pair._update`, reached here the way a swap, mint or burn
+    ///      reaches it: with the post-trade reserves. Accumulates the price that
+    ///      was standing for the elapsed span BEFORE writing the new reserves,
+    ///      which is why a swap in the same block as a read cannot move the
+    ///      accumulator.
+    function setReserves(uint112 reserve0_, uint112 reserve1_) public {
         uint32 nowTs = uint32(block.timestamp);
         uint32 elapsed;
         unchecked {
@@ -56,10 +58,13 @@ contract MockUniswapV2Pair {
         _blockTimestampLast = nowTs;
     }
 
-    /// @dev A no-op interaction — what any swap, mint or burn does to the
-    ///      accumulator when the reserves happen not to change.
-    function touch() external {
-        sync(_reserve0, _reserve1);
+    /// @dev `UniswapV2Pair.sync()`: `_update` at the OLD reserves for the elapsed
+    ///      span, then reserves := balances. There are no balances here, so the
+    ///      reserves are re-written unchanged — which is what `sync()` does on a
+    ///      live pair too whenever nothing has been donated to it. Permissionless
+    ///      on the real pair, and permissionless here.
+    function sync() external {
+        setReserves(_reserve0, _reserve1);
     }
 
     /// @dev Re-point the tokens WITHOUT touching reserves, so a test can prove

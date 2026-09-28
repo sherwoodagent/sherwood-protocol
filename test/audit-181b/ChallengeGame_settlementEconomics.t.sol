@@ -9,8 +9,9 @@ import {BatchExecutorLib} from "src/BatchExecutorLib.sol";
 import {ERC20Mock} from "test/mocks/ERC20Mock.sol";
 
 /// @dev Minimal governor stub — `file()` only reads `executedAt`/`vault` off
-///      `getProposal` (every filing here names no adapter, so
-///      `getExecuteCalls` is never consulted), and `proposerBondEscrow`
+///      `getProposal` (every filing here names no adapter, so neither call
+///      list is consulted; both are implemented anyway, so a filing that DID
+///      name one reaches `AdapterNotInProposal`), and `proposerBondEscrow`
 ///      defaults to `address(0)`, which `_settle` treats as "nothing to
 ///      forfeit" — none of these tests exercise `ProposerBondEscrow`.
 contract MockGovernorSE {
@@ -26,6 +27,10 @@ contract MockGovernorSE {
     }
 
     function getExecuteCalls(uint256) external pure returns (BatchExecutorLib.Call[] memory) {
+        return new BatchExecutorLib.Call[](0);
+    }
+
+    function getSettlementCalls(uint256) external pure returns (BatchExecutorLib.Call[] memory) {
         return new BatchExecutorLib.Call[](0);
     }
 }
@@ -104,11 +109,19 @@ contract MockLedgerSE {
 
     /// @dev Zero means "no override" at the `file()` call site — the raw
     ///      `approversOf` sum is used as-is.
-    function unsharedLiabilityUsd(address, uint256) external pure returns (uint256) {
-        return 0;
+    /// @dev The bond basis `file()` trusts outright under declared coverage
+    ///      locks (the game's uncapped fallback is gone): the cohort's locks at
+    ///      value, which this mock keeps as the `usd` figures set by
+    ///      `setApprovers`.
+    function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256 total) {
+        bytes32 k = _key(governor, proposalId);
+        address[] storage list = _approvers[k];
+        for (uint256 i = 0; i < list.length; i++) {
+            total += _committed[k][list[i]];
+        }
     }
 
-    function freezeCoverage(address, uint256) external {}
+    function freezeCoverage(address, uint256, uint256) external {}
     function unfreezeCoverage(address, uint256) external {}
 
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external {

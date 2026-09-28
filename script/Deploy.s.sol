@@ -13,7 +13,6 @@ import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
-import {CallSandbox} from "../src/CallSandbox.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -79,7 +78,6 @@ contract DeploySherwood is ScriptBase {
     bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.2");
     bytes32 constant SALT_SWOOD_IMPL = keccak256("sherwood.deploy.staked-wood-impl.1");
     bytes32 constant SALT_SWOOD_PROXY = keccak256("sherwood.deploy.staked-wood-proxy.1");
-    bytes32 constant SALT_SANDBOX_IMPL = keccak256("sherwood.deploy.call-sandbox-impl.1");
 
     // ── Registry default parameters (spec §3.1; overridable via env) ──
     uint256 constant DEFAULT_MIN_GUARDIAN_STAKE = 10_000e18;
@@ -124,7 +122,6 @@ contract DeploySherwood is ScriptBase {
         address registryProxy;
         address swoodProxy;
         address tierRegistry; // adapter-selector tier certification (spec §3.2)
-        address sandboxImpl; // CallSandbox implementation every new vault clones
     }
 
     function run() external virtual {
@@ -220,14 +217,6 @@ contract DeploySherwood is ScriptBase {
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
-        // The CallSandbox implementation every vault clones. Persisted because
-        // it is otherwise recoverable ONLY from the broadcast log: it is
-        // CREATE3-salted rather than deployed at a predictable nonce, and the
-        // factory's `sandboxImpl()` getter is the only on-chain copy, and
-        // reading it presupposes already knowing which factory to ask. Every
-        // downstream address book (CLI / SDK / guardian / skill) needs it
-        // by name rather than by derivation.
-        _patchAddress("CALL_SANDBOX_IMPL", d.sandboxImpl);
         // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
         // scripts.
         _patchAddress("STAKED_WOOD", d.swoodProxy);
@@ -329,26 +318,9 @@ contract DeploySherwood is ScriptBase {
             "submitter bond must stay 0 at launch - see issue #40"
         );
 
-        // The CallSandbox implementation every vault clones for a
-        // `proposeWithSandbox` payload. Deployed BEFORE the factory so the
-        // wiring below cannot be deferred to a follow-up transaction — a
-        // factory live without it creates vaults that can never run a payload,
-        // and the vault's binding is set-once, so those vaults could never be
-        // fixed.
-        d.sandboxImpl = c3.deploy(SALT_SANDBOX_IMPL, abi.encodePacked(type(CallSandbox).creationCode));
-
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
         require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
-
-        // Bound here, in the same transaction batch that created the factory,
-        // for the reason above. The deployer still owns the factory at this
-        // point; the ownership handoff happens later.
-        SyndicateFactory(d.factoryProxy).setSandboxImpl(d.sandboxImpl);
-        require(
-            SyndicateFactory(d.factoryProxy).sandboxImpl() == d.sandboxImpl,
-            "sandbox impl must be bound before the factory goes live"
-        );
     }
 
     /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
@@ -431,7 +403,7 @@ contract DeploySherwood is ScriptBase {
     ///      unattested dependency: `PortfolioStrategy` checks each Chainlink
     ///      aggregator (`_requireAllowedPriceSource`) AND its pairing to the
     ///      slot's token (`_requirePairedPriceSource`), `MorphoSupplyStrategy`
-    ///      checks `isAdapterAllowed(morpho)`, `ConcentratedLiquidityStrategy`
+    ///      checks `isCounterpartyAllowed(morpho)`, `ConcentratedLiquidityStrategy`
     ///      checks `isCounterpartyAllowed` on the position manager, Morpho and
     ///      the Uniswap v3 factory. A fresh registry answers false to all of
     ///      them, so a just-deployed protocol cannot run a single strategy
@@ -451,9 +423,6 @@ contract DeploySherwood is ScriptBase {
     ///      strategy deploys → multisig accepts. Accepting early is safe but
     ///      costs a multisig transaction per dependency.
     ///
-    ///      Per-clone `setAdapterAllowed` stays manual by construction — a
-    ///      clone's address is not known until an agent creates it.
-    ///
     ///      Best-effort per key: a chain whose address book lacks an entry
     ///      simply does not get that attestation. Silence is logged, never
     ///      assumed.
@@ -465,15 +434,11 @@ contract DeploySherwood is ScriptBase {
             return;
         }
 
-        // Counterparties: addresses a certified template may BIND to (pools,
-        // position managers, lending singletons) as distinct from addresses
-        // that may RECEIVE vault funds. Morpho needs both axes — CL binds it
-        // as a counterparty, MorphoSupplyStrategy spends into it as an adapter.
+        // Counterparties: the venues a certified template may bind (pools,
+        // position managers, lending singletons, feeds).
         _seedCounterparty(tierRegistry, "UNISWAP_V3_POSITION_MANAGER");
         _seedCounterparty(tierRegistry, "UNISWAP_V3_FACTORY");
-        if (_seedCounterparty(tierRegistry, "MORPHO_BLUE")) {
-            _seedAdapter(tierRegistry, "MORPHO_BLUE");
-        }
+        _seedCounterparty(tierRegistry, "MORPHO_BLUE");
 
         // Push-feed price sources. `symbols` drives BOTH lookups: the feed key
         // is CHAINLINK_<SYM>_USD_FEED and the token key is <SYM>, except ETH,
@@ -504,17 +469,6 @@ contract DeploySherwood is ScriptBase {
         return true;
     }
 
-    function _seedAdapter(address tierRegistry, string memory key) internal returns (bool) {
-        address target = _tryReadAddress(key);
-        if (target == address(0)) {
-            console.log("  adapter skipped (not in address book):", key);
-            return false;
-        }
-        TierRegistry(tierRegistry).setAdapterAllowed(target, true);
-        console.log("  adapter allowed:", key, target);
-        return true;
-    }
-
     /// @dev Allowlists the aggregator and pairs it to the token it prices.
     ///      `priceSource` MUST be the bare aggregator address widened to
     ///      bytes32 with no packed max-age — that is the exact normalization
@@ -528,7 +482,7 @@ contract DeploySherwood is ScriptBase {
             console.log("  feed skipped (not in address book):", symbol);
             return;
         }
-        TierRegistry(tierRegistry).setAdapterAllowed(feed, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(feed, true);
 
         // ETH's feed prices the wrapped token — every other symbol's token key
         // is the symbol itself.

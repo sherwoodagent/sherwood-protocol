@@ -24,9 +24,9 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset.
 contract SlashGasFeed {
@@ -203,6 +203,7 @@ contract SlashGasCeilingTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         adapter = new SlashGasAdapter();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
@@ -232,6 +233,7 @@ contract SlashGasCeilingTest is Test {
 
         _deploySyndicate();
         registry.addGovernor(address(gov), address(vault));
+        _bondVaultOwner(address(vault));
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(gov))
         );
@@ -258,12 +260,14 @@ contract SlashGasCeilingTest is Test {
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new SlashGasFeed(1e8, 8);
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));
@@ -302,15 +306,6 @@ contract SlashGasCeilingTest is Test {
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
-        // issue #166: certifying a (target, selector) prices it for tiering
-        // but does NOT make `target` batch-callable at all — that is the
-        // SEPARATE `isAdapterAllowed` allowlist `SyndicateVault._guardBatchCalls`
-        // PART 2a now enforces on every batch callee. `adapter` (`SlashGasAdapter`)
-        // is a benign, fund-neutral fixture, not an attacker probe — allowlist
-        // it or every proposal touching it is refused with
-        // `DisallowedBatchCallee` before the gas-ceiling mechanics under test
-        // ever run. Inherited by `DemotionGasProbeTest` (`is SlashGasCeilingTest`).
-        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
@@ -420,7 +415,7 @@ contract SlashGasCeilingTest is Test {
         registry.openReview(address(gov), pid);
         for (uint256 i = 0; i < approvers.length; i++) {
             vm.prank(approvers[i]);
-            registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
+            registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         }
 
         vm.warp(gov.getProposal(pid).reviewEnd + 1);
@@ -810,5 +805,22 @@ contract SlashGasCeilingTest is Test {
             address(court).call{gas: MAX_TX_GAS - INTRINSIC_TX_GAS}(abi.encodeCall(TokenCourt.finalize, (caseId)));
         spent = before - gasleft();
         assertTrue(ok, "the measurement must be of a conviction that landed");
+    }
+
+    /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
+    ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
+    ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
+    ///      so a hand-built syndicate that skips it models a vault the real
+    ///      factory cannot produce. Binding here restores the fixture to a
+    ///      state the protocol can actually reach.
+    function _bondVaultOwner(address vault_) internal {
+        uint256 bond = swood.minOwnerStake();
+        wood.mint(owner, bond);
+        vm.startPrank(owner);
+        wood.approve(address(swood), bond);
+        swood.prepareOwnerStake(bond);
+        vm.stopPrank();
+        // The test contract is sWOOD's factory.
+        swood.bindOwnerStake(owner, vault_);
     }
 }

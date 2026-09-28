@@ -12,8 +12,8 @@ interface IStakedWood {
     /// @notice Reverts when a non-slasher calls the verdict slash path.
     error NotAuthorizedSlasher();
 
-    /// @notice Reverts when `slashVerdict` is handed a rate array whose length
-    ///         does not match `approvers`. Positional alignment is the only
+    /// @notice Reverts when `slashVerdict` or `slashGuardians` is handed a rate
+    ///         array whose length does not match `approvers`. Positional alignment is the only
     ///         thing binding a guardian to their own rate, so a mismatch is a
     ///         caller bug that would otherwise slash the tail of the batch at a
     ///         rate nobody chose.
@@ -65,7 +65,6 @@ interface IStakedWood {
     function claimUnstakeOwner(address vault) external;
 
     /// @notice Consent to having your prepared owner stake bound to `vault` by
-    ///         the factory's owner-rotation flow (issue #98). Callable only by
     ///         the prospective owner themselves; one approved vault per
     ///         address, overwritten on re-approval, consumed by the bind.
     function approveOwnerStakeBinding(address vault) external;
@@ -115,7 +114,6 @@ interface IStakedWood {
     /// @notice The WOOD a verdict slash anchored at `anchor` could recover
     ///         from `guardian`'s own stake right now: `min(max(liability at
     ///         anchor, votableStake at anchor), liveStake)`. Byte-for-byte the basis
-    ///         `_slashOne` sizes its per-approver take from (issue #35) — a
     ///         guardian who tops up its stake after `anchor` is not counted.
     ///         Reverts `VerdictNotPast` on a future `anchor`.
     function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
@@ -158,6 +156,11 @@ interface IStakedWood {
     function isActiveGuardian(address guardian) external view returns (bool);
     function guardianStake(address guardian) external view returns (uint256);
     function ownerStake(address vault) external view returns (uint256);
+
+    /// @notice True iff `vault`'s owner-stake slot is bound and not exiting —
+    ///         `owner != address(0) && unstakeRequestedAt == 0`. The predicate
+    function ownerBondLive(address vault) external view returns (bool);
+
     function totalGuardianStake() external view returns (uint256);
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);
@@ -178,15 +181,28 @@ interface IStakedWood {
     function maxSlashBps() external view returns (uint256);
 
     // Registry-only mutations
-    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of each
-    ///         approver's own stake. Registry-only.
-    /// @param reviewKey  keccak256(abi.encode(governor, proposalId)).
-    /// @param openedAt   The review's open timestamp — the checkpoint each
-    ///                   approver's slash is sized off.
-    /// @param approvers  Approver addresses to slash.
-    /// @param slashBps   Slash fraction in basis points.
-    function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
-        external;
+    /// @notice Slash `approvers` for a blocked proposal, each at its own rate.
+    ///         Registry-only. Each non-zero rate is clamped into
+    ///         `[minSlashBps, maxSlashBps]`; a zero rate is skipped (zero is the
+    ///         absence of liability, not a severity to floor).
+    /// @dev    The registry derives each rate from the approver's WOOD lock for
+    ///         the reviewed proposal over its slash basis at review open, scaled
+    ///         by the block-decisiveness severity — so the burn is at most the
+    ///         lock, and never less than `minSlashBps` of the bond.
+    /// @param reviewKey   keccak256(abi.encode(governor, proposalId)).
+    /// @param openedAt    The review's open anchor (already `-1`-hardened by the
+    ///                    registry) — the checkpoint each approver's slash is
+    ///                    sized off.
+    /// @param approvers   Approver addresses to slash.
+    /// @param slashBpsPer Per-approver slash fractions in bps, positionally
+    ///                    aligned with `approvers`; a length mismatch reverts
+    ///                    `SlashBpsLengthMismatch`.
+    function slashGuardians(
+        bytes32 reviewKey,
+        uint256 openedAt,
+        address[] calldata approvers,
+        uint256[] calldata slashBpsPer
+    ) external;
 
     /// @notice Burn the owner bond bound to `vault` (emergency-settle failure).
     ///         Registry-only.

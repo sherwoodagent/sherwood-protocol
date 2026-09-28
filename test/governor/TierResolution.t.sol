@@ -14,8 +14,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
-import {unwireTierRegistry} from "../helpers/TierRegistryUnwire.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Task 5 — propose-time tier resolution (spec 2026-07-22 §3.2). The
 ///         proposal's tier is the MAX tier across its execute calls (resolved
@@ -50,6 +49,7 @@ contract TierResolutionTest is Test {
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
@@ -112,8 +112,19 @@ contract TierResolutionTest is Test {
     ///      wired registry, onboarding an adapter now means certify + allowlist.
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
-        tierRegistry.setAdapterAllowed(address(usdc), true);
+    }
+
+    /// @dev Certifies the shared `_settleCalls()` leg (`usdc.approve`) tier-0.
+    ///      Since SHE-210 the settlement leg's tier counts toward the proposal
+    ///      tier, so an uncertified settle call pins any proposal at the
+    ///      fail-closed tier 2. Call this from tests whose subject is the
+    ///      EXECUTE leg's tier and which therefore need the settle leg to be
+    ///      genuinely benign. Deliberately NOT in `_wireTierRegistry`: a
+    ///      certified bound also changes the leg's COVERAGE contribution (full
+    ///      notional -> 100 bps), which the coverage-assertion tests in this
+    ///      file measure.
+    function _certifyBenignSettleLeg() internal {
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
     }
 
     /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test
@@ -244,30 +255,6 @@ contract TierResolutionTest is Test {
         assertEq(governor.getRequiredCoverage(pid), 1_502_500_000);
     }
 
-    /// @notice Registry unset (address(0)) → everything defaults to tier 2 /
-    ///         full notional, even for calls a registry would have certified.
-    /// @dev    Reaches the state with `vm.store` (see `unwireTierRegistry`): the
-    ///         registry is a mandatory `initialize` argument since pashov
-    ///         finding #1, so only a governor deployed BEFORE that fix is
-    ///         registry-less — which is exactly the population this branch
-    ///         exists for. Note the pricing here (`MAX_CAPITAL`, flat) differs
-    ///         from the wired uncertified case
-    ///         (`test_shortCalldataResolvesAsUncertifiedTier2`, `2 *
-    ///         MAX_CAPITAL`): the flat default prices the ENVELOPE once, the
-    ///         wired path prices each declared cap.
-    function test_zeroTierRegistryAddressDefaultsAllToTier2() public {
-        unwireTierRegistry(address(governor));
-        // Deliberately NOT wired; certification alone must not matter.
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
-
-        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
-        calls[0] = _certifiedCall();
-        uint256 pid = _propose(calls);
-
-        assertEq(governor.getProposalTier(pid), 2);
-        assertEq(governor.getRequiredCoverage(pid), MAX_CAPITAL);
-    }
-
     /// @notice Calldata shorter than 4 bytes cannot carry a selector — it
     ///         resolves as selector 0, which is uncertified → tier 2.
     function test_shortCalldataResolvesAsUncertifiedTier2() public {
@@ -326,6 +313,7 @@ contract TierResolutionTest is Test {
     ///         stale bounded-tier coverage price.
     function test_executeRevertsWhenTierRegressedSincePropose() public {
         _wireTierRegistry();
+        _certifyBenignSettleLeg();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
@@ -340,6 +328,36 @@ contract TierResolutionTest is Test {
         vm.etch(address(mockAdapter), address(executorLib).code);
         (uint8 liveTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
         assertEq(liveTier, 2); // demoted since propose
+
+        vm.expectRevert(ISyndicateGovernor.TierRegressed.selector);
+        governor.executeProposal(pid);
+    }
+
+    /// @notice SHE-210, execute-side half: demoting ONLY the settlement leg
+    ///         between propose and execute must trip `TierRegressed`. The
+    ///         execute leg stays certified tier 0 throughout, so this passes
+    ///         only if the live comparison prices the settle leg too — a
+    ///         refactor that split the propose and execute tier resolutions
+    ///         apart would regress it silently without this pin.
+    function test_she210_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
+        _wireTierRegistry();
+        _certifyBenignSettleLeg();
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = _certifiedCall();
+        uint256 pid = _propose(calls);
+        assertEq(governor.getProposalTier(pid), 0);
+
+        _advancePastVoting();
+
+        // Owner demotes the settle leg's (usdc, approve) pair; the execute
+        // leg's certification is untouched.
+        tierRegistry.demote(address(usdc), usdc.approve.selector);
+        (uint8 settleTier,) = tierRegistry.tierOf(address(usdc), usdc.approve.selector);
+        assertEq(settleTier, 2);
+        (uint8 execTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
+        assertEq(execTier, 0); // control: the execute leg alone would still pass
 
         vm.expectRevert(ISyndicateGovernor.TierRegressed.selector);
         governor.executeProposal(pid);
@@ -390,6 +408,7 @@ contract TierResolutionTest is Test {
     ///         execution proceeds normally to Executed.
     function test_executeSucceedsWhenTierUnchanged() public {
         _wireTierRegistry();
+        _certifyBenignSettleLeg();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);

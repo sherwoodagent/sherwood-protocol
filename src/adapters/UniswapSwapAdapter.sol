@@ -232,37 +232,12 @@ contract UniswapSwapAdapter is ISwapAdapter {
                 })
             );
         } else if (mode == 1) {
-            // V3 multi-hop via chained `exactInputSingle` calls. SwapRouter02's
-            // `exactInput` computes wrong pool addresses for certain pairs on
-            // Base, so this decomposes the path and swaps hop-by-hop, which always
-            // resolves pools correctly. Each non-terminal hop's
-            // `amountOutMinimum` is derived at swap time from a quoter pre-call.
-            //
-            // That per-hop floor is a quoter/router CONSISTENCY check, NOT
-            // sandwich resistance: the quote is taken in this same transaction
-            // against the same pool, so a front-run that moved the pool moves the
-            // floor with it. The route's economic bound is the caller-supplied
-            // `amountOutMin` on the terminal hop, anchored on an oracle by
-            // `PortfolioStrategy._buyFloor` / `_sellFloor`.
             (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
             require(perHopSlippageBps <= 10_000, "slippage > 100%");
             address pathStart = _extractFirstAddress(path);
             if (pathStart != tokenIn) {
                 path = _reversePath(path);
             }
-            // BIND BOTH ENDPOINTS (pashov 2026-08 finding #4). Only the head was
-            // checked, and `tokenOut` was never referenced on this branch at
-            // all: `_chainedSingleHops` derives every hop from the path bytes
-            // and sends the terminal token to `msg.sender`, so the route decided
-            // what the caller received. `amountOutMin` is computed by the caller
-            // in `tokenOut` units — an oracle-anchored figure in
-            // `PortfolioStrategy._buyFloor`/`_sellFloor` — and was then enforced
-            // by the router against a DIFFERENT token's units, which any
-            // freely-mintable token clears trivially.
-            //
-            // Modes 0, 2 and 3 all bind `tokenOut` already (`exactInputSingle`'s
-            // struct field, `hops[0].currency`, and `_orientHops`' explicit
-            // endpoint check respectively); mode 1 was the sole exception.
             _requireEndpoints(path, tokenIn, tokenOut);
             amountOut = _chainedSingleHops(path, amountIn, amountOutMin, perHopSlippageBps);
         } else {
@@ -272,21 +247,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
     // ── Modes 2/3: Uniswap V4 single- and multi-hop (hookless) ──
 
-    /// @dev Drive the swap through `poolManager.unlock`, passing the route in the
-    ///      unlock payload (a dynamic path does not fit fixed transient slots).
-    ///      Output is `take`n directly to the original `swap()` caller.
-    ///      `amountOutMin` is enforced on the FINAL output after unlock returns,
-    ///      still inside the revert boundary, since v4 core enforces none itself.
-    ///
-    ///      MEV note: this terminal floor bounds TOTAL route slippage to the
-    ///      caller's budget; it does NOT localize which hop was attacked, unlike
-    ///      mode 1's per-hop quoter floors. Per-hop floors are NOT implementable
-    ///      here — the V4Quoter itself drives `poolManager.unlock` and a nested
-    ///      unlock reverts, and pre-quoting each hop before unlock would add
-    ///      nothing, since those quotes are computed against post-frontrun state.
-    ///      The binding protection for strategy flows is the CALLER-SIDE floor:
-    ///      `PortfolioStrategy.rebalanceDelta` derives `minOut` from Chainlink
-    ///      prices and passes it here.
     function _swapV4(address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, PathHop[] memory hops)
         internal
         returns (uint256 amountOut)
@@ -403,13 +363,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
         }
     }
 
-    /// @dev Execute a multi-hop swap as sequential `exactInputSingle` calls, with
-    ///      intermediate tokens held by this contract between hops. Each hop's
-    ///      `amountOutMinimum` is derived at swap time from the quoter, scaled by
-    ///      `perHopSlippageBps`; the final-hop floor takes the max of that and the
-    ///      top-level `amountOutMin`, so the existing slippage contract still
-    ///      holds. The adapter does the quoter calls so callers need not
-    ///      re-compute per-hop floors, keeping `extraData` static.
     function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin, uint16 perHopSlippageBps)
         internal
         returns (uint256 amountOut)
@@ -433,18 +386,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
                 IERC20(hopIn).forceApprove(address(v3Router), currentAmount);
             }
 
-            // Per-hop floor from a quoter pre-call, scaled by the caller's
-            // slippage budget. Final hop additionally honors the top-level
-            // `amountOutMin` so the legacy contract holds.
-            //
-            // Quote and swap run in the SAME transaction against the SAME pool,
-            // so the quote simulates the swap that follows: the floor binds only
-            // when the router diverges from the quoter (the SwapRouter02
-            // pool-resolution bug class this mode routes around — why it stays),
-            // and it gives no sandwich protection, since a front-run moves the
-            // pool the quote is read from. Intermediate hops therefore carry no
-            // independent economic floor; `amountOutMin` on the terminal hop
-            // bounds the route.
             (uint256 quoted,,,) = quoter.quoteExactInputSingle(
                 IQuoterV2.QuoteExactInputSingleParams({
                     tokenIn: hopIn, tokenOut: hopOut, amountIn: currentAmount, fee: fee, sqrtPriceLimitX96: 0
@@ -493,19 +434,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
         }
     }
 
-    /// @dev Require a packed V3 path to run exactly from `tokenIn` to
-    ///      `tokenOut`. Call AFTER any `_reversePath` orientation fix.
-    ///
-    ///      The tail check is the load-bearing half: without it a route may end
-    ///      anywhere, and since `_chainedSingleHops` pays the terminal token to
-    ///      `msg.sender` while `amountOutMin` is denominated by the caller in
-    ///      `tokenOut`, the floor gets enforced against units it does not
-    ///      describe. The head check is re-asserted here rather than trusted
-    ///      from the caller's `if`, so this function is a complete statement of
-    ///      the invariant on its own.
-    ///
-    ///      Path layout is `addr(20) [+ fee(3) + addr(20)]*`, so the terminal
-    ///      address begins at `length - 20`.
     function _requireEndpoints(bytes memory path, address tokenIn, address tokenOut) internal pure {
         if (path.length < 20) revert InvalidPath();
         if (_extractFirstAddress(path) != tokenIn) revert InvalidPath();

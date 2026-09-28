@@ -52,7 +52,7 @@ contract DeployTierRegistrySeedTest is Test {
         vm.chainId(4663);
         harness = new SeedHarness();
         // The registry's owner must be whoever actually makes the nested
-        // `setAdapterAllowed` call. Under `vm.broadcast` that is the deployer
+        // `setCounterpartyAllowed` call. Under `vm.broadcast` that is the deployer
         // EOA; in this harness it is the harness contract. Pranking the entry
         // call would NOT carry into the nested one, so the owner is bound to
         // the harness and `deployer` below is its stand-in.
@@ -82,14 +82,11 @@ contract DeployTierRegistrySeedTest is Test {
         assertTrue(registry.isCounterpartyAllowed(MORPHO_BLUE), "morpho not attested as counterparty");
     }
 
-    /// @dev Morpho needs BOTH axes and they are different questions:
-    ///      `isCounterpartyAllowed` says a template may bind it,
-    ///      `isAdapterAllowed` says vault funds may be spent into it.
-    ///      `MorphoSupplyStrategy._requireAllowedMorpho` reads the adapter axis.
-    function test_seed_attestsMorphoOnTheAdapterAxisToo() public {
-        assertFalse(registry.isAdapterAllowed(MORPHO_BLUE), "morpho adapter-attested before seeding");
+    /// @dev `MorphoSupplyStrategy._requireAllowedMorpho` reads the counterparty axis.
+    function test_seed_attestsMorphoAsACounterparty() public {
+        assertFalse(registry.isCounterpartyAllowed(MORPHO_BLUE), "morpho attested before seeding");
         _seed();
-        assertTrue(registry.isAdapterAllowed(MORPHO_BLUE), "morpho not attested as adapter");
+        assertTrue(registry.isCounterpartyAllowed(MORPHO_BLUE), "morpho not attested as counterparty");
     }
 
     /// @dev The encoding is the whole test. `PortfolioStrategy._initialize`
@@ -101,7 +98,7 @@ contract DeployTierRegistrySeedTest is Test {
     function test_seed_pairsFeedsUnderTheEncodingTheStrategyActuallyQueries() public {
         _seed();
 
-        assertTrue(registry.isAdapterAllowed(CHAINLINK_TSLA_USD_FEED), "TSLA feed not allowlisted");
+        assertTrue(registry.isCounterpartyAllowed(CHAINLINK_TSLA_USD_FEED), "TSLA feed not allowlisted");
         assertTrue(
             registry.isPriceSourceForToken(TSLA, bytes32(uint256(uint160(CHAINLINK_TSLA_USD_FEED)))),
             "TSLA feed not paired to TSLA under the bare-address encoding"
@@ -142,7 +139,7 @@ contract DeployTierRegistrySeedTest is Test {
         _seed();
 
         assertFalse(registry.isCounterpartyAllowed(UNISWAP_V3_FACTORY), "seeded a registry it no longer owns");
-        assertFalse(registry.isAdapterAllowed(MORPHO_BLUE), "seeded a registry it no longer owns");
+        assertFalse(registry.isCounterpartyAllowed(MORPHO_BLUE), "seeded a registry it no longer owns");
     }
 
     /// @dev Ownable2Step: `transferOwnership` alone only sets `pendingOwner`,
@@ -170,6 +167,6 @@ contract DeployTierRegistrySeedTest is Test {
         vm.chainId(31337);
         _seed();
         assertFalse(registry.isCounterpartyAllowed(UNISWAP_V3_FACTORY), "attested from a nonexistent book");
-        assertFalse(registry.isAdapterAllowed(MORPHO_BLUE), "attested from a nonexistent book");
+        assertFalse(registry.isCounterpartyAllowed(MORPHO_BLUE), "attested from a nonexistent book");
     }
 }

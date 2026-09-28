@@ -67,6 +67,8 @@ contract MockStakedWood is IStakedWood {
     uint256 public slashGuardiansCallCount;
     bytes32 public lastSlashReviewKey;
     uint256 public lastSlashBps;
+    address[] public lastSlashApprovers;
+    uint256[] public lastSlashBpsPer;
     uint256 public slashOwnerBondCallCount;
     address public lastSlashedVault;
 
@@ -204,6 +206,13 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
+    /// @dev A constant, not a settable slot: `IStakedWood` declares the member but
+    ///      no fixture puts this mock behind a real `GuardianRegistry`, so a setter
+    ///      would have no reachable caller. Restore it when one does (SHE-215).
+    function ownerBondLive(address) external pure returns (bool) {
+        return true;
+    }
+
     /// @dev Anchor-aware slash basis (issue #35). DEFAULTS to live
     ///      `guardianStake`, same pattern as `getPastStake`'s default: most
     ///      fixtures do not care about the anchor distinction, so an
@@ -232,21 +241,30 @@ contract MockStakedWood is IStakedWood {
 
     // ── Registry-only mutations (no-op stubs that record args) ──
     // Sherlock run #3 #6: signature carries `openedAt` — sWOOD sizes the slash
-    // off the raw own-stake checkpoint at open. Mock ignores it.
+    // off the raw own-stake checkpoint at open. Mock ignores it. Declared
+    // coverage locks: the rate is PER APPROVER (each approver's lock over its
+    // basis, scaled by severity); the mock records the array and, for the
+    // pre-existing single-rate assertions, the first element (0 when empty).
     function slashGuardians(
         bytes32 reviewKey,
         uint256,
         /* openedAt */
-        address[] calldata,
-        uint256 slashBps
-    )
-        external
-    {
+        address[] calldata approvers,
+        uint256[] calldata slashBpsPer
+    ) external {
         slashGuardiansCallCount++;
         lastSlashReviewKey = reviewKey;
-        lastSlashBps = slashBps;
+        lastSlashBps = slashBpsPer.length != 0 ? slashBpsPer[0] : 0;
+        delete lastSlashApprovers;
+        delete lastSlashBpsPer;
+        for (uint256 i = 0; i < approvers.length; i++) {
+            lastSlashApprovers.push(approvers[i]);
+            lastSlashBpsPer.push(slashBpsPer[i]);
+        }
     }
 
+    /// @dev Models the funding half of `slashOwnerBond` only; the real one also
+    ///      deletes the record, which `ownerBondLive` here cannot observe.
     function slashOwnerBond(address vault) external {
         slashOwnerBondCallCount++;
         lastSlashedVault = vault;

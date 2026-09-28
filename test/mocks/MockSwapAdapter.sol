@@ -23,11 +23,41 @@ contract MockSwapAdapter is ISwapAdapter {
 
     uint256 public constant RATE_PRECISION = 1e18;
 
+    /// @notice Fraction of `amountIn` actually pulled, in bps. An adapter that pays the full
+    ///         quote while pulling less leaves the remainder on the caller.
+    uint256 public pullBps = 10_000;
+
+    /// @notice When set, `quote` reverts while `swap` still fills at the rate.
+    bool public quoteReverts;
+
+    /// @notice Number of `swap` calls served.
+    uint256 public swapCalls;
+
+    /// @notice When nonzero, `swap` pays exactly this amount regardless of the rate.
+    uint256 public fixedAmountOut;
+
+    /// @notice Arguments of the last `swap` served.
+    uint256 public lastAmountIn;
+    uint256 public lastAmountOutMin;
+
     error RateNotSet();
+    error QuoteDisabled();
     error SlippageExceeded();
 
     function setRate(address tokenIn, address tokenOut, uint256 rate) external {
         rates[_pairKey(tokenIn, tokenOut)] = rate;
+    }
+
+    function setPullBps(uint256 bps) external {
+        pullBps = bps;
+    }
+
+    function setQuoteReverts(bool v) external {
+        quoteReverts = v;
+    }
+
+    function setFixedAmountOut(uint256 v) external {
+        fixedAmountOut = v;
     }
 
     /// @inheritdoc ISwapAdapter
@@ -44,11 +74,14 @@ contract MockSwapAdapter is ISwapAdapter {
     {
         uint256 rate = rates[_pairKey(tokenIn, tokenOut)];
         if (rate == 0) revert RateNotSet();
+        swapCalls++;
+        lastAmountIn = amountIn;
+        lastAmountOutMin = amountOutMin;
 
-        amountOut = (amountIn * rate) / RATE_PRECISION;
+        amountOut = fixedAmountOut != 0 ? fixedAmountOut : (amountIn * rate) / RATE_PRECISION;
         if (amountOut < amountOutMin) revert SlippageExceeded();
 
-        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), (amountIn * pullBps) / 10_000);
         IERC20(tokenOut).safeTransfer(msg.sender, amountOut);
     }
 
@@ -64,6 +97,7 @@ contract MockSwapAdapter is ISwapAdapter {
         override
         returns (uint256 amountOut)
     {
+        if (quoteReverts) revert QuoteDisabled();
         uint256 rate = rates[_pairKey(tokenIn, tokenOut)];
         if (rate == 0) revert RateNotSet();
         amountOut = (amountIn * rate) / RATE_PRECISION;

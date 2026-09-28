@@ -107,7 +107,7 @@ contract RobinhoodMainnetFullExitTest is RobinhoodMainnetIntegrationTest {
             address(new UniswapSwapAdapter(UNISWAP_SWAP_ROUTER, UNISWAP_QUOTER_V2, V4_POOL_MANAGER, V4_QUOTER));
         template = address(new PortfolioStrategy());
         vm.prank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(swapAdapter, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(swapAdapter, true);
 
         // Asymmetric book: lp1 15k, lp2 10k.
         _dealUSDG(lp1, LP1_EXTRA);
@@ -138,21 +138,11 @@ contract RobinhoodMainnetFullExitTest is RobinhoodMainnetIntegrationTest {
         extraData[0] = abi.encodePacked(uint8(0), abi.encode(FEE_500));
         uint8[] memory priceDecimals = new uint8[](1);
         priceDecimals[0] = 8;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(uint160(CHAINLINK_ETH_USD_FEED)));
+        address[] memory feeds = new address[](1);
+        feeds[0] = CHAINLINK_ETH_USD_FEED;
 
-        return abi.encode(
-            USDG,
-            swapAdapter,
-            address(0), // push mode
-            tokens,
-            weights,
-            totalAmt,
-            MAX_SLIPPAGE_BPS,
-            extraData,
-            priceDecimals,
-            feedIds
-        );
+        return
+            abi.encode(USDG, swapAdapter, tokens, weights, totalAmt, MAX_SLIPPAGE_BPS, extraData, priceDecimals, feeds);
     }
 
     function _execCalls(address strategy, uint256 amount) internal pure returns (BatchExecutorLib.Call[] memory calls) {

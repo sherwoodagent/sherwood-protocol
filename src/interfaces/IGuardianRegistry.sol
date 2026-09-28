@@ -68,28 +68,32 @@ interface IGuardianRegistry {
     event GovernorAdded(address indexed governor);
     /// @notice Governor pushed a proposal's review window at propose time.
     event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
-    event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
+    event ReviewOpened(address indexed governor, uint256 indexed proposalId, uint128 totalStakeAtOpen);
+    /// @notice First vote on a review. `governor` disambiguates: per-vault governors
+    ///         all number proposals from 1. Blocker attribution is an off-chain join
     event GuardianVoteCast(
-        uint256 indexed proposalId, address indexed guardian, GuardianVoteType support, uint128 weight
+        address indexed governor,
+        uint256 indexed proposalId,
+        address indexed guardian,
+        GuardianVoteType support,
+        uint128 weight
     );
+    /// @notice Side flip before the late-vote lockout; weight is the one from `GuardianVoteCast`.
     event GuardianVoteChanged(
-        uint256 indexed proposalId, address indexed guardian, GuardianVoteType from, GuardianVoteType to
+        address indexed governor,
+        uint256 indexed proposalId,
+        address indexed guardian,
+        GuardianVoteType from,
+        GuardianVoteType to
     );
-    event ApproverCapReached(uint256 indexed proposalId);
-    /// @notice Emitted when a Block vote is rejected because the blocker
-    ///         array has hit `MAX_BLOCKERS_PER_PROPOSAL`. Parallels
-    ///         `ApproverCapReached`.
-    event BlockerCapReached(uint256 indexed proposalId);
-    event ReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
+    event ApproverCapReached(address indexed governor, uint256 indexed proposalId);
+    event ReviewResolved(address indexed governor, uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     event EmergencyReviewOpened(uint256 indexed proposalId, bytes32 callsHash, uint64 reviewEnd);
     event EmergencyReviewCancelled(uint256 indexed proposalId);
-    event EmergencyBlockVoteCast(uint256 indexed proposalId, address indexed guardian, uint128 weight);
-    event EmergencyReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
-    // Emitted per blocker when a review resolves blocked = true. Merkl's
-    // off-chain bot reads this to build the epoch WOOD campaign's Merkle roots.
-    event BlockerAttributed(
-        address indexed governor, uint256 indexed proposalId, uint256 epochId, address indexed blocker, uint256 weight
+    event EmergencyBlockVoteCast(
+        address indexed governor, uint256 indexed proposalId, address indexed guardian, uint128 weight
     );
+    event EmergencyReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     event Paused(address indexed by);
     event Unpaused(address indexed by, bool deadman);
     event SlashAppealReserveFunded(address indexed by, uint256 amount);
@@ -105,7 +109,19 @@ interface IGuardianRegistry {
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
     ///         at `resolveReview`.
-    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external;
+    /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
+    ///         locks behind the proposal; the ledger locks
+    ///         `min(lockWood, free budget)`, and rejects the vote when what it
+    ///         books is worth less than the smaller of one slot's share of the
+    ///         proposal's coverage need and the guardian's whole-budget
+    ///         valuation, or when that valuation is zero — approver slots are
+    ///         bounded, so one has to be paid for. It rejects the vote for the
+    ///         same reason when the need cannot be read or priced, or when
+    ///         settlement lies beyond the ledger's coverage horizon.
+    ///         That lock is what a conviction burns (under sWOOD's
+    ///         `[minSlashBps, maxSlashBps]` envelope) and what counts toward the
+    ///         execute-time coverage quorum at live value. Ignored on Block.
+    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 lockWood) external;
 
     // ── Multi-governor management ──
     function addGovernor(address governor, address vault) external;
@@ -198,15 +214,18 @@ interface IGuardianRegistry {
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
 
     /// @notice Per-proposal approver set plus the COVERAGE each one actually
-    ///         underwrote, from the exposure ledger's settled allocation.
+    ///         underwrote: the exposure ledger's `coverageUsdOf`, i.e.
+    ///         `min(lock, slashable stake)` at the live WOOD price, uncapped at
+    ///         the proposal's need.
     /// @dev    The weight guardian fees should be paid on. `getApproverWeights`
     ///         returns staked WOOD, which pays for parking capital rather than for
-    ///         underwriting — an approver the ledger booked nothing for still
+    ///         underwriting — an approver the ledger locked nothing for still
     ///         appears there at full stake weight. Weighting on this instead pays
-    ///         zero for a zero-coverage approve without touching anyone's right to
-    ///         vote.
+    ///         zero for a zero-lock approve without touching anyone's right to
+    ///         vote, and pays a guardian who locked more (and so stands to burn
+    ///         more) proportionally more.
     /// @return approvers   Registry-side approver set for the proposal.
-    /// @return coverageUsd Allocated coverage per approver, USD-18. Zero entries
+    /// @return coverageUsd Locked coverage per approver, USD-18. Zero entries
     ///                     are real: that approver underwrote nothing.
     /// @return priced      False when the ledger could not value the coverage.
     ///                     RETRY — do not treat the zeros as a payable result.
@@ -230,6 +249,10 @@ interface IGuardianRegistry {
     /// @notice A vault's bound owner stake. Passthrough to sWOOD —
     ///         `GovernorEmergency` reads it through the registry handle.
     function ownerStake(address vault) external view returns (uint256);
+
+    /// @notice True iff `vault`'s owner-stake slot is bound and not exiting.
+    ///         Passthrough to sWOOD — the route `SyndicateGovernor` already has
+    function ownerBondLive(address vault) external view returns (bool);
 
     /// @notice The minimum WOOD a vault owner must bond. Passthrough to sWOOD.
     function minOwnerStake() external view returns (uint256);

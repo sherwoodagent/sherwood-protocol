@@ -15,6 +15,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {MockLedgerFullLocks} from "../mocks/MockLedgerFullLocks.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
@@ -200,6 +201,16 @@ contract ProposalLifecycleTest is Test {
         vm.prank(owner);
         swood.setRegistry(address(registry));
 
+        // Declared coverage locks: a review-path slash burns each approver's
+        // LOCK, so an unwired ledger has nothing to burn and a blocked review
+        // slashes nobody. Wire a ledger under which every approver locked its
+        // whole stake (rate 10_000) — the pre-lock slash shape the severity
+        // arithmetic below (`EXPECTED_SEVERITY_BPS` of the whole stake) pins.
+        MockLedgerFullLocks fullLockLedger = new MockLedgerFullLocks();
+        fullLockLedger.setGuardianRegistry(address(registry));
+        vm.prank(owner);
+        registry.setExposureLedger(address(fullLockLedger));
+
         // LPs deposit, then the block advances once — every proposal's
         // `snapshotTimestamp` (propose ts - 1) then sees the full supply.
         usdc.mint(lp1, 100_000e6);
@@ -342,15 +353,15 @@ contract ProposalLifecycleTest is Test {
     function _reviewWithBlockQuorum(uint256 pid) private {
         registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g4);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         vm.prank(g5);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
     }
 
     function _assertNoGuardianSlashing(string memory reason) private view {
@@ -461,9 +472,9 @@ contract ProposalLifecycleTest is Test {
         // Guardians review; nobody blocks.
         registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         _warpPast(p.reviewEnd);
 
@@ -600,7 +611,8 @@ contract ProposalLifecycleTest is Test {
         assertEq(emitted, 0, "Approved -> Expired must NOT re-run the review economic commit");
         assertEq(governor.openProposalCount(), 0, "expiry releases the vault binding");
 
-        // The vault is free again.
+        // The vault is free again once the settle cooldown the flush stamped has elapsed.
+        vm.warp(governor.getCooldownEnd());
         uint256 pid2 = _propose();
         assertGt(pid2, pid, "a fresh proposal id was minted");
         _assertState(pid2, ISyndicateGovernor.ProposalState.Pending, "the new proposal opens in Pending");
@@ -734,6 +746,7 @@ contract ProposalLifecycleTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid);
         assertEq(governor.openProposalCount(), 0, "cancel releases the binding");
+        vm.warp(governor.getCooldownEnd()); // cancel stamps the settle cooldown propose honours
 
         // ── Collaborative: NOT registered while Draft ──
         uint256 cpid = _proposeCollaborative();
@@ -772,7 +785,7 @@ contract ProposalLifecycleTest is Test {
 
         registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         _warpPast(_proposal(pid).reviewEnd);
 
         // Determinable as Cleared — but the registry cannot take the commit.
@@ -808,7 +821,7 @@ contract ProposalLifecycleTest is Test {
 
         registry.openReview(address(governor), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         _warpPast(_proposal(pid).reviewEnd);
 
         // Resolve out-of-band, THEN pause.

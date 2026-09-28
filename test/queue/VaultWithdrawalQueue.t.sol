@@ -76,8 +76,8 @@ contract VaultWithdrawalQueueTest is Test {
     ///         exists. Both legs may stay open precisely because neither pays:
     ///         claiming always mints at the current price, and cancelling just
     ///         returns the escrow. Cancel MUST stay open, because the deposit
-    ///         gate can hold a claim shut while a residue is outstanding and a
-    ///         depositor must never be wedged between two closed exits.
+    ///         gate holds a claim shut while a proposal is open and a depositor
+    ///         must never be wedged between two closed exits.
     function test_finding10_depositCancelStaysOpenBecauseTheOptionIsWorthless() public {
         uint256 pidOther = PID + 1;
         uint256 id = _queueDeposit(alice, 1_000e6);
@@ -98,10 +98,10 @@ contract VaultWithdrawalQueueTest is Test {
     }
 
     /// @notice The other half of the same property: a depositor whose claim is
-    ///         gated shut by an outstanding residue can always still walk. This
-    ///         is why deposit-cancel must be unconditional rather than merely
+    ///         gated shut by an open proposal can always still walk. This is why
+    ///         deposit-cancel must be unconditional rather than merely
     ///         convenient.
-    function test_depositCancelOpenEvenWhileTheResidueGateHoldsClaimShut() public {
+    function test_depositCancelOpenEvenWhileTheDepositGateHoldsClaimShut() public {
         uint256 id = _queueDeposit(alice, 1_000e6);
         vault.setDepositsLocked(true);
 
@@ -333,36 +333,33 @@ contract VaultWithdrawalQueueTest is Test {
         assertEq(out, 100e18, "claimable with no settlement ever stamped");
     }
 
-    /// @notice THE FINDING-#3 GATE. While the vault reports a residue
-    ///         outstanding, a queued deposit cannot mint — that is the instant
-    ///         at which the price is blind to strategy-held value and minting
-    ///         would skim it from the incumbents.
-    function test_claim_deposit_refusedWhileResidueOutstanding() public {
+    /// @notice While the vault reports deposits locked (a proposal is open), a
+    ///         queued deposit cannot mint — that is the instant at which the
+    ///         price is blind to strategy-held value and minting would skim it
+    ///         from the incumbents.
+    function test_claim_deposit_refusedWhileDepositsLocked() public {
         _queueDeposit(alice, 200e18);
         vault.setDepositsLocked(true);
         vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
         queue.claim(1);
 
-        // Residue cleared (swept in) — the claim opens, at the corrected price.
+        // The proposal settled — the claim opens, at the settled price.
         vault.setDepositsLocked(false);
         vault.setConvertRate(1, 2);
         assertEq(queue.claim(1), 100e18, "claimable once the residue is in");
     }
 
-    /// @notice THE SKIM ITSELF, INVERTED. A residue arriving between request and
-    ///         claim raises the price, so the depositor mints FEWER shares — it
-    ///         is priced in rather than skimmed. Under the old frozen stamp the
-    ///         same sequence minted at the pre-residue price and the difference
-    ///         was taken from the incumbents.
-    function test_claim_deposit_residueArrivingBeforeClaimIsPricedIn() public {
+    /// @notice A price rise between request and claim means the depositor mints
+    ///         FEWER shares — the claim converts LIVE, never at a stale stamp.
+    function test_claim_deposit_priceRisingBeforeClaimIsPricedIn() public {
         _queueDeposit(alice, 200e18);
 
-        // Pre-residue the vault is worth 2 assets/share; the residue lands and
-        // each share is now backed by 4.
+        // At request the vault is worth 2 assets/share; by claim each share is
+        // backed by 4.
         vault.setConvertRate(1, 4);
 
         uint256 out = queue.claim(1);
-        assertEq(out, 50e18, "minted at the post-residue price, not the stale one");
+        assertEq(out, 50e18, "minted at the live price, not the stale one");
     }
 
     // ── one frozen price for the whole proposal ──

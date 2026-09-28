@@ -25,6 +25,10 @@ contract MockAssetSink {
     function pushBack(uint256 amt) external {
         usdc.transfer(vaultAddr, amt);
     }
+
+    function pull(uint256 amt) external {
+        usdc.transferFrom(msg.sender, address(this), amt);
+    }
 }
 
 /// @notice Task 4 (spec 2026-07-22 §3.1): `executeGovernorBatch` enforces the
@@ -77,11 +81,13 @@ contract OutflowMeteringTest is Test {
 
     /// @dev Single-call batch that sends `amount` of vault float to the sink
     ///      (stands in for a strategy deployment pulling capital).
+    /// @dev Capital leaves only through an allowance a callee pulls inside the batch.
     function _outflowBatch(uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
-        calls = new BatchExecutorLib.Call[](1);
+        calls = new BatchExecutorLib.Call[](2);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(sink), amount)), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(sink), amount)), value: 0
         });
+        calls[1] = BatchExecutorLib.Call({target: address(sink), data: abi.encodeCall(sink.pull, (amount)), value: 0});
     }
 
     function test_batchWithinCapExecutes() public {

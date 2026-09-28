@@ -18,6 +18,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {MockLedgerFullLocks} from "../mocks/MockLedgerFullLocks.sol";
 
 /// @title SwoodReviewSlash.t
 /// @notice End-to-end integration test for the sWOOD staking-split (Task 11.1).
@@ -219,6 +220,14 @@ contract SwoodReviewSlashTest is Test {
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(owner);
         swood.setRegistry(address(registry));
+        // Declared coverage locks: the review-path slash burns each approver's
+        // LOCK RATE x severity, and with no ledger wired every rate is zero.
+        // Wire the whole-stake stand-in so the severity arithmetic this suite
+        // pins lands on real balances exactly as before.
+        MockLedgerFullLocks fullLocks = new MockLedgerFullLocks();
+        fullLocks.setGuardianRegistry(address(registry));
+        vm.prank(owner);
+        registry.setExposureLedger(address(fullLocks));
 
         // LPs deposit so the proposal vote has votable supply.
         usdc.mint(lp1, 100_000e6);
@@ -349,13 +358,13 @@ contract SwoodReviewSlashTest is Test {
 
         // ── 3. guardian votes: 1 Approve, 3 Block (no severity arg) ──
         vm.prank(gApprove);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(gBlock1);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block); // 10k weight
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max); // 10k weight
         vm.prank(gBlock2);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block); // 20k weight
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max); // 20k weight
         vm.prank(gBlock3);
-        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block); // 50k weight
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max); // 50k weight
 
         // ── 4. review window ends → resolveReview ──
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);

@@ -45,6 +45,13 @@ contract MockGovernorWithDuration {
         one[0] = BatchExecutorLib.Call({target: defaultTarget, data: abi.encodePacked(defaultSelector), value: 0});
         return one;
     }
+
+    /// @dev Empty: this stub's only adapter sits on the execute leg. Implemented
+    ///      so a filing naming anything else reaches `AdapterNotInProposal`
+    ///      rather than reverting on a selector the stub does not carry.
+    function getSettlementCalls(uint256) external pure returns (BatchExecutorLib.Call[] memory) {
+        return new BatchExecutorLib.Call[](0);
+    }
 }
 
 /// @dev `MockChallengeLedger` plus the one view `honestFilingNetPayoffBps`

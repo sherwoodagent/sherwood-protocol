@@ -12,7 +12,6 @@ import {GovernorBeacon} from "../src/GovernorBeacon.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
-import {CallSandbox} from "../src/CallSandbox.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
@@ -138,49 +137,6 @@ contract SyndicateFactoryTest is Test {
         assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
     }
 
-    /// @notice The sandbox implementation reaches the vault at creation. The
-    ///         vault's own setter is factory-only and set-once, so this is the
-    ///         ONLY moment a vault can ever get one — a factory that goes live
-    ///         unbound produces vaults permanently unable to run a payload.
-    function test_createSyndicate_bindsTheSandboxImplementation() public {
-        address impl = address(new CallSandbox());
-        vm.prank(owner);
-        factory.setSandboxImpl(impl);
-
-        vm.prank(creator1);
-        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
-
-        assertEq(SyndicateVault(payable(vaultAddr)).sandboxImplementation(), impl, "bound at creation");
-    }
-
-    /// @notice Unbound is a working factory, not a broken one — existing
-    ///         deployments keep creating vaults. Those vaults simply have no
-    ///         sandbox, and `proposeWithSandbox` refuses against them at propose.
-    function test_createSyndicate_withoutASandboxImplStillSucceeds() public {
-        assertEq(factory.sandboxImpl(), address(0), "fixture sanity: unbound");
-
-        vm.prank(creator1);
-        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
-
-        assertEq(SyndicateVault(payable(vaultAddr)).sandboxImplementation(), address(0), "no sandbox, no revert");
-    }
-
-    /// @notice A codeless implementation would be stamped into every future
-    ///         vault and then cloned into an address with no code — a sandbox
-    ///         that accepts the funding and does nothing.
-    function test_setSandboxImpl_refusesACodelessAddress() public {
-        vm.prank(owner);
-        vm.expectRevert(SyndicateFactory.InvalidSandboxImpl.selector);
-        factory.setSandboxImpl(address(0xBEEF));
-    }
-
-    function test_setSandboxImpl_onlyOwner() public {
-        address impl = address(new CallSandbox());
-        vm.prank(creator1);
-        vm.expectRevert();
-        factory.setSandboxImpl(impl);
-    }
-
     /// @notice A freshly created vault's governor starts at the advertised 20%
     ///         headline, not at the 30% protocol ceiling. The settle-time clamp
     ///         resolves an over-ceiling rate silently, so a permissive default
@@ -296,14 +252,7 @@ contract SyndicateFactoryTest is Test {
         vault.deposit(50_000e6, lp);
         vm.stopPrank();
 
-        // The fixture now wires a real TierRegistry (pashov finding #1), so the
-        // vault's spender gate is LIVE rather than skipped — allowlist the
-        // approve target the way a real deployment would.
-        address _owner = factory.owner();
-        TierRegistry _reg = TierRegistry(factory.tierRegistry());
         address _protocolSpender = makeAddr("protocol");
-        vm.prank(_owner);
-        _reg.setAdapterAllowed(_protocolSpender, true);
 
         // Governor executes batch (strategy-style approve — onlyGovernor after V-C3)
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
@@ -315,7 +264,7 @@ contract SyndicateFactoryTest is Test {
         vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
 
         // Verify: vault set the approval (delegatecall)
-        assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 1_000e6);
+        assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 0, "no allowance outlives the batch");
     }
 
     function test_storageIsolation() public {
@@ -904,35 +853,6 @@ contract SyndicateFactoryTest is Test {
         // asserted implicitly by the mocked registry accepting the call in setUp.
     }
 
-    /// @notice pashov finding #1 (THE live route) — a vault must not be
-    ///         CREATABLE without a TierRegistry.
-    /// @dev    `createSyndicate` SKIPPED the wiring when the factory's own
-    ///         pointer was unset, rather than refusing, so every vault created
-    ///         in that window was permanently registry-less. In that state
-    ///         `SyndicateVault._guardBatchCalls` resolves no registry and
-    ///         RETURNS, skipping the callee allowlist, the spender/recipient
-    ///         gate and the `UnrecognizedAssetSelector` branch — after which one
-    ///         instruction, `asset.approve(attacker, max)`, moves zero balance
-    ///         (so every meter reads zero) and licenses an unbounded pull in a
-    ///         LATER transaction.
-    ///
-    ///         Closes the STATE, not the symptom — the vault's runtime guard is
-    ///         deliberately untouched. This was the only LIVE route to
-    ///         `_tierRegistry == 0`: `setTierRegistry` is `onlyFactory` and both
-    ///         factory call sites already filtered zero, so the governor-side
-    ///         check is defence-in-depth, not a second open door.
-    function test_createSyndicate_refusesWhileFactoryHasNoRegistry() public {
-        // setUp wires one, so reproduce the unwired state explicitly. Zero is
-        // legal on the FACTORY setter on purpose — it blocks new syndicates.
-        vm.prank(owner);
-        factory.setTierRegistry(address(0));
-        assertEq(factory.tierRegistry(), address(0), "precondition: factory has no registry");
-
-        vm.prank(creator1);
-        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
-        factory.createSyndicate(creator1AgentId, _configWithSubdomain("no-registry"));
-    }
-
     /// @notice pashov finding #1, defence-in-depth — a wired registry must not
     ///         be REMOVABLE. `setTierRegistry(address(0))` was explicitly legal
     ///         and its natspec called it "the safe default"; it would re-open
@@ -957,7 +877,7 @@ contract SyndicateFactoryTest is Test {
         SyndicateGovernor(gov).setTierRegistry(address(0));
 
         // Same branch refuses codeless: an EOA passes every zero-check, then
-        // bricks the vault's typed `isCallableTarget` call.
+        // bricks the governor's typed `tierOf` call at propose.
         vm.prank(address(factory));
         vm.expectRevert(ISyndicateGovernor.TierRegistryNotWired.selector);
         SyndicateGovernor(gov).setTierRegistry(makeAddr("eoaRegistry"));
@@ -1013,19 +933,18 @@ contract SyndicateFactoryTest is Test {
         );
     }
 
-    /// @notice The factory-side setter rejects a codeless registry but still
-    ///         accepts `address(0)`.
-    /// @dev    Asymmetric on purpose: zero is a fail-CLOSED kill switch on new
-    ///         syndicates and cannot un-wire an existing governor, whereas an
-    ///         EOA would be pushed into every later governor and brick it.
-    function test_setTierRegistry_factoryRejectsCodelessButAllowsZero() public {
+    /// @notice The factory-side setter rejects zero and codeless alike: an
+    ///         unwired factory would brick `createSyndicate` at governor init.
+    function test_setTierRegistry_factoryRejectsCodelessAndZero() public {
+        address before = factory.tierRegistry();
         vm.prank(owner);
         vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
         factory.setTierRegistry(makeAddr("eoaRegistry"));
 
         vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
         factory.setTierRegistry(address(0));
-        assertEq(factory.tierRegistry(), address(0), "zero is a legal kill switch on the factory side");
+        assertEq(factory.tierRegistry(), before, "registry unchanged after both refusals");
     }
 
     /// @notice Task 7 wiring: when the factory owner sets a non-zero

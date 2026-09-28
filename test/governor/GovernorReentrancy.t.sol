@@ -329,4 +329,14 @@ contract ReentrantRegistry {
     function outcomeOf(address, uint256) external pure returns (IGuardianRegistry.ReviewOutcome) {
         return IGuardianRegistry.ReviewOutcome.Cleared;
     }
+
+    /// @dev The governor consults the vault's owner bond at `propose` and
+    ///      `executeProposal` (SHE-215), so this hostile stub must answer it
+    ///      for the same reason it answers `paused()` — a missing selector
+    ///      reverts with empty data and would mask the `Reentrancy()` these
+    ///      tests match on. Always live: an unbonded vault would refuse the
+    ///      proposal before the reentry path under test is ever reached.
+    function ownerBondLive(address) external pure returns (bool) {
+        return true;
+    }
 }

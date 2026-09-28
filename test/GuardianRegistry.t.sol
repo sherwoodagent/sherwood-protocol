@@ -33,6 +33,7 @@ import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 contract GuardianRegistryInitTest is RegistryTestHarness {
     function setUp() public {
         _deployRegistryAndSwood(24 hours, 3000);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
     }
 
     function test_initialize_setsFields() public view {
@@ -66,6 +67,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, 3000);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
     }
 
     function _stakeN(uint256 n) internal {
@@ -95,7 +97,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 50_000e18);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 50_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
 
         assertEq(swood.totalGuardianStake(), 50_000e18);
@@ -113,7 +115,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 30_000e18);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 30_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
     }
 
@@ -168,7 +170,9 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         // Leg 2: no guardian can vote on it.
         vm.prank(guardians[0]);
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         // Leg 3: the reward-attribution surface stays empty.
         (address[] memory approvers,, uint128 totalApproveWeight) =
@@ -186,6 +190,7 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, 3000);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
 
         // Stake 5 guardians × 10_000e18 = 50_000e18 to exactly meet
         // MIN_COHORT_STAKE_AT_OPEN.
@@ -218,9 +223,13 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address g = _guardian(0);
 
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, 10_000e18
+        );
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     function test_voteOnProposal_block_updatesBlockers_andWeight() public {
@@ -228,16 +237,22 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address g = _guardian(1);
 
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18
+        );
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
     }
 
     function test_voteOnProposal_revertsIfReviewNotOpen() public {
         address g = _guardian(0);
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     function test_voteOnProposal_revertsAfterReviewEnd() public {
@@ -246,7 +261,9 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address g = _guardian(0);
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     function test_voteOnProposal_revertsIfNotActiveGuardian() public {
@@ -254,7 +271,9 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address stranger = address(0xDEADBEEF);
         vm.prank(stranger);
         vm.expectRevert(IGuardianRegistry.NotActiveGuardian.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     /// @notice Issue #82's anchor-checkpoint fix: a top-up strictly AFTER
@@ -285,9 +304,13 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         // top-up's later re-anchor is invisible to this read. factor = 10_000
         // (par) → 10_000e18, unmoved by the top-up.
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18
+        );
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
     }
 
     function test_voteOnProposal_revertsIfSupportIsNone() public {
@@ -295,7 +318,9 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address g = _guardian(0);
         vm.prank(g);
         vm.expectRevert();
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.None);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.None, type(uint256).max
+        );
     }
 
     function test_voteOnProposal_capHitEmitsEventAndReverts() public {
@@ -308,26 +333,10 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address last = address(uint160(0x100000 + cap));
         _stakeGuardian(last, 10_000e18, 999);
 
-        // audit-181-second finding A: `_growthGatedVoteWeight` clamps a
-        // voter's own numerator weight to what they held `FLOOR_LOOKBACK`
-        // before `openedAt` whenever their raw stake grew over that window
-        // (mirrors `TokenCourt.vote`, issue #82). A guardian staked only
-        // seconds before `openReview` had ZERO stake at the lookback
-        // instant, so the clamp zeroes their vote weight and
-        // `voteOnProposal` reverts `NotActiveGuardian()` on a 0-weight
-        // first vote. Age the new cohort past `FLOOR_LOOKBACK` (same 30d as
-        // this harness's `maturationPeriod`, so this also brings them to
-        // par) so their stake already existed at the lookback checkpoint
-        // and the clamp is a no-op, matching the un-gated pre-remediation
-        // behaviour this test exercises (the cap, not the clamp).
-        skip(registry.FLOOR_LOOKBACK());
-
-        // PROPOSAL_ID's window was fixed in `setUp` (24h after the ORIGINAL
-        // pre-skip `voteEnd`) and would now already be in the past, so
-        // reusing it here would revert `ReviewNotOpen` instead of exercising
-        // the cap. Register a fresh proposal id whose window starts NOW —
-        // same pattern `test_voteOnProposal_blockerCapHitEmitsEventAndReverts`
-        // below already uses — so the vote window still covers the matured cohort.
+        // PROPOSAL_ID's window was fixed in `setUp`, so register a fresh
+        // proposal id whose window starts NOW — same pattern
+        // `test_voteOnProposal_hundredDustBlockersCannotCensorAnHonestBlock`
+        // below uses — and the vote window covers this cohort.
         uint256 capPid = 43;
         vm.warp(vm.getBlockTimestamp() + 1);
         _registerReview(capPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
@@ -335,56 +344,103 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
 
         for (uint256 i = 0; i < cap; i++) {
             vm.prank(address(uint160(0x100000 + i)));
-            registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Approve);
+            registry.voteOnProposal(
+                address(governor), capPid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+            );
         }
 
         vm.expectEmit(true, false, false, false);
-        emit IGuardianRegistry.ApproverCapReached(capPid);
+        emit IGuardianRegistry.ApproverCapReached(address(governor), capPid);
         vm.prank(last);
         vm.expectRevert(IGuardianRegistry.NewSideFull.selector);
-        registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), capPid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         // 101st Block succeeds — blockers uncapped at this size.
         vm.prank(last);
-        registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
     }
 
-    /// @notice ToB I-2 regression: blockers are capped at
-    /// `MAX_BLOCKERS_PER_PROPOSAL` so the `_emitBlockerAttribution` loop in
-    /// `resolveReview` is bounded.
-    function test_voteOnProposal_blockerCapHitEmitsEventAndReverts() public {
-        uint256 cap = registry.MAX_BLOCKERS_PER_PROPOSAL();
-        for (uint256 i = 0; i < cap; i++) {
+    /// @notice SHE-207 regression — blocker-slot squatting. The blocker list
+    ///         used to be a fixed 100-slot array: a hundred guardians at
+    ///         `minGuardianStake`, holding well under the block quorum between
+    ///         them, could fill it and every honest Block afterwards reverted
+    ///         `NewSideFull`, so `resolveReview` CLEARED a proposal the honest
+    ///         majority wanted vetoed. The list is gone (the tally is a scalar;
+    ///         nothing on-chain iterated it), so the 101st and every later Block
+    ///         lands and the quorum reads the honest weight.
+    ///
+    ///         Sizing: 100 squatters x 10_000e18 = 1_000_000e18, against a
+    ///         denominator of ~4_050_000e18 (5 fixture guardians + squatters +
+    ///         one 3_000_000e18 honest whale) = 24.7%, under the 30% quorum. The
+    ///         whale alone is 74%. Under the pre-fix code this test fails at the
+    ///         whale's vote with `NewSideFull`.
+    function test_voteOnProposal_hundredDustBlockersCannotCensorAnHonestBlock() public {
+        uint256 squat = 100; // == the deleted MAX_BLOCKERS_PER_PROPOSAL
+        for (uint256 i = 0; i < squat; i++) {
             _stakeGuardian(address(uint160(0x300000 + i)), 10_000e18, 1 + i);
         }
-        address last = address(uint160(0x300000 + cap));
-        _stakeGuardian(last, 10_000e18, 999);
-
-        // audit-181-second finding A: age this cap-test cohort past
-        // `FLOOR_LOOKBACK` before opening the review, same reasoning as
-        // `test_voteOnProposal_capHitEmitsEventAndReverts` above — a
-        // freshly-staked guardian's own vote weight is growth-gate clamped
-        // to zero (`_growthGatedVoteWeight`, mirrors `TokenCourt.vote`),
-        // which would revert every vote in this loop with
-        // `NotActiveGuardian()` on a 0-weight first vote instead of
-        // exercising the blocker cap this test targets.
-        skip(registry.FLOOR_LOOKBACK());
+        address whale = address(uint160(0x300000 + squat));
+        _stakeGuardian(whale, 3_000_000e18, 999);
 
         vm.warp(vm.getBlockTimestamp() + 1);
         uint256 newPid = 42;
         _registerReview(newPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
         registry.openReview(address(governor), newPid);
 
-        for (uint256 i = 0; i < cap; i++) {
+        for (uint256 i = 0; i < squat; i++) {
             vm.prank(address(uint160(0x300000 + i)));
-            registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block);
+            registry.voteOnProposal(
+                address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+            );
         }
+        // Control: the squatters alone do NOT reach quorum — this is the shape
+        // the attack needs, otherwise there is nothing to censor. `outcomeOf`
+        // reads `Unresolved` while the window is open, so peek at the end of
+        // the window on a snapshot and come back.
+        uint256 snap = vm.snapshotState();
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        assertEq(
+            uint8(registry.outcomeOf(address(governor), newPid)),
+            uint8(IGuardianRegistry.ReviewOutcome.Cleared),
+            "control: 100 dust blockers must sit under quorum on their own"
+        );
+        vm.revertToState(snap);
 
-        vm.expectEmit(true, false, false, false);
-        emit IGuardianRegistry.BlockerCapReached(newPid);
-        vm.prank(last);
-        vm.expectRevert(IGuardianRegistry.NewSideFull.selector);
-        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block);
+        // The 101st Block: this is the vote the old cap rejected.
+        vm.expectEmit(true, true, true, true);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), newPid, whale, IGuardianRegistry.GuardianVoteType.Block, 3_000_000e18
+        );
+        vm.prank(whale);
+        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+
+        // And a 102nd via the vote-CHANGE path: Approve -> Block also had the
+        // cap check inline. It must be gone too.
+        address flipper = _guardian(0);
+        vm.prank(flipper);
+        registry.voteOnProposal(
+            address(governor), newPid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
+        vm.expectEmit(true, true, true, true);
+        emit IGuardianRegistry.GuardianVoteChanged(
+            address(governor),
+            newPid,
+            flipper,
+            IGuardianRegistry.GuardianVoteType.Approve,
+            IGuardianRegistry.GuardianVoteType.Block
+        );
+        vm.prank(flipper);
+        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        assertEq(
+            uint8(registry.outcomeOf(address(governor), newPid)),
+            uint8(IGuardianRegistry.ReviewOutcome.Blocked),
+            "honest weight reaches quorum once its vote can land"
+        );
+        assertTrue(registry.resolveReview(address(governor), newPid), "resolves blocked, not cleared");
     }
 }
 
@@ -396,6 +452,7 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, 3000);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
 
         for (uint256 i = 0; i < 5; i++) {
             _stakeGuardian(_guardian(i), 10_000e18, 1 + i);
@@ -417,48 +474,70 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
     function test_voteChange_approveToBlock_updatesArraysAndTallies() public {
         address g = _guardian(0);
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         // Top up stake AFTER first vote: should NOT be reflected on swap.
         _stakeGuardian(g, 5_000e18, 42);
 
         vm.expectEmit(true, true, false, true);
         emit IGuardianRegistry.GuardianVoteChanged(
-            PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, IGuardianRegistry.GuardianVoteType.Block
+            address(governor),
+            PROPOSAL_ID,
+            g,
+            IGuardianRegistry.GuardianVoteType.Approve,
+            IGuardianRegistry.GuardianVoteType.Block
         );
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
 
         // Switch back to Approve → still original 10_000e18 weight.
         vm.expectEmit(true, true, false, true);
         emit IGuardianRegistry.GuardianVoteChanged(
-            PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, IGuardianRegistry.GuardianVoteType.Approve
+            address(governor),
+            PROPOSAL_ID,
+            g,
+            IGuardianRegistry.GuardianVoteType.Block,
+            IGuardianRegistry.GuardianVoteType.Approve
         );
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     function test_voteChange_sameSide_revertsNoVoteChange() public {
         address g = _guardian(0);
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.NoVoteChange.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     function test_voteChange_inLockoutWindow_reverts() public {
         address g = _guardian(0);
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         uint256 lockoutStart = reviewEnd - (REVIEW_PERIOD * 1000) / 10_000;
         vm.warp(lockoutStart);
 
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
     }
 
     /// @notice Sherlock run #1 finding #42 — first-time voters MUST be subject
@@ -469,7 +548,9 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
 
         vm.prank(_guardian(0));
         vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
     }
 
     function test_firstVote_justBeforeLockout_succeeds() public {
@@ -477,19 +558,25 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
         vm.warp(lockoutStart - 1);
 
         vm.prank(_guardian(0));
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
     }
 
     function test_voteChange_justBeforeLockout_succeeds() public {
         address g = _guardian(0);
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         uint256 lockoutStart = reviewEnd - (REVIEW_PERIOD * 1000) / 10_000;
         vm.warp(lockoutStart - 1);
 
         vm.prank(g);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
     }
 
     function test_voteChange_blockToApprove_revertsIfApproverCapFull() public {
@@ -504,23 +591,27 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
 
         address blockVoter = _guardian(0);
         vm.prank(blockVoter);
-        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         for (uint256 i = 0; i < cap; i++) {
             vm.prank(address(uint160(0x200000 + i)));
-            registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Approve);
+            registry.voteOnProposal(
+                address(governor), newPid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+            );
         }
 
         // Block voter tries to switch → must revert NewSideFull WITHOUT
         // mutating the old side (check-first-then-apply).
         vm.prank(blockVoter);
         vm.expectRevert(IGuardianRegistry.NewSideFull.selector);
-        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), newPid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         // Verify blockVoter still holds their Block vote (old side intact).
         vm.prank(blockVoter);
         vm.expectRevert(IGuardianRegistry.NoVoteChange.selector);
-        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
     }
 }
 
@@ -535,6 +626,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, BLOCK_QUORUM_BPS);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
 
         // Stake 5 guardians × 10_000e18 = 50_000e18 — matches
         // MIN_COHORT_STAKE_AT_OPEN.
@@ -572,7 +664,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         for (uint256 i = 0; i < 5; i++) {
             if (sides[i] == IGuardianRegistry.GuardianVoteType.None) continue;
             vm.prank(_guardian(i));
-            registry.voteOnProposal(address(governor), PROPOSAL_ID, sides[i]);
+            registry.voteOnProposal(address(governor), PROPOSAL_ID, sides[i], type(uint256).max);
         }
     }
 
@@ -588,7 +680,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         // Post-split: the registry no longer computes the slash, so
         // `slashedAmount` is always 0 in `ReviewResolved`.
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, false, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, false, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
         assertFalse(blocked);
         assertEq(wood.balanceOf(BURN_ADDRESS), 0);
@@ -608,7 +700,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
 
         vm.warp(reviewEnd);
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, false, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, false, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
 
         assertFalse(blocked);
@@ -641,7 +733,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         // Post-split: `ReviewResolved.slashedAmount` is 0 — sWOOD computes and
         // burns the slash; the registry just records the blocked flag.
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, true, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, true, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
 
         assertTrue(blocked);
@@ -681,7 +773,9 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         // that exists, so the veto fires.
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(_guardian(i));
-            registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+            registry.voteOnProposal(
+                address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+            );
         }
 
         vm.warp(reviewEnd);
@@ -701,7 +795,9 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         address approver = _guardian(0);
         registry.openReview(address(governor), PROPOSAL_ID);
         vm.prank(approver);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         // Top up AFTER voting — should not enlarge the slash.
         _stakeGuardian(approver, 10_000e18, 1);
@@ -711,9 +807,13 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         // deterministic severity at 40% decisiveness is 1669 bps (see
         // `_openAndVote` derivation).
         vm.prank(_guardian(1));
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
         vm.prank(_guardian(2));
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
 
         vm.warp(reviewEnd);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
@@ -765,12 +865,18 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         registry.openReview(address(governor), PROPOSAL_ID);
         address approver = _guardian(0);
         vm.prank(approver);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
 
         vm.prank(_guardian(1));
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
         vm.prank(_guardian(2));
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
 
         // Approver requests unstake between vote and resolve.
         vm.prank(approver);
@@ -808,6 +914,7 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, BLOCK_QUORUM_BPS);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
 
         vault = new MockERC4626Vault();
         vault.setOwner(creator);
@@ -913,7 +1020,7 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
         _openEmergency();
 
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.EmergencyBlockVoteCast(PROPOSAL_ID, _guardian(0), 10_000e18);
+        emit IGuardianRegistry.EmergencyBlockVoteCast(address(governor), PROPOSAL_ID, _guardian(0), 10_000e18);
         vm.prank(_guardian(0));
         registry.voteBlockEmergencySettle(address(governor), PROPOSAL_ID);
     }
@@ -1028,6 +1135,7 @@ contract GuardianRegistryAppealTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(24 hours, 3000);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
 
         wood.mint(regOwner, 1_000_000e18);
         vm.prank(regOwner);
@@ -1133,6 +1241,7 @@ contract GuardianRegistryPauseTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, 3000);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
 
         for (uint256 i = 0; i < 5; i++) {
             _stakeGuardian(address(uint160(0xAA01 + i)), 10_000e18, 1 + i);
@@ -1162,7 +1271,9 @@ contract GuardianRegistryPauseTest is RegistryTestHarness {
         address g = address(uint160(0xAA01));
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.ProtocolPaused.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
     }
 
     // Post-split: guardian staking lives in sWOOD which has no pause. The
@@ -1215,6 +1326,7 @@ contract GuardianRegistryParamTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(INIT_REVIEW_PERIOD, INIT_BLOCK_QUORUM);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
     }
 
     function test_setReviewPeriod_boundsEnforced() public {

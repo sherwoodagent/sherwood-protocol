@@ -54,6 +54,13 @@ export function handleProposalCreated(event: ProposalCreated): void {
   proposal.txHash = event.transaction.hash;
 
   proposal.save();
+
+  // Redemptions lock at propose (SHE-258): no share leaves while a proposal is open.
+  let syndicate = Syndicate.load(syndicateId!);
+  if (syndicate != null) {
+    syndicate.redemptionsLocked = true;
+    syndicate.save();
+  }
 }
 
 export function handleVoteCast(event: VoteCast): void {
