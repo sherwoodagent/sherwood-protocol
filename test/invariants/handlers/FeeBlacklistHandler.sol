@@ -216,6 +216,7 @@ contract FeeBlacklistHandler is Test {
             governor.approveCollaboration(proposalId);
         }
 
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         // LPs vote For (deposit + delegate happens in test setUp).
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
