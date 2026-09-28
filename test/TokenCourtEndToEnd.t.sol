@@ -208,6 +208,7 @@ contract TokenCourtEndToEndTest is Test {
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(gov))
         );
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         uint256 agentId = agentRegistry.mint(agent);
         vm.prank(owner);
         vault.registerAgent(agentId, agent);

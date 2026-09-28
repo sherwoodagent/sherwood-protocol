@@ -120,6 +120,7 @@ contract Governor_settlementOrdering_Test is Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         // The proposer/agent is a CONTRACT that implements the hooked asset's
         // post-transfer callback, so it can attempt to re-enter the vault

@@ -76,6 +76,7 @@ contract VaultDepositLifecycleAndHwmTest is Test {
         vault.setWithdrawalQueue(address(queue));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         _setProposal(0, 0, 0);
 
         usdc.mint(lp1, 10_000e6);

@@ -122,6 +122,7 @@ contract ProposalLifecycleVetoDenominatorTest is Test {
         // `Vault_settleStampDenominator.t.sol`) needs no real proposal
         // lifecycle. No open proposal at genesis.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         _setVaultProposal(0, 0, 0);
 
         // ── Real governor, bound to the SAME vault, for the veto check ──
