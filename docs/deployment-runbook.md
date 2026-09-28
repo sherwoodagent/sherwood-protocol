@@ -42,21 +42,7 @@ Nothing is read from the environment. Every number comes from
    the run requires, the launch set included — `USDC`, `BTC` and `LINK` are feed-only
    by decision (`_hasNoTokenOnRobinhood`), not gaps. `CREATE3_FACTORY` and
    `WOOD_USD_FEED` are written BY the run, not read.
-2. **Grow the V3 observation ring — before anything is deployed.** The feed's second
-   leg is a Uniswap V3 pool (SHE-291), and `DeployWoodPoolFeed` refuses a pool whose
-   ring cannot span `TWAP_WINDOW`. The call is permissionless, monotonic and safe to
-   repeat, so it can run well ahead of the ceremony:
-   ```bash
-   V3_CARDINALITY=<N> forge script script/GrowV3Cardinality.s.sol:GrowV3Cardinality \
-     --rpc-url robinhood --account <key> --broadcast --slow
-   ```
-   Size `N` from the `required for a <window> s window` line the feed phase prints;
-   above 1,400 the ring is grown in repeated steps, because every new slot is
-   initialised inside the call at ~22.4k gas paid by the CALLER. **The growth is not
-   instant.** The call raises a TARGET (`observationCardinalityNext`); the ring
-   reaches it one observation at a time, as the pool is traded. Wait for
-   `observationCardinality` itself — the `next` value is not what `observe` serves.
-3. **First run.**
+2. **First run.**
    ```bash
    forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll \
      --rpc-url robinhood --account <key> --broadcast --slow \
@@ -64,14 +50,14 @@ Nothing is read from the environment. Every number comes from
    ```
    It stops at `Checkpoint.AwaitingWoodFeed`: `WoodPoolFeed` is minted, nothing
    of Plan B is, and **no ownership has moved**.
-4. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
+3. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
    `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
    key owns every contract for this whole interval; that is the cost of the
-   warm-up, and it is why step 3 hands nothing off.
-5. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
+   warm-up, and it is why step 2 hands nothing off.
+4. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
    TokenCourt deploy, the handoff runs, and `deployAll` returns
    `Checkpoint.Complete`. Addresses are written to `chains/4663.json` last.
-6. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
+5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
    `ExposureLedger`, `ChallengeGame` and `TokenCourt` (the one-step contracts —
    beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already
    transferred). Then re-point `setProtocolFeeRecipient` and
@@ -79,7 +65,7 @@ Nothing is read from the environment. Every number comes from
    reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
-7. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
+6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
    address from the book's `CREATE3_FACTORY` and fails on any disagreement.
 
 **Fork — one run.** Chain 9994663, `chains/9994663.json` committed. Same command

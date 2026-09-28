@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {DeployWoodPoolFeed} from "../../script/DeployWoodPoolFeed.s.sol";
-import {GrowV3Cardinality} from "../../script/GrowV3Cardinality.s.sol";
 import {ForkWoodFeedFixture} from "../../script/robinhood-mainnet/ForkWoodFeedFixture.sol";
 import {WoodPoolFeed} from "../../src/pricing/WoodPoolFeed.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -65,10 +64,6 @@ contract DeployWoodPoolFeedTest is Test {
     ///      answer both stay the V2 pair's.
     int24 constant V3_TWAP_TICK = -122475;
     uint24 constant V3_FEE = 3000;
-    /// @dev The largest N `GrowV3Cardinality` will broadcast, and the ceiling
-    ///      `requiredCardinality` reports against: every slot is initialised
-    ///      inside the call, so a bigger ask cannot fit in one transaction.
-    uint16 constant MAX_GROW_PER_TX = 1_400;
 
     function setUp() public {
         // A real chain time: near zero every idle and staleness check clamps.
@@ -191,20 +186,20 @@ contract DeployWoodPoolFeedTest is Test {
         script.deploy(_params());
     }
 
-    /// @dev THE CHECK THE CEREMONY'S CARDINALITY STEP EXISTS FOR. The live 4663
-    ///      pool reports `observationCardinality` 1, which cannot span 24h: the
-    ///      feed would deploy and then revert from every read.
-    function test_preflight_bites_whenTheV3PoolCannotSpanTheWindow() public {
+    /// @dev THE READ THE FEED'S V3 LEG MAKES. A pool that will not serve the
+    ///      live accumulator deploys a feed whose `update()` reverts, i.e. no
+    ///      WOOD price at all once the standing snapshots age out.
+    function test_preflight_bites_whenTheV3PoolWillNotServeObserve() public {
         v3Pool.setObserveReverts(true);
-        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool cannot span TWAP_WINDOW"));
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool does not serve observe([0])"));
         script.deploy(_params());
     }
 
     /// @dev A pool that answers the selector but not the contract fails the same
-    ///      way: what the pre-flight asserts is a usable window, not a response.
+    ///      way: what the pre-flight asserts is a usable reading, not a response.
     function test_preflight_bites_whenTheV3PoolAnswersObserveMalformed() public {
         v3Pool.setObserveShortArray(true);
-        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool cannot span TWAP_WINDOW"));
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool does not serve observe([0])"));
         script.deploy(_params());
     }
 
@@ -265,54 +260,6 @@ contract DeployWoodPoolFeedTest is Test {
         script.deploy(p);
     }
 
-    /// @dev A ring of length one answers `observe` with SPOT rather than
-    ///      reverting, so the window check alone passes on a pool with no history
-    ///      at all. The gate is on the CURRENT cardinality, which is why the
-    ///      ceremony grows the ring and then waits for writes.
-    function test_preflight_bites_whenTheV3RingHoldsOnlyTheLiveObservation() public {
-        v3Pool.setObservationCardinality(1);
-        vm.expectRevert(
-            bytes("PRE-FLIGHT: V3 pool has no observation history (cardinality < 2); grow the ring and wait for writes")
-        );
-        script.deploy(_params());
-    }
-
-    // ── The cardinality derivation and its per-transaction bound ──
-
-    /// @dev The knob is SECONDS BETWEEN WRITES, not seconds per block: the ring
-    ///      advances only in blocks that touch the pool. At the measured ~880s
-    ///      cadence a 24h window needs 99 observations, not 86,400.
-    function test_requiredCardinality_countsWritesAndNotBlocks() public view {
-        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 880);
-        assertEq(n, 109, "ceil(86400/880) = 99, plus 10 slack");
-        assertFalse(capped, "well inside one transaction");
-    }
-
-    /// @dev A ring longer than one transaction can initialise is capped and SAID
-    ///      SO, because it is a different claim: the remedy is several grows, not
-    ///      a smaller ring. An uncapped 86,410 is ~1.47e9 gas and reverts.
-    function test_requiredCardinality_capsAtWhatOneTransactionCanInitialise() public view {
-        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 1);
-        assertEq(n, MAX_GROW_PER_TX, "the per-transaction bound");
-        assertTrue(capped, "the bound is flagged as a different claim");
-    }
-
-    function test_requiredCardinality_isCeilingDivisionPlusSlack() public view {
-        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 100);
-        assertEq(n, 874, "86400/100 + 10 slack");
-        assertFalse(capped, "well inside one transaction");
-
-        // Ceiling, not truncation: 86400/70 is 1234.28, and a ring of 1234
-        // observations is one write short of the window.
-        (uint16 odd,) = script.requiredCardinality(24 hours, 70);
-        assertEq(odd, 1_245, "ceil(86400/70) + 10 slack");
-    }
-
-    function test_requiredCardinality_refusesAZeroWriteInterval() public {
-        vm.expectRevert(bytes("PRE-FLIGHT: V3_WRITE_INTERVAL_SECONDS zero"));
-        script.requiredCardinality(24 hours, 0);
-    }
-
     // ── MIN_V3_LIQUIDITY is narrowed, not truncated ──
 
     /// @dev The dangerous direction: `uint128(2**128)` is ZERO, i.e. the floor
@@ -325,86 +272,6 @@ contract DeployWoodPoolFeedTest is Test {
     function test_minV3Liquidity_acceptsTheWidthItself() public view {
         assertEq(script.toMinV3Liquidity(type(uint128).max), type(uint128).max, "the boundary is inclusive");
         assertEq(script.toMinV3Liquidity(MIN_V3_LIQUIDITY), MIN_V3_LIQUIDITY, "the deploy default");
-    }
-
-    // ── GrowV3Cardinality ──
-
-    /// @dev THE STEP RAISES A TARGET, NOT THE RING. `observationCardinality` is
-    ///      what `observe` can actually serve, and it catches up one slot at a
-    ///      time as the pool is written to — which is why the ceremony has to
-    ///      leave time between this step and the feed deploy, and why asserting
-    ///      the ring itself grew here would pin the misconception the script's
-    ///      own console output warns against.
-    function test_grow_raisesTheTargetAndNotTheRingItself() public {
-        GrowV3Cardinality grower = new GrowV3Cardinality();
-        (,,, uint16 ringBefore, uint16 targetBefore,,) = v3Pool.slot0();
-        assertLt(targetBefore, 200, "control: the target really was below");
-
-        grower.grow(address(v3Pool), 200);
-
-        (,,, uint16 ring, uint16 target,,) = v3Pool.slot0();
-        assertEq(target, 200, "the growth target rose");
-        assertEq(ring, ringBefore, "the ring itself did NOT grow: it fills as the pool is traded");
-    }
-
-    /// @dev Monotonic upstream, so a re-run of the ceremony step is a no-op
-    ///      rather than a revert — an operator can repeat it safely. Asserted as
-    ///      NO CALL, because a monotonic setter makes "called and ignored"
-    ///      indistinguishable from "not called" by state alone.
-    function test_grow_isANoOpWhenTheTargetIsAlreadyThatHigh() public {
-        GrowV3Cardinality grower = new GrowV3Cardinality();
-        grower.grow(address(v3Pool), 1_000);
-        assertEq(v3Pool.cardinalityGrowCalls(), 1, "the first ask reached the pool");
-
-        grower.grow(address(v3Pool), 600);
-        assertEq(v3Pool.cardinalityGrowCalls(), 1, "a repeat below the standing target broadcasts nothing");
-    }
-
-    /// @dev And the same once the ring has actually filled: a pool already
-    ///      serving that much history is not asked to pay for more.
-    function test_grow_isANoOpWhenTheRingIsAlreadyThatLong() public {
-        GrowV3Cardinality grower = new GrowV3Cardinality();
-        v3Pool.setObservationCardinality(65_535);
-        grower.grow(address(v3Pool), 600);
-
-        (,,, uint16 ring,,,) = v3Pool.slot0();
-        assertEq(ring, 65_535, "never shrunk");
-        assertEq(v3Pool.cardinalityGrowCalls(), 0, "nothing broadcast");
-    }
-
-    function test_grow_refusesATargetAboveTheUint16Ceiling() public {
-        GrowV3Cardinality grower = new GrowV3Cardinality();
-        vm.expectRevert(bytes("PRE-FLIGHT: V3_CARDINALITY above the uint16 ceiling (65535)"));
-        grower.grow(address(v3Pool), 65_536);
-    }
-
-    /// @dev THE BOUND THAT ACTUALLY BINDS. Every new slot is initialised inside
-    ///      `increaseObservationCardinalityNext` at ~22.4k gas, so the grower pays
-    ///      the whole ring up front and a 65,535 ask is ~1.47e9 gas: a
-    ///      transaction no node will accept. The script refuses it here rather
-    ///      than printing it as a remedy.
-    function test_grow_refusesATargetOneTransactionCannotInitialise() public {
-        GrowV3Cardinality grower = new GrowV3Cardinality();
-        grower.grow(address(v3Pool), MAX_GROW_PER_TX); // control: the bound is inclusive
-        assertEq(v3Pool.cardinalityGrowCalls(), 1, "the bound itself is broadcast");
-
-        vm.expectRevert(
-            bytes("PRE-FLIGHT: V3_CARDINALITY above what one transaction can initialise (1400); grow in steps")
-        );
-        grower.grow(address(v3Pool), uint256(MAX_GROW_PER_TX) + 1);
-    }
-
-    function test_grow_refusesAnUnsetTargetOrPool() public {
-        GrowV3Cardinality grower = new GrowV3Cardinality();
-
-        vm.expectRevert(bytes("PRE-FLIGHT: V3_CARDINALITY unset"));
-        grower.grow(address(v3Pool), 0);
-
-        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_WETH_UNISWAP_V3_POOL unset"));
-        grower.grow(address(0), 600);
-
-        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool has no code"));
-        grower.grow(makeAddr("notAPool"), 600);
     }
 
     /// @notice The cap the ledger bounds the governance WOOD price with is refused
