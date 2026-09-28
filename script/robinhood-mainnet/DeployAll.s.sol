@@ -125,7 +125,7 @@ contract DeployAll is
         s.core = core;
 
         _seatOwnerWrites(s.core, s.core.deployer);
-        // Closed beta: launch whitelist-only across every vault; the Safe lifts it later.
+        // Invite-only launch: whitelist-only across every vault; the Safe lifts it later.
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
         if (!factory.depositsRestricted()) factory.setDepositsRestricted(true);
         _deployPortfolio(s, i);

@@ -695,7 +695,7 @@ contract SyndicateVault is
         if (!_depositsOpen() && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
     }
 
-    /// @dev Open only if this vault opted in AND the factory's closed-beta flag is off.
+    /// @dev Open only if this vault opted in AND the factory's invite-only flag is off.
     function _depositsOpen() private view returns (bool) {
         return _openDeposits && !ISyndicateFactory(_factory).depositsRestricted();
     }
