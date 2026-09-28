@@ -132,7 +132,6 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         if (tokens.length != priceDecimals_.length || tokens.length != feeds_.length) revert LengthMismatch();
         if (totalAmount_ == 0) revert InvalidAmount();
         if (maxSlippageBps_ < MIN_SLIPPAGE_BPS || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
-        if (_resolveTierRegistry() == address(0)) revert TierRegistryUnresolved();
 
         uint256 weightSum;
         for (uint256 i; i < tokens.length; ++i) {
@@ -380,24 +379,23 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
 
     // ── Counterparty binding ──
 
-    /// @dev Skips when the registry is unresolvable so a broken walk never strands `rebalanceDelta`;
-    ///      init is fail-closed on resolution separately.
+    /// @dev Fail-closed on an unresolvable registry; only init/execute/rebalanceDelta call these, never settle.
     function _requireAllowedAdapter(address swapAdapter_) private view {
         address registry = _resolveTierRegistry();
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
         if (!_isCounterpartyAllowed(registry, swapAdapter_)) revert AdapterNotAllowed(swapAdapter_, registry);
     }
 
     function _requireAllowedPriceSource(address priceSource) private view {
         address registry = _resolveTierRegistry();
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
         if (!_isCounterpartyAllowed(registry, priceSource)) revert PriceSourceNotAllowed(priceSource, registry);
     }
 
     /// @dev Attestation key is the bare aggregator address widened to bytes32.
     function _requirePairedPriceSource(address token, address feed) private view {
         address registry = _resolveTierRegistry();
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
         bytes32 priceSource = bytes32(uint256(uint160(feed)));
         if (!_isPriceSourceForToken(registry, token, priceSource)) {
             revert PriceSourceNotPairedWithToken(token, priceSource, registry);
