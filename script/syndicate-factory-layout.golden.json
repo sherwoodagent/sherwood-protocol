@@ -133,10 +133,22 @@
       "type": "t_address"
     },
     {
-      "label": "__gap",
+      "label": "depositsRestricted",
+      "slot": "21",
+      "offset": 20,
+      "type": "t_bool"
+    },
+    {
+      "label": "creationSponsored",
       "slot": "22",
       "offset": 0,
-      "type": "t_array(t_uint256)43_storage"
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "__gap",
+      "slot": "23",
+      "offset": 0,
+      "type": "t_array(t_uint256)42_storage"
     }
   ],
   "types": {

@@ -105,6 +105,7 @@ contract FeeBlacklistResilienceTest is Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         usdc.mint(lp1, 100_000e6);
         usdc.mint(lp2, 100_000e6);

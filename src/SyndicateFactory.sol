@@ -191,9 +191,16 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `pushWiring`.
     address public bondEscrow;
 
+    /// @notice Invite-only launch: while true every vault accepts deposits
+    ///         from its approved depositors only, whatever its own `openDeposits`.
+    bool public depositsRestricted;
+
+    /// @notice Single-use creation-fee waiver granted by the owner to `creator`.
+    mapping(address creator => bool) public creationSponsored;
+
     /// @dev Reserved for future storage. Shrinks as named slots are carved off the
-    ///      FRONT of the gap, so every field behind it keeps its slot (43 words).
-    uint256[43] private __gap;
+    ///      FRONT of the gap, so every field behind it keeps its slot (42 words).
+    uint256[42] private __gap;
 
     // ── Events ──
 
@@ -207,6 +214,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event ManagementFeeBpsUpdated(uint256 oldBps, uint256 newBps);
     event VaultUpgraded(address indexed vault, address indexed newImpl);
     event UpgradesEnabledUpdated(bool enabled);
+    event DepositsRestrictedUpdated(bool restricted);
+    event CreationSponsored(address indexed creator, bool sponsored);
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
     /// @notice Emitted when the ENS subname registration in `createSyndicate`
@@ -305,8 +314,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
         // Collect creation fee (if set)
         if (creationFee > 0) {
-            if (address(creationFeeToken) == address(0)) revert InvalidFeeToken();
-            creationFeeToken.safeTransferFrom(msg.sender, creationFeeRecipient, creationFee);
+            if (creationSponsored[msg.sender]) {
+                creationSponsored[msg.sender] = false;
+            } else {
+                if (address(creationFeeToken) == address(0)) revert InvalidFeeToken();
+                creationFeeToken.safeTransferFrom(msg.sender, creationFeeRecipient, creationFee);
+            }
         }
 
         // Verify ERC-8004 identity (skipped on chains without agent registry)
@@ -503,6 +516,19 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     function setUpgradesEnabled(bool enabled) external onlyOwner {
         upgradesEnabled = enabled;
         emit UpgradesEnabledUpdated(enabled);
+    }
+
+    /// @notice Force every vault into whitelist-only deposits, or lift it (owner only).
+    function setDepositsRestricted(bool restricted) external onlyOwner {
+        depositsRestricted = restricted;
+        emit DepositsRestrictedUpdated(restricted);
+    }
+
+    /// @notice Waive the creation fee for `creator`'s next `createSyndicate`, or revoke it (owner only).
+    function setCreationSponsored(address creator, bool sponsored) external onlyOwner {
+        if (creator == address(0)) revert ZeroAddress();
+        creationSponsored[creator] = sponsored;
+        emit CreationSponsored(creator, sponsored);
     }
 
     /// @notice Update the Durin L2 Registrar used for ENS subname registration on
