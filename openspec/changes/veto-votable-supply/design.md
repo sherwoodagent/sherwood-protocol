@@ -145,7 +145,13 @@ and leave a bar of `0.4 (G + X)` that only `G` can reach. (c) holds only because
 the Draft keeps the redeem lock, so every share in the recorded set is capital at
 risk for the cycle.
 
-**SHIPPED: (c) plus a live clamp (v1 audit F1).** (c) alone let a redeem ordered
-ahead of the stamp raise the bar above every share still in the vault, re-opening
-NM 6.4-F2. The electorate is now `min(S - Q, L - min(Q, lq))` (snapshot vs live, each less
-its queue), with the live queue term capped at the snapshot's so the front-run (c) closed stays closed.
+**SHIPPED: (c) plus a second checkpoint read (v1 audit F1, then the v2 merge).** (c)
+alone let a redeem ordered ahead of the stamp raise the bar above every share still
+in the vault, re-opening NM 6.4-F2. v1 clamped the stamp at the live supply; that
+read is mid-second, and once SHE-287 kept Pending deposits open, a redeem ahead of
+`propose` plus a re-deposit after it in the same second voted 2x the electorate.
+The electorate is now `E(t) = S(t) - Q(t)` read from checkpoints at the same two
+instants as the weight: stamped at `snapshot`, lowered by `vote` to `E(snapshot + 1)`.
+This is Decision 2's "exact fix": every holder self-delegates, so `E(t)` is the
+castable weight at `t`, and a queue move in the propose second leaves the voters and
+the bar together.

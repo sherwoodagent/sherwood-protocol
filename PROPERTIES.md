@@ -293,8 +293,9 @@ Asserted inside the handler that performs the call.
   "closing the same-block acquisition window").
 - [ ] **SP-30** `SHOULD-HOLD` — a review's block-quorum denominator and threshold are
   snapshotted at open and never re-read live at resolution.
-- [ ] **SP-31** `EXPLORATORY` — the veto denominator is frozen at Pending-entry; a
-  mid-proposal supply change cannot move the bar.
+- [ ] **SP-31** `EXPLORATORY` — the veto denominator is fixed by the snapshot and the end
+  of the propose second (the first vote records the latter); a later supply change
+  cannot move the bar, and summed castable weight never exceeds it.
 - [ ] **SP-32** `SHOULD-HOLD` — every burn/fee rate used to price a challenge equals the
   value pinned at filing, not the live parameter (x-ray I-15).
 

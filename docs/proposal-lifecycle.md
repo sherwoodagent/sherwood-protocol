@@ -117,8 +117,9 @@ Cross-contract timing invariants (all enforced at the setters):
   checkpoints; snapshot is `now − 1` so same-block flash-delegation cannot vote).
 - **Optimistic:** the proposal passes by default when `voteEnd` arrives; it is
   rejected only if AGAINST votes reach `vetoThresholdBps` (20–80%) of the
-  proposal's `votableSupply` — supply minus the withdrawal queue, each term the
-  min of its snapshot and live value, recorded at the Draft → Pending transition.
+  proposal's `votableSupply` — supply minus the withdrawal queue at the snapshot,
+  recorded at the Draft → Pending transition and lowered by the first vote to the
+  same read at the end of the propose second, the two instants vote weight reads.
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
   (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
 

@@ -447,6 +447,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 atPropose = IVotes(proposal.vault).getPastVotes(msg.sender, snap + 1);
         if (atPropose < weight) weight = atPropose;
         if (weight == 0) revert NoVotingPower();
+        // The electorate reads the same two instants, so a mint later in the propose second
+        // cannot lift the castable weight above it (SHE-287 keeps Pending deposits open).
+        uint256 votable = _votableSupplyAt(proposal.vault, snap + 1);
+        if (votable < proposal.votableSupply) proposal.votableSupply = votable;
 
         _hasVoted[proposalId][msg.sender] = true;
         // Approval is optimistic: only Against votes are tallied, for the veto.
@@ -1051,21 +1055,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
-    /// @dev Each electorate term clamped at its live value: an exit ahead of the stamp shrinks
-    ///      the bar, an entry after `at` cannot inflate it. The live queue term is capped at the
-    ///      snapshot's so only escrows made before `at` leave twice (NM 6.4-F2; design.md Dec. 3).
+    /// @dev Supply less the queue, both at `at`: every holder self-delegates, so this is exactly
+    ///      the weight castable at that instant. `vote` re-reads it at the end of the propose
+    ///      second, the instant that catches an exit ahead of the stamp (NM 6.4-F2).
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
-        uint256 live = IERC20(vault).totalSupply();
         address queue = ISyndicateVault(vault).withdrawalQueue();
-        if (queue != address(0)) {
-            uint256 queued = IVotes(vault).getPastVotes(queue, at);
-            supply = supply > queued ? supply - queued : 0;
-            uint256 liveQueued = IERC20(vault).balanceOf(queue);
-            if (liveQueued > queued) liveQueued = queued;
-            live = live > liveQueued ? live - liveQueued : 0;
-        }
-        return supply < live ? supply : live;
+        if (queue == address(0)) return supply;
+        uint256 queued = IVotes(vault).getPastVotes(queue, at);
+        return supply > queued ? supply - queued : 0;
     }
 
     /// @dev Hoisted out of `propose` to keep that function under Yul's
