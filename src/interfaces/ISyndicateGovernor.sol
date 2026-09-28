@@ -709,7 +709,7 @@ interface ISyndicateGovernor {
     /// @notice Address of the guardian registry (zero if not yet wired).
     function guardianRegistry() external view returns (address);
 
-    /// @notice Address of the tier registry (zero if not wired — tier 2 default).
+    /// @notice Address of the tier registry (never zero: `initialize` and `setTierRegistry` require code).
     function tierRegistry() external view returns (address);
 
     /// @notice Address of the exposure ledger (zero if not wired — gates skipped).

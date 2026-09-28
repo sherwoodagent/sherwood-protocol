@@ -162,11 +162,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Maximum management fee a vault owner may charge (3% of post-strategy net).
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
 
-    /// @notice Adapter-selector tier registry (guardian economic-security model).
-    ///         Optional — `address(0)` means governors created by this factory
-    ///         keep the safe tier-2 default (full-notional coverage). Set
-    ///         post-deploy by the owner via `setTierRegistry`, then pushed into
-    ///         each per-vault governor at `createSyndicate`.
+    /// @notice Adapter-selector tier registry, required: `initialize` and `setTierRegistry`
+    ///         reject a codeless address. Passed to each governor at `createSyndicate`.
     address public tierRegistry;
 
     /// @notice Aggregate-exposure ledger (guardian economic-security model).
