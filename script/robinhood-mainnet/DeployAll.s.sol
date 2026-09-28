@@ -128,6 +128,11 @@ contract DeployAll is
         // Invite-only launch: whitelist-only across every vault; the Safe lifts it later.
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
         if (!factory.depositsRestricted()) factory.setDepositsRestricted(true);
+        // Creation is sponsorship-only in practice from the first run; the Safe lowers the fee at public launch.
+        if (factory.creationFee() == 0) {
+            address feeTo = i.ownerMultisig != address(0) ? i.ownerMultisig : i.deployer;
+            factory.setCreationFee(i.wood, RobinhoodParams.INVITE_ONLY_CREATION_FEE, feeTo);
+        }
         _deployPortfolio(s, i);
         _deployMorpho(s);
         _deployCL(s, i);
@@ -446,6 +451,7 @@ contract DeployAll is
 
         _validateMainnet(s.core, deployer, handedOff ? i.ownerMultisig : address(0), i.wood);
         require(SyndicateFactory(s.core.factoryProxy).depositsRestricted(), "factory.depositsRestricted");
+        require(SyndicateFactory(s.core.factoryProxy).creationFee() > 0, "factory.creationFee");
         _checkAddr("strategyFactory.owner", Ownable(s.strategyFactory).owner(), finalOwner);
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.portfolioTemplate), "template: portfolio");
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.morphoSupplyTemplate), "template: morpho");

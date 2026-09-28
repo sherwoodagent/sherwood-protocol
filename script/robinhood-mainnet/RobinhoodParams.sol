@@ -16,6 +16,8 @@ library RobinhoodParams {
 
     // Factory / governor. 200 bps is the guardian-budget floor, stamped once per vault at initialize.
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
+    // Invite-only window: 1M WOOD (~$5.9k) per unsponsored fund, so sponsorship is the way in.
+    uint256 internal constant INVITE_ONLY_CREATION_FEE = 1_000_000e18;
     // Governor-impl IMMUTABLE, so this deploy is the only chance to set it. Held at the
     // per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod` itself;
     // the operating value is the factory's 24h default, which owners may now lower.

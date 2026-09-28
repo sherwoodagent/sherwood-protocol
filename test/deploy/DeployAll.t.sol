@@ -425,6 +425,11 @@ contract DeployAllTest is DeployAllFixture {
         _assertOneStepOwners(first, deployer);
         Inputs memory i = _inputs(Posture.Mainnet);
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+        // Invite-only from run 1: creation already costs the window fee, paid to the Safe.
+        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
+        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "creation fee set in run 1");
+        assertEq(address(factory.creationFeeToken()), i.wood, "fee paid in WOOD");
+        assertEq(factory.creationFeeRecipient(), address(safe), "fee goes to the Safe");
 
         _primeWoodFeed(first.woodUsdFeed);
 
