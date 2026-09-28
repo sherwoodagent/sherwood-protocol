@@ -878,16 +878,15 @@ contract TierRegistry is Ownable2Step {
     ///         What the owner must check and this cannot: that `template` binds
     ///         every init-supplied external address and is not itself a proxy.
     ///
-    ///         A class certification admits every clone `StrategyFactory`
-    ///         minted from `template` as a batch recipient, whoever asked the
-    ///         factory for it. `SyndicateVault` binds each member to the vault
-    ///         (`vault() == vault`), which neutralizes a hostile clone ONLY IF
-    ///         the template derives its fund destination and its counterparty
-    ///         allowlist from `vault()` and exposes no payout / recipient /
-    ///         router address settable from `initialize` or `updateParams`
-    ///         data. `BaseStrategy._pushToVault` and the shipped templates
-    ///         satisfy this; the reviewer certifying a new template MUST verify
-    ///         it, because nothing on-chain does.
+    ///         A class admits every clone of `template` as a batch recipient,
+    ///         whoever minted it and whatever vault it is bound to: the protocol
+    ///         checks code identity and factory provenance, never the clone's
+    ///         `vault()`. That a clone cannot take a foreign vault's capital is
+    ///         a TEMPLATE invariant — `onlyVault` on every value-moving
+    ///         entrypoint, no fund destination or counterparty outside
+    ///         `vault()`, none settable from `initialize` / `updateParams` data
+    ///         — which the certifier MUST verify per template, because nothing
+    ///         on-chain does. Same statement as `StrategyFactory`'s header.
     function proposeClassCertification(
         address template,
         bytes4 selector,

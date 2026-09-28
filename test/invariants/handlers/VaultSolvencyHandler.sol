@@ -227,6 +227,7 @@ contract VaultSolvencyHandler is Test {
         // LPs vote For. The `balanceOf > 0` guard ensures the voter has
         // checkpointed delegation weight at the snapshot timestamp; no
         // legitimate revert reason remains, so we let any revert surface.
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         if (vault.balanceOf(lp1) > 0) {
             vm.prank(lp1);
             governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
