@@ -19,9 +19,11 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Governor_vetoDenominatorExits
-/// @notice SHE-205 / SHE-258: while a proposal is open no share is minted or burned, so the
-///         veto bar is measured against a supply nothing can shrink. The only exit is a
-///         queued redeem, cancellable until its proposal is stamped at settle.
+/// @notice SHE-205 / SHE-258 / SHE-287: the veto electorate is recorded at the Draft -> Pending
+///         stamp, and while a proposal is open no share is burned, so the bar is measured
+///         against a set nothing can shrink. The only exit is a queued redeem, cancellable until
+///         its proposal is stamped at settle. A Draft holds the redeem lock; deposits lock at
+///         execute.
 contract GovernorVetoDenominatorExitsTest is Test {
     SyndicateGovernor governor;
     SyndicateVault vault;
@@ -99,6 +101,32 @@ contract GovernorVetoDenominatorExitsTest is Test {
             _calls(0),
             GovEnvelope.defaultCaps(env.maxCapital, 1),
             none
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    /// @dev A collaborative Draft: same batch as `_propose`, one co-proposer who has not
+    ///      approved yet. Returns the pid and the co-proposer that can take it to Pending.
+    function _proposeDraft() internal returns (uint256 pid, address coAgent) {
+        coAgent = makeAddr("coAgent");
+        uint256 nft = agentReg.mint(coAgent);
+        vm.prank(owner);
+        vault.registerAgent(nft, coAgent);
+        ISyndicateGovernor.CoProposer[] memory co = new ISyndicateGovernor.CoProposer[](1);
+        co[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        vm.prank(agent);
+        pid = governor.propose(
+            address(vault),
+            address(0),
+            "she287",
+            7 days,
+            env,
+            _calls(1),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            _calls(0),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            co
         );
         vm.warp(vm.getBlockTimestamp() + 1);
     }
@@ -337,6 +365,53 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(vault.totalSupply(), vault.balanceOf(lp1) + lp2Shares, "but they still exist");
     }
 
+    // ── SHE-287: a Draft holds the redeem lock; deposits lock at execute ──
+
+    /// @notice A Draft binds the vault and holds the redeem lock, so no exit can land ahead of
+    ///         the electorate stamp; instant deposit stays open and buys weight with capital
+    ///         that is locked until settle (Sherlock #8, accepted).
+    function test_draft_holdsTheRedeemLock_andLeavesDepositOpen() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(lp2, 100_000e6);
+        (uint256 pid, address coAgent) = _proposeDraft();
+
+        assertTrue(vault.redemptionsLocked(), "a Draft holds the redeem lock");
+        assertFalse(vault.depositsLocked(), "a Draft must not lock deposits");
+        _instantExitReverts(lp2);
+        _deposit(attacker, 50_000e6); // Draft-window deposit
+        uint256 attackerShares = vault.balanceOf(attacker);
+
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "the Draft-window deposit votes");
+        assertEq(
+            governor.getProposal(pid).votableSupply, vault.totalSupply(), "and is in the electorate it was locked into"
+        );
+        _instantExitReverts(attacker);
+    }
+
+    /// @notice THE #320 ROUND-2 SHAPE, closed by the lock: deposit `X` during the Draft one
+    ///         block ahead, then exit in the final-approve block so the bar reads `0.4 (G + X)`
+    ///         while only `G` can vote. The exit reverts — `X` stays locked until settle and
+    ///         keeps its weight, so the bar it inflates is capital at risk, not a free ride.
+    function test_collab_draftDepositCannotExitInTheApproveBlock() public {
+        _deposit(lp1, 100_000e6); // G
+        (uint256 pid, address coAgent) = _proposeDraft();
+        _deposit(attacker, 200_000e6); // X, one block ahead of the final approve
+
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxRedeem.selector);
+        vault.redeem(attackerShares, attacker, attacker); // same block as the final approve
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+
+        assertEq(usdc.balanceOf(attacker), 0, "X is in the vault, not back in hand");
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "and can vote");
+        assertEq(vault.maxRedeem(attacker), 0, "and stays until settle");
+        assertEq(governor.getProposal(pid).votableSupply, vault.totalSupply(), "the bar counts only locked capital");
+    }
+
     /// @notice The collaborative Draft already holds the redeem lock, so the queue is open right
     ///         up to the approval that stamps the electorate. Read live there, lp2's escrowed 30k
     ///         would leave the bar at 70k while his snapshot weight still voted — 42.9%, a veto.
@@ -393,6 +468,70 @@ contract GovernorVetoDenominatorExitsTest is Test {
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice The collaborative stamp's queue term: shares parked in the queue under an
+    ///         earlier, cancelled proposal cannot vote and are outside the recorded electorate,
+    ///         read at the snapshot through the queue's own checkpointed custody.
+    function test_collab_parkedQueueSharesAreOutsideTheElectorate() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(lp2, 100_000e6);
+
+        uint256 parkPid = _propose();
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        vm.prank(agent);
+        governor.cancelProposal(parkPid);
+        vm.warp(governor.getCooldownEnd());
+
+        (uint256 pid, address coAgent) = _proposeDraft();
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+        assertEq(
+            governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "queued shares are not in the electorate"
+        );
+        assertEq(vault.totalSupply(), vault.balanceOf(lp1) + lp2Shares, "but they still exist");
+    }
+
+    /// @notice Pending keeps instant deposit open, and a deposit after the stamp buys no vote:
+    ///         weight is read at `snapshot`, and the electorate was already recorded.
+    function test_pending_depositIsOpenButBuysNoVoteWeight() public {
+        _deposit(lp1, 100_000e6);
+        uint256 pid = _propose();
+        uint256 electorate = governor.getProposal(pid).votableSupply;
+
+        assertFalse(vault.depositsLocked(), "deposit lock waits for execute");
+        _deposit(lp2, 100_000e6); // lands during Pending
+        assertGt(vault.balanceOf(lp2), 0, "instant deposit open while Pending");
+        assertEq(governor.getVoteWeight(pid, lp2), 0, "a post-stamp deposit has no weight");
+        assertEq(governor.getProposal(pid).votableSupply, electorate, "the recorded electorate did not move");
+        vm.prank(lp2);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+    }
+
+    /// @notice Execute is where the deposit lock lands: instant deposit closes, the async
+    ///         lane opens tagged to the active pid, and settle reopens instant deposit.
+    function test_executed_depositLocksAndTheLaneOpens() public {
+        _deposit(lp1, 100_000e6);
+        uint256 pid = _propose();
+        _endVote();
+        governor.executeProposal(pid);
+        assertTrue(vault.depositsLocked(), "execute locks deposits");
+
+        usdc.mint(lp2, 1_000e6);
+        vm.startPrank(lp2);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, lp2);
+        uint256 req = vault.requestDeposit(1_000e6, lp2);
+        vm.stopPrank();
+        assertEq(queue.getRequest(req).pid, pid, "lane request tagged to the executing proposal");
+
+        _settle(pid);
+        assertFalse(vault.depositsLocked(), "settle reopens deposits");
+        assertFalse(vault.redemptionsLocked(), "settle reopens redemption");
     }
 
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {

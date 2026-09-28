@@ -709,6 +709,7 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.rejectCollaboration(pid);
         assertEq(governor.openProposalCount(), 0, "decremented on rejectCollaboration");
+        assertFalse(vault.redemptionsLocked(), "the vault unlocks with it");
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
@@ -758,6 +759,7 @@ contract OpenProposalCountTest is Test {
 
         // R9 fix: counter must drop back to 0.
         assertEq(governor.openProposalCount(), 0, "R9: emergencyCancel decremented Draft");
+        assertFalse(vault.redemptionsLocked(), "the vault unlocks with it");
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
@@ -789,13 +791,14 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 1, "counter at 1 after fresh propose");
     }
 
-    /// @notice Sherlock run #1 finding #8 — once a Draft exists, the vault
-    ///         is bound and new deposits are blocked (vault's
-    ///         `_depositsLocked` reads `governor.openProposalCount > 0`).
-    ///         Pre-fix, Draft sat outside the counter, so depositors could
-    ///         front-run the Draft→Pending snapshot during the up-to-7-day
-    ///         collab window and have their fresh balance counted at vote time.
-    function test_draft_locksDeposits() public {
+    /// @notice A Draft holds the redeem lock but not the deposit lock: instant redeem
+    ///         is closed from Draft creation (no exit can land ahead of the electorate
+    ///         stamp), instant deposit stays open until execute. Sherlock run #1
+    ///         finding #8 (a Draft-window deposit buys vote weight) is ACCEPTED under
+    ///         SHE-287 — that capital is locked until settle, which is the price of
+    ///         the vote — and the electorate is recorded at the stamp, so the
+    ///         finding's "counted at vote time" mechanism no longer exists.
+    function test_draft_locksRedeemNotDeposit() public {
         address agent2 = makeAddr("agent2");
         uint256 agent2Id = agentRegistry.mint(agent2);
         vm.prank(owner);
@@ -805,7 +808,7 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        governor.propose(
+        uint256 pid = governor.propose(
             address(vault),
             address(0),
             "ipfs://draft-lock",
@@ -818,16 +821,75 @@ contract OpenProposalCountTest is Test {
             coProps
         );
 
-        // openProposalCount = 1; vault's _depositsLocked() returns true.
         assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");
+        assertFalse(vault.depositsLocked(), "deposit lock waits for execute");
+        assertTrue(vault.redemptionsLocked(), "redeem lock is held from Draft creation");
 
-        // Attempt to deposit during the Draft window — must revert.
+        // Deposit during the Draft window: open.
         address depositor = makeAddr("depositor");
         usdc.mint(depositor, 1_000e6);
         vm.startPrank(depositor);
         usdc.approve(address(vault), type(uint256).max);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, depositor);
+        assertGt(vault.deposit(1_000e6, depositor), 0, "instant deposit open during a Draft");
         vm.stopPrank();
+
+        // Instant redeem during the Draft window: closed, for everyone.
+        assertEq(vault.maxRedeem(lp1), 0, "instant redeem closed during a Draft");
+        assertEq(vault.maxRedeem(depositor), 0, "including the Draft-window depositor");
+
+        // The accepted trade: the Draft-window deposit buys weight at the stamp,
+        // and that capital stays locked until settle.
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(agent2);
+        governor.approveCollaboration(pid);
+        assertGt(governor.getVoteWeight(pid, depositor), 0, "the Draft-window deposit votes");
+        assertTrue(vault.redemptionsLocked(), "and cannot leave until settle");
+    }
+
+    /// @notice A lead cancel of a Draft releases the vault: the redeem lock a Draft
+    ///         holds must lift with the binding.
+    function test_cancelProposal_draftReleasesTheLock() public {
+        uint256 pid = _proposeDraftWithCoAgent();
+        assertTrue(vault.redemptionsLocked(), "Draft holds the redeem lock");
+
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        assertEq(governor.openProposalCount(), 0, "cancel released the binding");
+        assertFalse(vault.redemptionsLocked(), "and the lock");
+        assertFalse(vault.depositsLocked(), "deposit lock never held");
+    }
+
+    /// @notice The lazy Draft -> Expired commit is the fifth Draft exit; same pin.
+    function test_draftExpiry_releasesTheLock() public {
+        uint256 pid = _proposeDraftWithCoAgent();
+        vm.warp(governor.collaborationDeadline(pid) + 1);
+        governor.resolveProposalState(pid);
+        assertEq(
+            uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Expired), "Draft lapsed"
+        );
+        assertEq(governor.openProposalCount(), 0, "expiry released the binding");
+        assertFalse(vault.redemptionsLocked(), "and the lock");
+    }
+
+    function _proposeDraftWithCoAgent() internal returns (uint256 pid) {
+        address agent2 = makeAddr("agent2");
+        uint256 agent2Id = agentRegistry.mint(agent2);
+        vm.prank(owner);
+        vault.registerAgent(agent2Id, agent2);
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
+        vm.prank(agent);
+        pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://draft",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            coProps
+        );
     }
 }

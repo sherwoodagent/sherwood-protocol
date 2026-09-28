@@ -68,7 +68,7 @@ to expose it.
 
 On the direct path the lock, the stamp and the snapshot are one transaction. On
 the collaborative path they are not: `redemptionsLocked()` is armed at Draft
-creation (so a deposit cannot inflate the Pending snapshot), while
+creation (so no share can leave before the stamp lands), while
 `votableSupply` and `snapshotTimestamp` are stamped later, at the final
 `approveCollaboration`. `requestRedeem` is open for the whole collaboration
 window.
@@ -134,3 +134,11 @@ whole collaboration window — a product change — to buy what (c) buys with a
 different read at the same instant. (b) leaves a repeatable griefing vector
 open. Decision 2's residual is a different instant pair (vote weight vs.
 electorate on the direct path) and stays open.
+
+The two shapes that keep instant redeem open during the Draft were tried in #320
+(SHE-287) and rejected in review: a live collaborative read lets
+`{redeem, approveCollaboration}` vote full weight against a bar shrunk by its own
+exit, and a `t − 1` read lets a Draft-window deposit `X` exit in the approve block
+and leave a bar of `0.4 (G + X)` that only `G` can reach. (c) holds only because
+the Draft keeps the redeem lock, so every share in the recorded set is capital at
+risk for the cycle.

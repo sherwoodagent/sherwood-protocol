@@ -552,9 +552,9 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev True from Draft creation to settle: no share is minted or burned while a
-    ///      proposal is open, so the veto denominator cannot move.
-    ///      Fail-closed on a missing governor.
+    /// @dev True from Draft creation to settle: no share is burned while a proposal is
+    ///      open, so no exit can land ahead of the electorate stamp. Fail-closed on a
+    ///      missing governor.
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
@@ -634,6 +634,14 @@ contract SyndicateVault is
         }
     }
 
+    /// @dev Voting power never leaves the holder: `delegate`/`delegateBySig` to
+    ///      anyone else would keep shares in the veto denominator while they vote
+    ///      for nobody (or for the queue). Covers the auto-delegate above (self).
+    function _delegate(address account, address delegatee) internal override {
+        if (delegatee != account) revert DelegationLocked();
+        super._delegate(account, delegatee);
+    }
+
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
     function clock() public view override returns (uint48) {
         return uint48(block.timestamp);
@@ -660,10 +668,13 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Same predicate as `redemptionsLocked`: a proposal settles only when
-    ///      its strategy holds nothing, so no receivable is ever priced.
+    /// @dev True only while capital is deployed (execute to settle): that is the one
+    ///      window in which the share price is not knowable. A deposit after the vote
+    ///      snapshot buys no weight, so nothing else needs the gate.
     function depositsLocked() public view returns (bool) {
-        return redemptionsLocked();
+        address gov = _getGovernor();
+        if (gov == address(0)) revert GovernorNotSet();
+        return IProposalStatus(gov).getActiveProposal() != 0;
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -763,10 +774,10 @@ contract SyndicateVault is
         _requireApprovedDepositor(receiver);
     }
 
-    /// @dev Instant deposit is allowed only outside an open proposal. During an
-    ///      open proposal (Pending..Executed) it reverts and LPs use the async
-    ///      deposit queue (`requestDeposit`), entering at the realized settle
-    ///      price. Auto-delegate to self so shareholders get voting power.
+    /// @dev Instant deposit is allowed until capital is deployed. From execute to
+    ///      settle it reverts and LPs use the async deposit queue (`requestDeposit`),
+    ///      entering at the realized settle price. Auto-delegate to self so
+    ///      shareholders get voting power.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
@@ -881,8 +892,8 @@ contract SyndicateVault is
     ///         Escrows `assets` in the queue (off-vault, so they never inflate
     ///         `totalAssets` nor get swept into the strategy) and records a claim
     ///         that mints shares at the realized settle price.
-    /// @dev Gated on `openProposalCount() != 0`, the predicate instant deposit
-    ///      closes on, so exactly one deposit path is always open.
+    /// @dev Gated on the executing pid, the same read `depositsLocked()` makes,
+    ///      so exactly one deposit path is always open.
     /// @return requestId Always > 0 (the queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
         external
@@ -892,10 +903,13 @@ contract SyndicateVault is
     {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
-        if (IProposalStatus(_getGovernor()).openProposalCount() == 0) revert NoOpenProposal();
+        address gov = _getGovernor();
+        if (gov == address(0)) revert GovernorNotSet();
+        // The executing pid is the deposit lock: nonzero iff `depositsLocked()`.
+        uint256 pid = IProposalStatus(gov).getActiveProposal();
+        if (pid == 0) revert DepositsNotLocked();
         if (assets == 0) revert ZeroAssets();
         _requireApprovedDepositor(receiver);
-        uint256 pid = _openProposalPid();
         // Escrow assets in the queue (off-vault custody — never counted in
         // totalAssets, never swept into the strategy).
         IERC20(asset()).safeTransferFrom(msg.sender, q, assets);

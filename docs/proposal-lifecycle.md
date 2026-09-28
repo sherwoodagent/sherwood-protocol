@@ -105,8 +105,11 @@ Cross-contract timing invariants (all enforced at the setters):
   WOOD (allowance alone is not enough). See [proposer-bond.md](proposer-bond.md).
 - With co-proposers → `Draft`; each co-proposer must `approveCollaboration` within
   `collaborationWindow` or the draft expires. The lead can `rejectCollaboration`.
-- Vault funds: **untouched**. Deposits and withdrawals stay open through propose,
-  vote, review, and approval — only execution locks them.
+- Vault funds: **untouched**. Instant deposits stay open through propose, vote,
+  review and approval — only execution locks them (`depositsLocked`). Instant
+  withdrawals lock from propose, `Draft` included (`redemptionsLocked`): whoever
+  can vote stays at risk for the outcome, and no exit can land ahead of the
+  electorate stamp.
 
 ### 1. Vote (`vote`, `src/SyndicateGovernor.sol:378`)
 
@@ -115,7 +118,10 @@ Cross-contract timing invariants (all enforced at the setters):
 - **Optimistic:** the proposal passes by default when `voteEnd` arrives; it is
   rejected only if AGAINST votes reach `vetoThresholdBps` (20–80%) of the
   proposal's `votableSupply` — total supply minus the withdrawal queue's
-  balance, both recorded live at the Draft → Pending transition.
+  balance, recorded at the Draft → Pending transition: live on the direct path
+  (nothing can move between the read and the stamp), at `snapshotTimestamp` on
+  the collaborative path (the redeem lane is open for the whole Draft, so a live
+  queue term could be shrunk by a same-block `requestRedeem` that keeps its weight).
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
   (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
 
@@ -149,8 +155,8 @@ Cross-contract timing invariants (all enforced at the setters):
   empty / zero aggregate reverts `InsufficientApproveCoverage`) → the voted
   batch runs via `executeGovernorBatch` under that effective cap. See
   [coverage.md](coverage.md).
-- Effects: capital snapshot taken, `_activeProposal = id` (**redemptions lock**),
-  management-fee clock starts.
+- Effects: capital snapshot taken, `_activeProposal = id` (**deposits lock** —
+  redemptions have been locked since propose, `Draft` included), management-fee clock starts.
 - Batch metering: per-call caps (`CallCapExceeded`), net outflow ≤ `maxCapital`
   (`MaxNetOutflowExceeded`), queue reserve untouchable (`QueueReserveBreached`),
   idle-float floor (`BufferBreached`), callee gate + adapter allowlist.
@@ -171,7 +177,7 @@ Cross-contract timing invariants (all enforced at the setters):
 - Settlement batch unwinds the position (same caps + `maxCapital`), then
   `_finishSettlement`: `pnl = vault balance − capital snapshot`, management fee →
   performance fee → high-water-mark ratchet → queue settle price stamped →
-  `Settled`. Redemptions unlock; the cooldown arms.
+  `Settled`. Deposits and redemptions unlock; the cooldown arms.
 - Emergency paths (vault owner): `unstick` replays the voted settlement calls after
   `strategyDuration` (no review needed); `emergencySettleWithCalls` runs
   owner-supplied calls behind a fresh guardian review + owner bond
