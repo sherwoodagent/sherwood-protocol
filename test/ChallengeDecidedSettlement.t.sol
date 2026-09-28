@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ChallengeEndToEndBase} from "./ChallengeEndToEnd.t.sol";
 import {IChallengeGame} from "src/interfaces/IChallengeGame.sol";
+import {IGuardianRegistry} from "src/interfaces/IGuardianRegistry.sol";
 
 /// @notice A challenge settles before its window only once the convict side is decided.
 contract ChallengeDecidedSettlementTest is ChallengeEndToEndBase {
@@ -109,6 +110,27 @@ contract ChallengeAccusedTopUpTest is ChallengeEndToEndBase {
         assertEq(c.totalStakeAtFiling, G1_STAKE + 2 * FILLER_STAKE, "g1 counts at its execution-time stake");
         assertEq(c.votableAtFiling, 2 * FILLER_STAKE, "votable excludes all of g1");
 
+        _convict(cid);
+        game.resolve(cid);
+        assertEq(uint8(game.challengeOf(cid).status), uint8(IChallengeGame.Status.Settled), "the rest convict");
+    }
+
+    /// @notice A top-up between approve and execute is inside the slash basis but slashes nothing
+    ///         beyond the lock, so it is capped at the approve snapshot and cannot close the door.
+    function test_accusedTopUpBeforeExecutionDoesNotBuyImmunity() public {
+        uint256 pid = _propose();
+        vm.warp(gov.getProposal(pid).voteEnd + 1);
+        registry.openReview(address(gov), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        _stakeGuardian(g1, 64_000e18, 1);
+        vm.warp(gov.getProposal(pid).reviewEnd + 1);
+        gov.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 cid = _file(challenger, pid, "ipfs://evidence");
+        assertEq(game.challengeOf(cid).totalStakeAtFiling, G1_STAKE + 2 * FILLER_STAKE, "g1 counts at approve");
         _convict(cid);
         game.resolve(cid);
         assertEq(uint8(game.challengeOf(cid).status), uint8(IChallengeGame.Status.Settled), "the rest convict");

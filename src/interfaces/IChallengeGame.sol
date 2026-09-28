@@ -90,8 +90,8 @@ interface IChallengeGame {
         ///      than an error. Appended for tuple-position stability.
         address proposerBondEscrow;
         /// @dev Staked WOOD at `filedAt - 1`, the quorum denominator. The accused stay in
-        ///      it (a wide cohort raises the bar) but each counts at most its stake at
-        ///      `executedAt - 1`: a post-execution top-up is unslashable and adds nothing.
+        ///      it (a wide cohort raises the bar) but each counts at most its stake at the
+        ///      approve snapshot and `executedAt - 1`: a later top-up is never slashed, so adds nothing.
         uint256 totalStakeAtFiling;
         /// @dev The quorum in force at filing, pinned like every other rate.
         uint256 quorumBpsAtFiling;
