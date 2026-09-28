@@ -1093,6 +1093,7 @@ contract GovernorCoverageGatesTest is Test {
 
         // lp1 holds the entire share supply; voting Against clears the 4000 bps
         // veto threshold, so the proposal resolves Rejected at voteEnd.
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         vm.warp(governor.getProposal(pid).voteEnd + 1);

@@ -156,6 +156,7 @@ contract GovernorProposeTargetValidationTest is Test {
     }
 
     function _voteAndAdvance(uint256 pid) internal {
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.prank(voter);
         governor.vote(pid, ISyndicateGovernor.VoteType.For);
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);

@@ -429,6 +429,7 @@ contract SyndicateGovernorTest is Test {
         // Snapshot is block.timestamp - 1; the delegation checkpoint was written
         // at block.timestamp, so getPastVotes returns 0 and vote() reverts.
         vm.prank(flashVoter);
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
     }
