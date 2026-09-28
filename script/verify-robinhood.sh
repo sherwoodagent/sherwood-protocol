@@ -116,8 +116,7 @@ check "factory.beacon"                "$(call "$FACTORY" 'beacon()(address)')"  
 check "factory.protocolConfig"        "$(call "$FACTORY" 'protocolConfig()(address)')"  "$CONFIG"
 check "factory.tierRegistry"          "$(call "$FACTORY" 'tierRegistry()(address)')"    "$TIERS"
 check "factory.guardianRegistry"      "$(call "$FACTORY" 'guardianRegistry()(address)')" "$REGISTRY"
-# v1 ships with identity gating OFF: both registrars are deliberately address(0).
-check "factory.ensRegistrar (off in v1)" "$(call "$FACTORY" 'ensRegistrar()(address)')"  "$ZERO"
+# v1 ships with identity gating OFF: the agent registry is deliberately address(0).
 check "factory.agentRegistry (off in v1)" "$(call "$FACTORY" 'agentRegistry()(address)')" "$ZERO"
 # A beacon serving address(0) mints governors that are pure fallback.
 BIMPL=$(call "$BEACON" 'implementation()(address)')

@@ -167,8 +167,7 @@ contract DeployAllForkTest is Test {
         assertEq(address(factory.guardianRegistry()), s.core.registryProxy, "factory.guardianRegistry");
         assertEq(factory.beacon(), s.core.beacon, "factory.beacon");
         assertEq(factory.protocolConfig(), s.core.protocolConfig, "factory.protocolConfig");
-        // v1 ships with identity gating off, so both registrars are deliberately zero.
-        assertEq(address(factory.ensRegistrar()), address(0), "factory.ensRegistrar");
+        // v1 ships with identity gating off, so the agent registry is deliberately zero.
         assertEq(address(factory.agentRegistry()), address(0), "factory.agentRegistry");
         assertEq(StakedWood(s.core.swoodProxy).registry(), s.core.registryProxy, "swood.registry");
         assertEq(address(StakedWood(s.core.swoodProxy).wood()), i.wood, "swood.wood is the live WOOD");

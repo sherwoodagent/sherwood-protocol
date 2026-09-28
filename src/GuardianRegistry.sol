@@ -7,7 +7,6 @@ import {IStakedWood} from "./interfaces/IStakedWood.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
@@ -30,7 +29,7 @@ interface ILedgerRegistryPointer {
 ///         checkpoints, and slashing live in `StakedWood` (sWOOD); the
 ///         registry reads vote weight from sWOOD and calls sWOOD to slash.
 ///         See `openspec/specs/guardian-staking/spec.md`.
-contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgradeable {
+contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
 

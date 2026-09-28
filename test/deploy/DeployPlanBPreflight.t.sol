@@ -209,7 +209,6 @@ contract DeployPlanBPreflightTest is Test {
                     owner: deployer,
                     executorImpl: address(new BatchExecutorLib()),
                     vaultImpl: address(new SyndicateVault()),
-                    ensRegistrar: address(0),
                     agentRegistry: address(0),
                     beacon: address(beacon),
                     protocolConfig: address(protocolConfig),

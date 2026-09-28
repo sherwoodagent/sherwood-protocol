@@ -116,7 +116,6 @@ contract DeployScriptTest is Test {
                     owner: deployer,
                     executorImpl: executorLib,
                     vaultImpl: vaultImpl,
-                    ensRegistrar: address(0),
                     agentRegistry: address(0),
                     beacon: beacon,
                     protocolConfig: address(protocolConfig),

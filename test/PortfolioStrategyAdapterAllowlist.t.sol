@@ -419,26 +419,34 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_initBelowFloor_49_reverts() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault2");
+        address vault_ = _resolvedVault();
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, _initData(49));
+        strategy.initialize(vault_, proposer, _initData(49));
     }
 
     function test_initBelowFloor_zero_reverts() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault3");
+        address vault_ = _resolvedVault();
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, _initData(0));
+        strategy.initialize(vault_, proposer, _initData(0));
     }
 
     function test_initAboveCeiling_stillReverts() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault4");
+        address vault_ = _resolvedVault();
         // Hoisted: a call in argument position would consume the pending
         // `vm.expectRevert` before `initialize` itself runs.
         bytes memory data = _initData(strategy.MAX_SLIPPAGE_CEILING_BPS() + 1);
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, data);
+        strategy.initialize(vault_, proposer, data);
+    }
+
+    /// @dev A vault whose registry resolves and allows the basket, so init reaches the slippage checks.
+    function _resolvedVault() internal returns (address) {
+        MockTierRegistry registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        registry.setAllowed(address(tsla), true);
+        return address(new MockVaultWithGovernor(address(new MockGovernorWithRegistry(address(registry)))));
     }
 
     function test_initAtExactFloor_succeeds() public {
@@ -596,6 +604,28 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
             abi.encodeWithSelector(PortfolioStrategy.AdapterNotAllowed.selector, address(adapter), address(registry))
         );
         strategy.rebalanceDelta();
+    }
+
+    /// @notice A registry that stops resolving after execute fails `rebalanceDelta` closed.
+    function test_unresolvedRegistry_rebalanceDelta_reverts() public {
+        (PortfolioStrategy strategy,, MockVaultWithGovernor vault,) =
+            _initAndExecuteWithResolvedRegistryAndAggregator(SLIPPAGE_100);
+        MockGovernorWithRegistry(vault.governor()).setTierRegistry(address(0));
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
+        strategy.rebalanceDelta();
+    }
+
+    /// @notice An unresolvable registry never blocks settlement.
+    function test_unresolvedRegistry_settleStillCompletes() public {
+        (PortfolioStrategy strategy,, MockVaultWithGovernor vault,) =
+            _initAndExecuteWithResolvedRegistryAndAggregator(SLIPPAGE_100);
+        MockGovernorWithRegistry(vault.governor()).setTierRegistry(address(0));
+
+        vm.prank(address(vault));
+        strategy.settle();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
     }
 
     /// @dev Regression guard: a resolved, still-allowlisted adapter must not

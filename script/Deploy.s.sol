@@ -27,7 +27,6 @@ abstract contract DeploySherwood is ScriptBase {
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
 
     struct Config {
-        address ensRegistrar;
         address agentRegistry;
         uint256 managementFeeBps;
         address woodToken;
@@ -159,7 +158,6 @@ abstract contract DeploySherwood is ScriptBase {
                     owner: d.deployer,
                     executorImpl: d.executorLib,
                     vaultImpl: d.vaultImpl,
-                    ensRegistrar: cfg.ensRegistrar,
                     agentRegistry: cfg.agentRegistry,
                     beacon: d.beacon,
                     protocolConfig: d.protocolConfig,
@@ -286,7 +284,6 @@ abstract contract DeploySherwood is ScriptBase {
         address factoryAddr,
         address executorLibAddr,
         address vaultImplAddr,
-        address ensRegistrar,
         address agentRegistry,
         uint256 mgmtFeeBps
     ) internal view {
@@ -298,7 +295,6 @@ abstract contract DeploySherwood is ScriptBase {
         _checkAddr("factory.protocolConfig", factory.protocolConfig(), protocolConfigAddr);
         _checkAddr("factory.executorImpl", factory.executorImpl(), executorLibAddr);
         _checkAddr("factory.vaultImpl", factory.vaultImpl(), vaultImplAddr);
-        _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), ensRegistrar);
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), agentRegistry);
         _checkUint("factory.managementFeeBps", factory.managementFeeBps(), mgmtFeeBps);
 

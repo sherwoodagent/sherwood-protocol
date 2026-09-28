@@ -27,9 +27,6 @@ import {FeeConstants} from "./FeeConstants.sol";
  *   and vault implementation. Each vault proxy has its own storage: positions,
  *   agent registry, and depositor whitelist.
  *
- *   ENS subnames are registered atomically via Durin L2 Registrar, so each
- *   syndicate gets a <subdomain>.sherwoodagent.eth name resolving to its vault.
- *
  *   UUPS upgradeable — owner can update config (creation fee, governor, etc.)
  *   but deployed vaults are immutable (no upgradeTo on vaults).
  */
@@ -41,8 +38,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error TierRegistryNotWired();
     error InvalidExecutorImpl();
     error InvalidVaultImpl();
-    error InvalidENSRegistrar();
-    error InvalidAgentRegistry();
     error NotAgentOwner();
     /// @notice `rotateOwner` restricted to vault owner / creator.
     error NotVaultOwnerOrCreator();
@@ -51,7 +46,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error NotCreator();
     error InvalidBeacon();
     error InvalidProtocolConfig();
-    error InsufficientCreationFee();
     error InvalidFeeToken();
     error ManagementFeeTooHigh();
     error UpgradesDisabled();
@@ -75,7 +69,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         string name; // Vault token name
         string symbol; // Vault token symbol
         bool openDeposits; // If true, anyone can deposit. If false, depositor whitelist enforced.
-        string subdomain; // ENS subdomain label (e.g. "alpha-seekers")
+        string subdomain; // Logical name label (e.g. "alpha-seekers")
     }
 
     struct Syndicate {
@@ -85,7 +79,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         string metadataURI; // ipfs://... via Pinata
         uint256 createdAt;
         bool active;
-        string subdomain; // ENS subdomain registered
+        string subdomain; // Logical name reserved at creation
     }
 
     // ── Storage ──
@@ -96,8 +90,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Shared vault implementation (proxies are non-upgradeable)
     address public vaultImpl;
 
-    /// @notice Durin L2 Registrar for ENS subnames
-    IL2Registrar public ensRegistrar;
+    /// @dev Retired ENS registrar slot; kept in place (same type) for the golden layout.
+    IL2Registrar private __deprecated_ensRegistrar;
 
     /// @notice ERC-8004 agent identity registry (ERC-721)
     IERC721 public agentRegistry;
@@ -134,7 +128,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Vault address → syndicate ID
     mapping(address => uint256) public vaultToSyndicate;
 
-    /// @notice ENS subdomain → syndicate ID
+    /// @notice Subdomain (logical name) → syndicate ID
     mapping(string => uint256) public subdomainToSyndicate;
 
     /// @notice ERC-20 token required for creation fee (e.g., USDC)
@@ -168,11 +162,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Maximum management fee a vault owner may charge (3% of post-strategy net).
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
 
-    /// @notice Adapter-selector tier registry (guardian economic-security model).
-    ///         Optional — `address(0)` means governors created by this factory
-    ///         keep the safe tier-2 default (full-notional coverage). Set
-    ///         post-deploy by the owner via `setTierRegistry`, then pushed into
-    ///         each per-vault governor at `createSyndicate`.
+    /// @notice Adapter-selector tier registry, required: `initialize` and `setTierRegistry`
+    ///         reject a codeless address. Passed to each governor at `createSyndicate`.
     address public tierRegistry;
 
     /// @notice Aggregate-exposure ledger (guardian economic-security model).
@@ -218,12 +209,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event CreationSponsored(address indexed creator, bool sponsored);
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
-    /// @notice Emitted when the ENS subname registration in `createSyndicate`
-    ///         reverts (e.g. a mempool front-runner registered the same label,
-    ///         or the registrar is paused). The vault + queue + stake bind
-    ///         already landed; off-chain can retry by calling the registrar
-    ///         directly.
-    event EnsRegistrationFailed(address indexed vault, string subdomain);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
@@ -237,13 +222,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event GovernorDeployed(address indexed vault, address indexed governor);
     event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
     event ProtocolConfigUpdated(address indexed oldConfig, address indexed newConfig);
-    event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
 
     struct InitParams {
         address owner;
         address executorImpl;
         address vaultImpl;
-        address ensRegistrar;
         address agentRegistry;
         address beacon;
         address protocolConfig;
@@ -260,7 +243,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     function initialize(InitParams calldata p) external initializer {
         if (p.executorImpl == address(0)) revert InvalidExecutorImpl();
         if (p.vaultImpl == address(0)) revert InvalidVaultImpl();
-        // NOTE: ensRegistrar and agentRegistry can be address(0) on chains without ENS/ERC-8004
+        // NOTE: agentRegistry can be address(0) on chains without ERC-8004
         if (p.beacon == address(0)) revert InvalidBeacon();
         if (p.protocolConfig == address(0)) revert InvalidProtocolConfig();
         if (p.guardianRegistry == address(0)) revert InvalidGuardianRegistry();
@@ -272,7 +255,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
         executorImpl = p.executorImpl;
         vaultImpl = p.vaultImpl;
-        ensRegistrar = IL2Registrar(p.ensRegistrar);
         agentRegistry = IERC721(p.agentRegistry);
         beacon = p.beacon;
         protocolConfig = p.protocolConfig;
@@ -284,7 +266,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     // ==================== SYNDICATE CREATION ====================
 
-    /// @notice Create a new syndicate — deploys vault proxy, registers ENS subname, stores everything
+    /// @notice Create a new syndicate — deploys vault proxy, reserves its subdomain, stores everything
     /// @param creatorAgentId ERC-8004 agent ID of the creator (must be owned by msg.sender)
     /// @param config Syndicate configuration
     /// @return syndicateId The new syndicate's ID
@@ -295,7 +277,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     {
         // Reject zero/empty config fields before any side effects — otherwise
         // `cfg.asset == 0` would only trip in `SyndicateVault.initialize` (after
-        // ENS subdomain registration + registry stake bind), leaving stranded
+        // the registry stake bind), leaving stranded
         // state, and empty name / symbol / metadataURI would deploy a vault
         // with blank ERC-4626 metadata + no IPFS pointer. `subdomain.length < 3`
         // is checked below (`SubdomainTooShort`) so we only assert non-empty here.
@@ -378,29 +360,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // roll back the whole creation tx — atomic.
         sw.bindOwnerStake(msg.sender, vault);
 
-        if (address(ensRegistrar) != address(0)) {
-            // The `available()` view is itself an external call into a
-            // possibly-paused / misconfigured / non-conforming registrar. It
-            // MUST be in try/catch too — otherwise a reverting view bricks ALL
-            // vault creation, the exact DoS the `register` catch (and the note
-            // above) is meant to prevent.
-            try ensRegistrar.available(config.subdomain) returns (bool avail) {
-                if (avail) {
-                    try ensRegistrar.register(config.subdomain, vault) {}
-                    catch {
-                        emit EnsRegistrationFailed(vault, config.subdomain);
-                    }
-                } else {
-                    // Label already taken upstream (front-run or prior external
-                    // registration). Skip the doomed call; signal for retry/triage.
-                    emit EnsRegistrationFailed(vault, config.subdomain);
-                }
-            } catch {
-                // Registrar `available()` faulted — fail open, stay operational.
-                emit EnsRegistrationFailed(vault, config.subdomain);
-            }
-        }
-
         syndicates[syndicateId] = Syndicate({
             id: syndicateId,
             vault: vault,
@@ -412,12 +371,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         });
 
         vaultToSyndicate[vault] = syndicateId;
-        // Written unconditionally (even if the ENS on-chain registration above
-        // failed) — the subdomain is the syndicate's logical name used for
-        // chat discovery, and Sherwood reserves it locally regardless of ENS
-        // state. The earlier `SubdomainTaken` guard prevents two syndicates
-        // from claiming the same logical name. ENS is a best-effort on-chain
-        // mirror, retryable out-of-band.
+        // The subdomain is the syndicate's logical name (chat discovery);
+        // `SubdomainTaken` above keeps it unique.
         subdomainToSyndicate[config.subdomain] = syndicateId;
         _activeSyndicateIds.add(syndicateId);
 
@@ -529,18 +484,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (creator == address(0)) revert ZeroAddress();
         creationSponsored[creator] = sponsored;
         emit CreationSponsored(creator, sponsored);
-    }
-
-    /// @notice Update the Durin L2 Registrar used for ENS subname registration on
-    ///         new syndicates. Zero disables ENS registration on
-    ///         `createSyndicate`. Only affects FUTURE syndicates — existing ones
-    ///         created against a misconfigured registrar keep their on-chain state
-    ///         and must be backfilled per-syndicate by calling the registrar's
-    ///         permissionless `register` directly.
-    function setEnsRegistrar(address newRegistrar) external onlyOwner {
-        address old = address(ensRegistrar);
-        ensRegistrar = IL2Registrar(newRegistrar);
-        emit EnsRegistrarUpdated(old, newRegistrar);
     }
 
     /// @notice Re-point the beacon that new governor proxies read their impl from.
@@ -746,8 +689,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     /// @notice Check if a subdomain is available for registration
     function isSubdomainAvailable(string calldata subdomain) external view returns (bool) {
-        return subdomainToSyndicate[subdomain] == 0
-            && (address(ensRegistrar) == address(0) || ensRegistrar.available(subdomain));
+        return subdomainToSyndicate[subdomain] == 0;
     }
 
     /// @notice Get active syndicates with pagination.

@@ -344,6 +344,19 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         assertEq(usdg.allowance(address(s), address(realMorpho)), 0, "no approval granted");
     }
 
+    /// @notice A registry that stops resolving between init and execute fails `execute()` closed.
+    function test_execute_revertsWhenRegistryUnresolvedAfterInit() public {
+        registry.setAllowed(address(realMorpho), true);
+        MorphoSupplyStrategy s = _init(address(realMorpho), mp);
+        governor.setTierRegistry(address(0));
+
+        vm.prank(address(vaultStub));
+        usdg.approve(address(s), SUPPLY);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MorphoSupplyStrategy.TierRegistryUnresolved.selector);
+        s.execute();
+    }
+
     /// @notice The exit path is NOT gated: a demotion after execute must not be
     ///         able to freeze deployed capital inside the clone.
     function test_settle_notGatedByAllowlist() public {

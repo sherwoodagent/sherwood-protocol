@@ -12,132 +12,6 @@ contract UniswapAdapterPathTest is Test {
         adapter = new UniswapSwapAdapterHarness(address(1), address(2), address(0), address(0));
     }
 
-    // ── extractFirstAddress ──
-
-    function test_extractFirstAddress() public view {
-        address usdc = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address weth = 0x4200000000000000000000000000000000000006;
-        address token = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-
-        bytes memory path = abi.encodePacked(usdc, uint24(500), weth, uint24(10000), token);
-        assertEq(adapter.extractFirstAddress(path), usdc);
-    }
-
-    // ── extractAddressAt / extractFeeAt ──
-
-    function test_extractAddressAt() public view {
-        address usdc = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address weth = 0x4200000000000000000000000000000000000006;
-        address token = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-        uint24 fee1 = 500;
-        uint24 fee2 = 10000;
-
-        bytes memory path = abi.encodePacked(usdc, fee1, weth, fee2, token);
-
-        // offset 0: USDC
-        assertEq(adapter.extractAddressAt(path, 0), usdc);
-        // offset 23: WETH (20 addr + 3 fee)
-        assertEq(adapter.extractAddressAt(path, 23), weth);
-        // offset 46: TOKEN
-        assertEq(adapter.extractAddressAt(path, 46), token);
-    }
-
-    function test_extractFeeAt() public view {
-        address usdc = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address weth = 0x4200000000000000000000000000000000000006;
-        address token = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-        uint24 fee1 = 500;
-        uint24 fee2 = 10000;
-
-        bytes memory path = abi.encodePacked(usdc, fee1, weth, fee2, token);
-
-        // fee1 at offset 20
-        assertEq(adapter.extractFeeAt(path, 20), fee1);
-        // fee2 at offset 43
-        assertEq(adapter.extractFeeAt(path, 43), fee2);
-    }
-
-    function test_extractFeeAt_allTiers() public view {
-        address a = address(0x1111111111111111111111111111111111111111);
-        address b = address(0x2222222222222222222222222222222222222222);
-
-        uint24[4] memory tiers = [uint24(100), uint24(500), uint24(3000), uint24(10000)];
-        for (uint256 i; i < tiers.length; ++i) {
-            bytes memory path = abi.encodePacked(a, tiers[i], b);
-            assertEq(adapter.extractFeeAt(path, 20), tiers[i], "fee tier mismatch");
-        }
-    }
-
-    // ── reversePath ──
-
-    function test_reversePath_singleHop() public view {
-        address usdc = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address token = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-        uint24 fee = 3000;
-
-        bytes memory forward = abi.encodePacked(usdc, fee, token);
-        bytes memory reversed = adapter.reversePath(forward);
-        bytes memory expected = abi.encodePacked(token, fee, usdc);
-
-        assertEq(keccak256(reversed), keccak256(expected));
-    }
-
-    function test_reversePath_twoHop() public view {
-        address usdc = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address weth = 0x4200000000000000000000000000000000000006;
-        address token = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-        uint24 fee1 = 500;
-        uint24 fee2 = 10000;
-
-        bytes memory forward = abi.encodePacked(usdc, fee1, weth, fee2, token);
-        bytes memory reversed = adapter.reversePath(forward);
-        bytes memory expected = abi.encodePacked(token, fee2, weth, fee1, usdc);
-
-        assertEq(keccak256(reversed), keccak256(expected), "reversed path should match expected");
-        assertEq(adapter.extractFirstAddress(reversed), token, "reversed path starts with token");
-    }
-
-    function test_reversePath_threeHop() public view {
-        address a = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address b = 0x4200000000000000000000000000000000000006;
-        address c = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-        address d = 0x6502EE0aB950Bdf5114C7e36c5F1da0429f73811;
-        uint24 f1 = 500;
-        uint24 f2 = 3000;
-        uint24 f3 = 10000;
-
-        bytes memory forward = abi.encodePacked(a, f1, b, f2, c, f3, d);
-        bytes memory reversed = adapter.reversePath(forward);
-        bytes memory expected = abi.encodePacked(d, f3, c, f2, b, f1, a);
-
-        assertEq(keccak256(reversed), keccak256(expected), "3-hop reverse");
-    }
-
-    function test_reversePath_isInvolution() public view {
-        address a = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        address b = 0x4200000000000000000000000000000000000006;
-        address c = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-
-        bytes memory path = abi.encodePacked(a, uint24(500), b, uint24(10000), c);
-        bytes memory doubleReversed = adapter.reversePath(adapter.reversePath(path));
-
-        assertEq(keccak256(doubleReversed), keccak256(path), "reverse(reverse(path)) == path");
-    }
-
-    // ── Edge cases ──
-
-    function test_extractFirstAddress_reverts_tooShort() public {
-        bytes memory path = new bytes(19);
-        vm.expectRevert("path too short");
-        adapter.extractFirstAddress(path);
-    }
-
-    function test_reversePath_reverts_invalidLength() public {
-        bytes memory path = new bytes(25); // not 20 + 23*n
-        vm.expectRevert("invalid path length");
-        adapter.reversePath(path);
-    }
-
     // ── Mode 2 (V4) guards — the harness has address(0) poolManager/v4Quoter ──
 
     function test_mode2_swap_reverts_whenPoolManagerUnset() public {
@@ -179,6 +53,29 @@ contract UniswapAdapterPathTest is Test {
         vm.expectRevert(UniswapSwapAdapter.UnsupportedMode.selector);
         adapter.swap(address(tokenIn), makeAddr("out"), 1e18, 0, extraData);
         vm.stopPrank();
+    }
+
+    /// @notice The retired V3 multi-hop mode 1 is no longer routable.
+    function test_mode1_swap_reverts_unsupported() public {
+        ERC20Mock tokenIn = new ERC20Mock("In", "IN", 18);
+        address user = makeAddr("user");
+        tokenIn.mint(user, 1e18);
+        bytes memory path = abi.encodePacked(address(tokenIn), uint24(500), makeAddr("out"));
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path, uint16(200)));
+
+        vm.startPrank(user);
+        tokenIn.approve(address(adapter), 1e18);
+        vm.expectRevert(UniswapSwapAdapter.UnsupportedMode.selector);
+        adapter.swap(address(tokenIn), makeAddr("out"), 1e18, 0, extraData);
+        vm.stopPrank();
+    }
+
+    /// @notice The retired V3 multi-hop mode 1 is no longer quotable.
+    function test_mode1_quote_reverts_unsupported() public {
+        bytes memory path = abi.encodePacked(makeAddr("in"), uint24(500), makeAddr("out"));
+        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path));
+        vm.expectRevert(UniswapSwapAdapter.UnsupportedMode.selector);
+        adapter.quote(makeAddr("in"), makeAddr("out"), 1e18, extraData);
     }
 
     function test_unsupportedMode_quote_reverts() public {
@@ -373,111 +270,11 @@ contract UniswapAdapterPathTest is Test {
 contract UniswapSwapAdapterHarness is UniswapSwapAdapter {
     constructor(address r, address q, address pm, address v4q) UniswapSwapAdapter(r, q, pm, v4q) {}
 
-    function extractFirstAddress(bytes memory path) external pure returns (address) {
-        return _extractFirstAddress(path);
-    }
-
-    function extractAddressAt(bytes memory path, uint256 offset) external pure returns (address) {
-        return _extractAddressAt(path, offset);
-    }
-
-    function extractFeeAt(bytes memory path, uint256 offset) external pure returns (uint24) {
-        return _extractFeeAt(path, offset);
-    }
-
-    function reversePath(bytes memory path) external pure returns (bytes memory) {
-        return _reversePath(path);
-    }
-
-    function requireEndpoints(bytes memory path, address tokenIn, address tokenOut) external pure {
-        _requireEndpoints(path, tokenIn, tokenOut);
-    }
-
     function orientHops(PathHop[] memory hops, address tokenIn, address tokenOut)
         external
         pure
         returns (PathHop[] memory)
     {
         return _orientHops(hops, tokenIn, tokenOut);
-    }
-}
-
-/// @notice Pashov 2026-08 finding #4 — mode 1 never bound the path's TAIL to
-///         `tokenOut`.
-/// @dev    `swap` mode 1 checked only that the packed path STARTS at `tokenIn`
-///         (reversing it if not) and never referenced `tokenOut` at all, while
-///         `_chainedSingleHops` derives every hop from the path bytes and pays
-///         the terminal token to `msg.sender`. So the route decided what the
-///         caller received, and `amountOutMin` — computed by the caller in
-///         `tokenOut` units, oracle-anchored in `PortfolioStrategy._buyFloor` /
-///         `_sellFloor` — was enforced by the router against a DIFFERENT
-///         token's units, which any freely-mintable token clears trivially.
-///
-///         `quote` mode 1 had the same gap with a sharper consequence:
-///         `quoteExactInput` prices the path's terminal token, so callers built
-///         slippage floors out of a mis-denominated number rather than failing.
-///
-///         Modes 0, 2 and 3 all bind `tokenOut` already (`exactInputSingle`'s
-///         struct field, `hops[0].currency`, and `_orientHops`' own endpoint
-///         check); mode 1 was the sole exception.
-contract UniswapAdapterEndpointBindingTest is Test {
-    UniswapSwapAdapterHarness adapter;
-
-    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-    address constant WETH = 0x4200000000000000000000000000000000000006;
-    address constant TSLA = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
-    /// @dev The attacker's own freely-mintable token — the terminal hop a
-    ///      mis-bound route redirects into.
-    address constant ATK = 0x00000000000000000000000000000000DeaDBeef;
-
-    function setUp() public {
-        adapter = new UniswapSwapAdapterHarness(address(1), address(2), address(0), address(0));
-    }
-
-    function test_singleHop_matchingEndpoints_accepted() public view {
-        bytes memory path = abi.encodePacked(USDC, uint24(500), TSLA);
-        adapter.requireEndpoints(path, USDC, TSLA);
-    }
-
-    function test_multiHop_matchingEndpoints_accepted() public view {
-        bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), TSLA);
-        adapter.requireEndpoints(path, USDC, TSLA);
-    }
-
-    /// @dev THE finding: head matches, tail does not. Pre-fix this was accepted
-    ///      and the caller received ATK while its floor was denominated in TSLA.
-    function test_headMatchesButTailRedirected_rejected() public {
-        bytes memory path = abi.encodePacked(USDC, uint24(500), ATK);
-        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
-        adapter.requireEndpoints(path, USDC, TSLA);
-    }
-
-    /// @dev Same redirect hidden behind an honest-looking intermediate hop.
-    function test_multiHopTailRedirected_rejected() public {
-        bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), ATK);
-        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
-        adapter.requireEndpoints(path, USDC, TSLA);
-    }
-
-    /// @dev The head is re-asserted here rather than trusted from the caller's
-    ///      orientation `if`, so the helper states the whole invariant alone.
-    function test_headMismatch_rejected() public {
-        bytes memory path = abi.encodePacked(WETH, uint24(500), TSLA);
-        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
-        adapter.requireEndpoints(path, USDC, TSLA);
-    }
-
-    /// @dev A degenerate 20-byte path is head AND tail at once, so it is only
-    ///      valid when both endpoints are the same token — which is not a swap.
-    function test_degenerateSingleAddressPath_rejectedForDistinctTokens() public {
-        bytes memory path = abi.encodePacked(USDC);
-        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
-        adapter.requireEndpoints(path, USDC, TSLA);
-    }
-
-    function test_shortPath_rejected() public {
-        bytes memory path = hex"00112233";
-        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
-        adapter.requireEndpoints(path, USDC, TSLA);
     }
 }
