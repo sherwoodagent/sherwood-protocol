@@ -105,11 +105,10 @@ Cross-contract timing invariants (all enforced at the setters):
   WOOD (allowance alone is not enough). See [proposer-bond.md](proposer-bond.md).
 - With co-proposers → `Draft`; each co-proposer must `approveCollaboration` within
   `collaborationWindow` or the draft expires. The lead can `rejectCollaboration`.
-- Vault funds: **untouched**. Instant deposits stay open through propose, vote,
-  review and approval — only execution locks them (`depositsLocked`). Instant
-  withdrawals lock from propose, `Draft` included (`redemptionsLocked`): whoever
-  can vote stays at risk for the outcome, and no exit can land ahead of the
-  electorate stamp.
+- Vault funds: **untouched**, but instant deposits and withdrawals lock from
+  propose, `Draft` included, until settle (`depositsLocked` = `redemptionsLocked`):
+  no share is minted or burned while a proposal is open. LPs use the queue lanes
+  (`requestDeposit` / `requestRedeem`) meanwhile.
 
 ### 1. Vote (`vote`, `src/SyndicateGovernor.sol:378`)
 
@@ -153,7 +152,7 @@ Cross-contract timing invariants (all enforced at the setters):
   empty / zero aggregate reverts `InsufficientApproveCoverage`) → the voted
   batch runs via `executeGovernorBatch` under that effective cap. See
   [coverage.md](coverage.md).
-- Effects: capital snapshot taken, `_activeProposal = id` (**deposits lock** —
+- Effects: capital snapshot taken, `_activeProposal = id` (deposits and
   redemptions have been locked since propose, `Draft` included), management-fee clock starts.
 - Batch metering: per-call caps (`CallCapExceeded`), net outflow ≤ `maxCapital`
   (`MaxNetOutflowExceeded`), queue reserve untouchable (`QueueReserveBreached`),

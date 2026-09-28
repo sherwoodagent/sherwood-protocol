@@ -407,10 +407,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // param change. Packed (executionWindow << 128 | votingPeriod).
             _draftTimingSnap[proposalId] =
                 (uint256(uint128(_params.executionWindow)) << 128) | uint256(uint128(_params.votingPeriod));
-            // A Draft binds the vault and holds the redeem lock: the electorate
-            // is stamped at the final approve, whose readiness is public, so no
-            // exit may land ahead of it. A Draft-window deposit is accepted —
-            // it buys weight with capital locked until settle.
+            // Locks the vault at Draft creation: an unlocked Draft would let
+            // an attacker deposit between propose and the final approve,
+            // inflating the balance counted in the Pending snapshot.
             unchecked {
                 ++_openProposalCount;
             }
@@ -447,8 +446,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 atPropose = IVotes(proposal.vault).getPastVotes(msg.sender, snap + 1);
         if (atPropose < weight) weight = atPropose;
         if (weight == 0) revert NoVotingPower();
-        // The electorate reads the same two instants, so a mint later in the propose second
-        // cannot lift the castable weight above it (SHE-287 keeps Pending deposits open).
+        // The electorate reads the same two instants, so no share flow in the propose second
+        // can lift the castable weight above it; independent of the deposit lock.
         uint256 votable = _votableSupplyAt(proposal.vault, snap + 1);
         if (votable < proposal.votableSupply) proposal.votableSupply = votable;
 

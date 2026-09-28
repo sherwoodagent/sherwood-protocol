@@ -148,8 +148,10 @@ risk for the cycle.
 **SHIPPED: (c) plus a second checkpoint read (v1 audit F1, then the v2 merge).** (c)
 alone let a redeem ordered ahead of the stamp raise the bar above every share still
 in the vault, re-opening NM 6.4-F2. v1 clamped the stamp at the live supply; that
-read is mid-second, and once SHE-287 kept Pending deposits open, a redeem ahead of
+read is mid-second, and while SHE-287 kept Pending deposits open, a redeem ahead of
 `propose` plus a re-deposit after it in the same second voted 2x the electorate.
+The v2 merge restores v1's deposit lock (Draft to settle), which also closes that
+path; the formula below does not depend on the lock.
 The electorate is now `E(t) = S(t) - Q(t)` read from checkpoints at the same two
 instants as the weight: stamped at `snapshot`, lowered by `vote` to `E(snapshot + 1)`.
 This is Decision 2's "exact fix": every holder self-delegates, so `E(t)` is the
