@@ -67,7 +67,6 @@ contract SetGuardianRegistryTest is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(0),
                     agentRegistry: address(0),
                     beacon: address(governor),
                     protocolConfig: address(governor),

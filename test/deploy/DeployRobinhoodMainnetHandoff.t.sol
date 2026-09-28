@@ -82,9 +82,8 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         multisig = new MockMultisig();
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
-        DeploySherwood.Config memory cfg = DeploySherwood.Config({
-            ensRegistrar: address(0), agentRegistry: address(0), managementFeeBps: 200, woodToken: address(wood)
-        });
+        DeploySherwood.Config memory cfg =
+            DeploySherwood.Config({agentRegistry: address(0), managementFeeBps: 200, woodToken: address(wood)});
 
         // `deployCore`'s inner `c3.deploy` calls run as the harness address, so
         // prank as the harness to keep the `Create3Factory` owner consistent —

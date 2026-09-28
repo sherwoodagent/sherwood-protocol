@@ -15,7 +15,6 @@ import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
-import {MockL2Registrar} from "./mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {FeeConstants} from "../src/FeeConstants.sol";
 
@@ -24,7 +23,6 @@ contract SyndicateFactoryTest is Test {
     BatchExecutorLib public executorLib;
     SyndicateVault public vaultImpl;
     ERC20Mock public usdc;
-    MockL2Registrar public ensRegistrar;
     MockAgentRegistry public agentRegistry;
 
     address public owner = makeAddr("owner");
@@ -46,7 +44,6 @@ contract SyndicateFactoryTest is Test {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         vaultImpl = new SyndicateVault();
-        ensRegistrar = new MockL2Registrar();
         agentRegistry = new MockAgentRegistry();
 
         // Per-vault governor: the factory deploys a BeaconProxy governor per
@@ -66,7 +63,6 @@ contract SyndicateFactoryTest is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
                     beacon: address(beacon),
                     protocolConfig: address(protocolCfg),
@@ -181,7 +177,6 @@ contract SyndicateFactoryTest is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
                     beacon: governorAddr,
                     protocolConfig: governorAddr,
@@ -214,22 +209,6 @@ contract SyndicateFactoryTest is Test {
         );
         assertEq(perVaultCeiling, 2000, "the headline is 20%");
         assertLt(perVaultCeiling, FeeConstants.MAX_PERFORMANCE_FEE_BPS, "the default must sit below the ceiling");
-    }
-
-    /// @notice F4 — a reverting registrar `available()` view must NOT brick
-    ///         vault creation. PR #359 #7 wrapped `register()` in try/catch but
-    ///         left the `available()` pre-check unguarded, so a paused / non-
-    ///         conforming registrar still reverted the whole `createSyndicate`.
-    ///         The syndicate must come up ENS-less instead.
-    function test_createSyndicate_succeedsWhenRegistrarAvailableReverts() public {
-        ensRegistrar.setRevertOnAvailable(true);
-
-        vm.prank(creator1);
-        (uint256 id, address vaultAddr) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("ens-fault"));
-
-        assertEq(id, 1, "syndicate still created");
-        assertTrue(vaultAddr != address(0), "vault created despite reverting registrar available()");
-        assertFalse(ensRegistrar.isRegistered("ens-fault"), "ENS skipped when available() faults");
     }
 
     function test_createSyndicate_notAgentOwner_reverts() public {
@@ -355,16 +334,7 @@ contract SyndicateFactoryTest is Test {
         assertTrue(vault2.isAgent(agent2));
     }
 
-    // ==================== ENS SUBDOMAINS ====================
-
-    function test_createSyndicate_registersENS() public {
-        vm.prank(creator1);
-        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("alpha-seekers"));
-
-        // Verify the registrar received the correct label + vault address
-        assertTrue(ensRegistrar.isRegistered("alpha-seekers"));
-        assertEq(ensRegistrar.getOwner("alpha-seekers"), vaultAddr);
-    }
+    // ==================== SUBDOMAINS ====================
 
     function test_createSyndicate_duplicateName_reverts() public {
         vm.prank(creator1);
@@ -396,10 +366,6 @@ contract SyndicateFactoryTest is Test {
         factory.createSyndicate(creator1AgentId, _configWithSubdomain("new-fund"));
 
         assertFalse(factory.isSubdomainAvailable("new-fund"));
-    }
-
-    function test_isSubdomainAvailable_tooShort() public view {
-        assertFalse(factory.isSubdomainAvailable("ab"));
     }
 
     // ==================== METADATA ====================
@@ -582,7 +548,6 @@ contract SyndicateFactoryTest is Test {
                 owner: attacker,
                 executorImpl: address(executorLib),
                 vaultImpl: address(vaultImpl),
-                ensRegistrar: address(ensRegistrar),
                 agentRegistry: address(agentRegistry),
                 beacon: governorAddr,
                 protocolConfig: governorAddr,
@@ -610,7 +575,6 @@ contract SyndicateFactoryTest is Test {
                 owner: attacker,
                 executorImpl: address(executorLib),
                 vaultImpl: address(vaultImpl),
-                ensRegistrar: address(ensRegistrar),
                 agentRegistry: address(agentRegistry),
                 beacon: governorAddr,
                 protocolConfig: governorAddr,
@@ -699,8 +663,8 @@ contract SyndicateFactoryTest is Test {
     // ==================== V-M7: SyndicateConfig validation ====================
 
     /// @notice V-M7 regression: `createSyndicate` must reject a config whose
-    ///         `asset` is zero before any side effects (stake bind, ENS
-    ///         register, vault deploy). Consolidated under
+    ///         `asset` is zero before any side effects (stake bind,
+    ///         vault deploy). Consolidated under
     ///         `InvalidSyndicateConfig`.
     function test_createSyndicate_revertsIfAssetZero() public {
         SyndicateFactory.SyndicateConfig memory cfg = _defaultConfig();
@@ -818,66 +782,6 @@ contract SyndicateFactoryTest is Test {
         assertEq(VaultWithdrawalQueue(q).vault(), syndicateVault, "queue's vault mismatch");
     }
 
-    // ==================== setEnsRegistrar ====================
-
-    event EnsRegistrarUpdated(address indexed oldRegistrar, address indexed newRegistrar);
-
-    /// @notice Owner can repoint the ENS registrar; future syndicates use the new one.
-    ///         Recovery path for the Base mainnet deploy where `ensRegistrar` was
-    ///         initialized to `address(0)` and every syndicate created since then
-    ///         silently skipped ENS registration.
-    function test_setEnsRegistrar_ownerRepointsRegistrar() public {
-        address oldRegistrar = address(ensRegistrar);
-        MockL2Registrar newRegistrar = new MockL2Registrar();
-
-        vm.expectEmit(true, true, false, true);
-        emit EnsRegistrarUpdated(oldRegistrar, address(newRegistrar));
-
-        vm.prank(owner);
-        factory.setEnsRegistrar(address(newRegistrar));
-
-        assertEq(address(factory.ensRegistrar()), address(newRegistrar), "ensRegistrar not updated");
-    }
-
-    /// @notice Owner can clear the registrar by setting to zero — disables ENS
-    ///         registration for future syndicates without breaking creation.
-    ///         (createSyndicate's `address(0)` guard already covers this case.)
-    function test_setEnsRegistrar_zeroAddressDisablesEns() public {
-        vm.prank(owner);
-        factory.setEnsRegistrar(address(0));
-
-        assertEq(address(factory.ensRegistrar()), address(0));
-
-        // createSyndicate still succeeds — the ENS register call is guarded.
-        vm.prank(creator1);
-        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
-        assertTrue(vaultAddr != address(0));
-    }
-
-    /// @notice Non-owner cannot change the registrar.
-    function test_setEnsRegistrar_revertsForNonOwner() public {
-        vm.prank(creator1);
-        vm.expectRevert();
-        factory.setEnsRegistrar(makeAddr("rogueRegistrar"));
-    }
-
-    /// @notice After repointing, new syndicates register against the new registrar.
-    function test_setEnsRegistrar_futureSyndicatesUseNewRegistrar() public {
-        MockL2Registrar newRegistrar = new MockL2Registrar();
-        vm.prank(owner);
-        factory.setEnsRegistrar(address(newRegistrar));
-
-        vm.prank(creator1);
-        SyndicateFactory.SyndicateConfig memory cfg = _defaultConfig();
-        cfg.subdomain = "fresh-after-repoint";
-        factory.createSyndicate(creator1AgentId, cfg);
-
-        // The MockL2Registrar tracks calls; new registrar should have been hit,
-        // old one untouched for this subdomain.
-        assertTrue(newRegistrar.isRegistered("fresh-after-repoint"), "new registrar missed");
-        assertFalse(ensRegistrar.isRegistered("fresh-after-repoint"), "old registrar called");
-    }
-
     // ==================== Task 22: per-vault governor wiring ====================
 
     /// @notice Every createSyndicate deploys its own BeaconProxy governor —
@@ -980,7 +884,6 @@ contract SyndicateFactoryTest is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
                     beacon: factory.beacon(),
                     protocolConfig: factory.protocolConfig(),

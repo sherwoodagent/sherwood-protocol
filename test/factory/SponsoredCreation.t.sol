@@ -14,7 +14,6 @@ import {TierRegistry} from "../../src/TierRegistry.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
-import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
 /// @notice An owner-granted sponsorship waives exactly one creation fee for exactly one creator.
@@ -48,7 +47,6 @@ contract SponsoredCreationTest is Test {
                     owner: owner,
                     executorImpl: address(new BatchExecutorLib()),
                     vaultImpl: address(new SyndicateVault()),
-                    ensRegistrar: address(new MockL2Registrar()),
                     agentRegistry: address(agentRegistry),
                     beacon: address(beacon),
                     protocolConfig: address(new ProtocolConfig(owner)),

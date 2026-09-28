@@ -219,9 +219,8 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
 
     function _deployProtocol() internal {
         DeploySherwoodHarness deployScript = new DeploySherwoodHarness();
-        DeploySherwood.Config memory cfg = DeploySherwood.Config({
-            ensRegistrar: address(0), agentRegistry: address(0), managementFeeBps: 50, woodToken: address(wood)
-        });
+        DeploySherwood.Config memory cfg =
+            DeploySherwood.Config({agentRegistry: address(0), managementFeeBps: 50, woodToken: address(wood)});
         // deployCore's internal c3.deploy calls run as the script address, so
         // prank as the script to keep the Create3Factory owner consistent.
         vm.prank(address(deployScript));

@@ -394,11 +394,11 @@ This requirement and `script/DeployTokenCourt.s.sol` are removed TOGETHER with S
 - **THEN** `_wireCourt` reverts PRE-FLIGHT 5 — the court must not be granted ruling authority over a game whose verdicts cannot execute
 
 ### Requirement: Chain-specific factory identity configuration
-On Robinhood Chain the factory SHALL be deployed with `address(0)` for both `ensRegistrar` and `agentRegistry` (identity + subname registration disabled), and validation SHALL assert both read back as zero. There is no ENS/Durin registrar on 4663; the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`) IS live there, so the zero `agentRegistry` is a v1 product decision, not a chain constraint, and wiring it later is a factory-config change with no redeploy.
+On Robinhood Chain the factory SHALL be deployed with `address(0)` for `agentRegistry` (identity gating disabled), and validation SHALL assert it reads back as zero. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663); the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`) IS live there, so the zero `agentRegistry` is a v1 product decision, not a chain constraint, and wiring it later is a factory-config change with no redeploy.
 
 #### Scenario: Identity disabled on Robinhood
 - **WHEN** post-deploy validation runs on 4663 or its fork
-- **THEN** `factory.ensRegistrar() == address(0)` and `factory.agentRegistry() == address(0)`
+- **THEN** `factory.agentRegistry() == address(0)`
 
 ### Requirement: Accepted oracle risks are stated in the deploy runbook
 Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period gate (`src/libraries/ChainlinkReader.sol`'s `SequencerDown`/`GracePeriodNotOver`) cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still clearing the aggregator's own publication heartbeat.

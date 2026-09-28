@@ -107,7 +107,6 @@ contract DeployAll is
 
         DeploySherwood.Deployed memory core = deployCore(
             Config({
-                ensRegistrar: RobinhoodParams.ENS_REGISTRAR,
                 agentRegistry: RobinhoodParams.AGENT_REGISTRY,
                 managementFeeBps: RobinhoodParams.MANAGEMENT_FEE_BPS,
                 woodToken: i.wood

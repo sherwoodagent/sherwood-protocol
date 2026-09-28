@@ -250,8 +250,7 @@ abstract contract DeployAllFixture is Test {
         assertEq(factory.beacon(), s.core.beacon, "factory.beacon");
         assertEq(factory.protocolConfig(), s.core.protocolConfig, "factory.protocolConfig");
         assertEq(factory.managementFeeBps(), RobinhoodParams.MANAGEMENT_FEE_BPS, "factory.managementFeeBps");
-        // v1 ships with identity gating off, so both registrars are deliberately zero.
-        assertEq(address(factory.ensRegistrar()), address(0), "factory.ensRegistrar");
+        // v1 ships with identity gating off, so the agent registry is deliberately zero.
         assertEq(address(factory.agentRegistry()), address(0), "factory.agentRegistry");
         assertEq(StakedWood(s.core.swoodProxy).registry(), s.core.registryProxy, "swood.registry");
         assertEq(address(StakedWood(s.core.swoodProxy).wood()), address(wood), "swood.wood");

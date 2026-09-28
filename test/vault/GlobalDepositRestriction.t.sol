@@ -15,7 +15,6 @@ import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
-import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
 /// @notice The factory's `depositsRestricted` flag closes every vault to non-whitelisted
@@ -46,7 +45,6 @@ contract GlobalDepositRestrictionTest is Test {
                     owner: owner,
                     executorImpl: address(new BatchExecutorLib()),
                     vaultImpl: address(new SyndicateVault()),
-                    ensRegistrar: address(new MockL2Registrar()),
                     agentRegistry: address(agentRegistry),
                     beacon: address(beacon),
                     protocolConfig: address(new ProtocolConfig(owner)),

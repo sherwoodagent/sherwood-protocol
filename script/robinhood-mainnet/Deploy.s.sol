@@ -71,7 +71,6 @@ abstract contract DeployRobinhoodMainnet is DeploySherwood {
         // `createSyndicate`. Plan B's `TIER2_CALL_CAP_BPS` is a PRINTED policy figure for the
         // vault owner (`setTier2CallCapBps` is `onlyVaultOwner`); `CheckSyndicateParams` is the gate.
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
-        _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
 
         _checkAddr("swood.wood", address(StakedWood(d.swoodProxy).wood()), wood);
