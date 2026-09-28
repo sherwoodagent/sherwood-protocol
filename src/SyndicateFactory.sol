@@ -191,6 +191,10 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `pushWiring`.
     address public bondEscrow;
 
+    /// @notice Protocol-wide closed beta: while true every vault accepts deposits
+    ///         from its approved depositors only, whatever its own `openDeposits`.
+    bool public depositsRestricted;
+
     /// @dev Reserved for future storage. Shrinks as named slots are carved off the
     ///      FRONT of the gap, so every field behind it keeps its slot (43 words).
     uint256[43] private __gap;
@@ -207,6 +211,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event ManagementFeeBpsUpdated(uint256 oldBps, uint256 newBps);
     event VaultUpgraded(address indexed vault, address indexed newImpl);
     event UpgradesEnabledUpdated(bool enabled);
+    event DepositsRestrictedUpdated(bool restricted);
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
     /// @notice Emitted when the ENS subname registration in `createSyndicate`
@@ -503,6 +508,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     function setUpgradesEnabled(bool enabled) external onlyOwner {
         upgradesEnabled = enabled;
         emit UpgradesEnabledUpdated(enabled);
+    }
+
+    /// @notice Force every vault into whitelist-only deposits, or lift it (owner only).
+    function setDepositsRestricted(bool restricted) external onlyOwner {
+        depositsRestricted = restricted;
+        emit DepositsRestrictedUpdated(restricted);
     }
 
     /// @notice Update the Durin L2 Registrar used for ENS subname registration on

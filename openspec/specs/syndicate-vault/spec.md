@@ -79,7 +79,8 @@ so pay-on-behalf funding is permitted.
 #### Scenario: maxDeposit reflects every deposit gate
 
 - **WHEN** the vault is paused, `depositsLocked()` is true, or the receiver is
-  not an approved depositor in closed mode
+  not an approved depositor in closed mode (including closed by the factory's
+  `depositsRestricted`)
 - **THEN** `maxDeposit(receiver)`/`maxMint(receiver)` return 0; otherwise they
   return `type(uint256).max`
 
@@ -93,6 +94,11 @@ The vault owner SHALL control deposit access via an open/closed mode flag (`setO
 #### Scenario: Pagination clamp
 - **WHEN** a paginated view is called with `limit > 100`
 - **THEN** at most 100 rows are returned
+
+#### Scenario: Factory-wide deposit restriction
+- **WHEN** the factory owner has set `depositsRestricted` via `setDepositsRestricted(true)`
+- **THEN** every vault the factory created accepts `deposit`, `mint` and `requestDeposit` only for approved depositors, as in closed mode, whatever its own `openDeposits`
+- **AND** withdrawals, redemptions, redeem requests and claims of already-queued deposits are unaffected, and `setDepositsRestricted(false)` restores each vault's own setting
 
 ### Requirement: Instant withdrawal flow and capacity
 

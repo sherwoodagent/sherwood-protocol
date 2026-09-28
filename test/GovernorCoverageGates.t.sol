@@ -251,6 +251,7 @@ contract GovernorCoverageGatesTest is Test {
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(governor))
         );
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         vm.mockCall(
             address(this),
             abi.encodeWithSignature("governorOf(address)", address(unwiredVault)),

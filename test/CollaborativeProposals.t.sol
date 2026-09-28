@@ -106,6 +106,7 @@ contract CollaborativeProposalsTest is Test {
         // The vault resolves its governor via factory.governorOf(vault); this test
         // contract is the vault's factory, so mock the lookup.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         // Register agents
         vm.startPrank(owner);

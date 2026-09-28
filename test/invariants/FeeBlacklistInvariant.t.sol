@@ -131,6 +131,7 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         // ── LP deposits — funds the vault + provides voting weight ──
         usdc.mint(lp1, 100_000e6);

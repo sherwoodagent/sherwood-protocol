@@ -21,6 +21,7 @@ interface ISyndicateFactory {
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     event WiringPushed(address indexed governor);
+    event DepositsRestrictedUpdated(bool restricted);
 
     /// @notice Emitted by `setExecutorImpl` — the shared `BatchExecutorLib`
     ///         new syndicates are wired to at `createSyndicate`.
@@ -53,6 +54,8 @@ interface ISyndicateFactory {
     function bondEscrow() external view returns (address);
     /// @notice Whether `governor` is a per-vault governor deployed by this factory.
     function isFactoryGovernor(address governor) external view returns (bool);
+    /// @notice While true, every vault takes deposits from approved depositors only.
+    function depositsRestricted() external view returns (bool);
 
     // ── Admin ──
     function rotateOwner(address vault, address newOwner) external;
@@ -60,6 +63,7 @@ interface ISyndicateFactory {
     function setTierRegistry(address newRegistry) external;
     function setExposureLedger(address newLedger) external;
     function setBondEscrow(address newEscrow) external;
+    function setDepositsRestricted(bool restricted) external;
     /// @notice Push the factory's current tierRegistry / exposureLedger / bondEscrow
     ///         into an EXISTING factory-deployed governor.
     function pushWiring(address governor) external;

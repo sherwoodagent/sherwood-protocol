@@ -209,6 +209,7 @@ contract CoverageEndToEndTest is Test {
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vaultA)), abi.encode(address(govA))
         );
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vaultB)), abi.encode(address(govB))
         );

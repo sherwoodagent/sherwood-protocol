@@ -692,7 +692,12 @@ contract SyndicateVault is
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
     ///      whitelisted. Shared by `_deposit` / `requestDeposit`.
     function _requireApprovedDepositor(address who) private view {
-        if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
+        if (!_depositsOpen() && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
+    }
+
+    /// @dev Open only if this vault opted in AND the factory's closed-beta flag is off.
+    function _depositsOpen() private view returns (bool) {
+        return _openDeposits && !ISyndicateFactory(_factory).depositsRestricted();
     }
 
     // `nonReentrant` lives on the internal `_deposit`, which both `deposit` and `mint` route
@@ -752,7 +757,7 @@ contract SyndicateVault is
     ///      locked, or `receiver` not whitelisted in closed mode (EIP-4626).
     function maxDeposit(address receiver) public view override returns (uint256) {
         if (paused() || depositsLocked()) return 0;
-        if (!_openDeposits && !_approvedDepositors.contains(receiver)) return 0;
+        if (!_depositsOpen() && !_approvedDepositors.contains(receiver)) return 0;
         return type(uint256).max;
     }
 
