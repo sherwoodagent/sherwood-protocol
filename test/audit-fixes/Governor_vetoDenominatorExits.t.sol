@@ -556,8 +556,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertFalse(vault.redemptionsLocked(), "settle reopens redemption");
     }
 
-    /// @notice Both delegation entrypoints are refused whatever the target, and `delegateBySig`
-    ///         reverts before it ever looks at the signature (zeros get the same revert).
+    /// @notice Delegation away from the holder is refused whatever the target; `delegate(self)`
+    ///         asks for the state the vault already guarantees and is a no-op (SHE-293).
     function test_delegate_isRefused() public {
         _deposit(lp1, 60_000e6);
         _deposit(lp2, 40_000e6);
@@ -566,12 +566,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vault.delegate(address(0));
         vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(lp2);
-        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(lp1);
-        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
-        vault.delegateBySig(lp2, 0, type(uint256).max, 0, bytes32(0), bytes32(0));
-        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
-        vault.delegateBySig(address(0), 0, 0, 0, bytes32(0), bytes32(0));
         vm.stopPrank();
         assertEq(vault.delegates(lp1), lp1, "the receipt self-delegated and nothing could move it");
         assertEq(vault.getVotes(lp1), vault.balanceOf(lp1), "votes equal balance");

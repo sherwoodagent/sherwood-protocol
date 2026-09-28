@@ -57,19 +57,19 @@ the caller, so pay-on-behalf funding is permitted.
 
 ### Requirement: Vote checkpointing and auto-delegation
 
-The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL auto-delegate an undelegated recipient to itself, after balances update, so checkpointed voting power tracks balance for every holder. Voting power SHALL NOT be delegated away from the holder: `delegate` and `delegateBySig` SHALL revert `DelegationLocked` for any delegatee other than the account itself (including `address(0)`), so every share in the veto denominator is castable by its holder and the recorded electorate equals the castable weight at the snapshot.
+The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder. Voting power SHALL NOT be delegated away from the holder: `delegate` and `delegateBySig` SHALL revert `DelegationDisabled` for any delegatee other than the account itself (including `address(0)`), so every share in the veto denominator is castable by its holder and the recorded electorate equals the castable weight at the snapshot.
 
 #### Scenario: Recipient auto-delegates on receipt
-- **WHEN** shares are transferred or minted to an address whose delegate is unset
+- **WHEN** shares are transferred or minted to an address that is not delegated to itself
 - **THEN** the recipient is delegated to itself and its post-receipt balance is checkpointed
 
 #### Scenario: Permissionless heal via zero-value transfer
-- **WHEN** anyone transfers 0 shares to an undelegated legacy holder
+- **WHEN** anyone transfers 0 shares to a holder that is not self-delegated
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
 #### Scenario: Delegation to another address is refused
 - **WHEN** a holder calls `delegate` or `delegateBySig` with a delegatee that is not itself (another holder, the queue, or `address(0)`)
-- **THEN** the call reverts `DelegationLocked` and the holder's shares keep voting for the holder
+- **THEN** the call reverts `DelegationDisabled` and the holder's shares keep voting for the holder
 
 #### Scenario: Self-delegation is a no-op
 - **WHEN** a holder calls `delegate(self)`

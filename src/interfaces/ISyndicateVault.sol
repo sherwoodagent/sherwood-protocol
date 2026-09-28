@@ -38,9 +38,6 @@ interface ISyndicateVault {
     ///         (`depositsLocked()` false): the instant `deposit`/`mint` path is
     ///         the open one; use it instead.
     error DepositsNotLocked();
-    /// @notice `delegate`/`delegateBySig` to anyone but the holder: voting power stays
-    ///         with the shares so the veto denominator and the castable weight match.
-    error DelegationLocked();
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
@@ -66,8 +63,8 @@ interface ISyndicateVault {
     /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
     ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
     error MalformedAssetCall(bytes4 selector);
-    /// @notice `delegate` or `delegateBySig` was called. The vault self-delegates every
-    ///         receiver, so delegation is fixed and both entrypoints are refused.
+    /// @notice `delegate`/`delegateBySig` named anyone but the holder. The vault self-delegates
+    ///         every receiver, so votes always equal balance; `delegate(self)` is a no-op.
     error DelegationDisabled();
 
     // ── Init Params ──

@@ -8,7 +8,7 @@
       exactly one deposit path is open in every state; resolves the governor once.
 - [x] 1.3 Rescue paths unchanged: `redemptionsLocked()`, Drafts included.
 - [x] 1.4 Dead `IRequestableVault.getPastVotes` declaration removed.
-- [x] 1.5 `_delegate` refuses any delegatee but the account (`DelegationLocked`);
+- [x] 1.5 `_delegate` refuses any delegatee but the account (`DelegationDisabled`, SHE-293);
       `delegate`, `delegateBySig` and the auto-delegate all route through it.
 
 ## 2. Governor
@@ -39,7 +39,7 @@
       `Vault_redemptionLockSemantics`, `Vault_settleStampDenominator`,
       `Vault_depositLifecycleAndHwm`, `OpenProposalCount`.
 - [x] 3.9 `delegate(other)`, `delegate(0)`, `delegateBySig(other)` revert
-      `DelegationLocked`; `delegate(self)` succeeds. Mutation — drop the override.
+      `DelegationDisabled`; `delegate(self)` succeeds. Mutation — drop the override.
 
 ## 4. Docs
 

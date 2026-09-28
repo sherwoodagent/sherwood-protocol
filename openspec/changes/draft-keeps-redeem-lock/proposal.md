@@ -55,7 +55,7 @@ Before execute the vault still holds everything and the NAV is knowable.
   Decision 3). Both terms at `t − 1` see one set. The direct path keeps its live read:
   instant redeem is open right up to `propose`, and a `t − 1` read there would count
   shares that already left.
-- `delegate`/`delegateBySig` to anyone but the holder revert `DelegationLocked`
+- `delegate`/`delegateBySig` to anyone but the holder revert `DelegationDisabled`
   (`SyndicateVault._delegate`). Without it the two `t − 1` terms are not one set: a
   holder that undelegates (`delegate(address(0))`) a block before the stamp stays in
   `getPastTotalSupply` and votes for nobody, inflating the bar to `b·(G + X)` with

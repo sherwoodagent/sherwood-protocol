@@ -635,11 +635,10 @@ contract SyndicateVault is
         }
     }
 
-    /// @dev Voting power never leaves the holder: `delegate`/`delegateBySig` to
-    ///      anyone else would keep shares in the veto denominator while they vote
-    ///      for nobody (or for the queue). Covers the auto-delegate above (self).
+    /// @dev Voting power never leaves the holder, so the veto electorate equals the castable
+    ///      weight. Guards every path, the auto-delegate above (self) included (SHE-293).
     function _delegate(address account, address delegatee) internal override {
-        if (delegatee != account) revert DelegationLocked();
+        if (delegatee != account) revert DelegationDisabled();
         super._delegate(account, delegatee);
     }
 

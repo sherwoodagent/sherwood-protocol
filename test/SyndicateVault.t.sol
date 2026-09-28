@@ -149,14 +149,14 @@ contract SyndicateVaultTest is Test {
     function test_delegate_toOther_reverts() public {
         _depositLp1();
         vm.prank(lp1);
-        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(lp2);
     }
 
     function test_delegate_toZero_reverts() public {
         _depositLp1();
         vm.prank(lp1);
-        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(address(0));
     }
 
@@ -198,8 +198,23 @@ contract SyndicateVaultTest is Test {
         (uint8 v, bytes32 r, bytes32 sHalf) = vm.sign(pk, digest);
 
         uint256 nonce = vault.nonces(signer);
-        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegateBySig(lp2, nonce, expiry, v, r, sHalf);
+    }
+
+    /// @notice A holder whose delegate is anything but itself is re-self-delegated on its next
+    ///         receipt, even a zero-value one (pins `_update`'s `delegates(to) != to`).
+    function test_zeroValueReceipt_healsAForeignDelegate() public {
+        _depositLp1();
+        address holder = makeAddr("foreignDelegated");
+        // ERC-7201 `openzeppelin.storage.Votes`; `_delegatee` is its first member.
+        bytes32 votesSlot = 0xe8b26c30fad74198956032a3533d903385d56dd795af560196f9c78d4af40d00;
+        vm.store(address(vault), keccak256(abi.encode(holder, votesSlot)), bytes32(uint256(uint160(lp2))));
+        assertEq(vault.delegates(holder), lp2, "fixture: a foreign delegate is forced");
+
+        vm.prank(lp1);
+        vault.transfer(holder, 0);
+        assertEq(vault.delegates(holder), holder, "the zero-value receipt restored self-delegation");
     }
 
     function _depositLp1() internal {
