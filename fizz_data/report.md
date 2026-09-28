@@ -58,7 +58,7 @@ three matured guardians and a seeded vault.
 | GuardianRegistry | 50% | 19.8% | 40% | ❌ |
 | ProposerBondEscrow | 40% | 8.5% | 34% | ❌ |
 | ExposureLedger | 70% | 19.3% | 33% | ❌ |
-| TokenCourt | 70% | 29.5% | 29% | ❌ |
+| TokenCourt (deleted in SHE-269) | 70% | 29.5% | 29% | ❌ |
 | ChallengeGame | 70% | 20.3% | 26% | ❌ |
 
 **5/13 at target.** Targets are set ~10 points below normal because the fuzz
@@ -263,7 +263,7 @@ defect in a property added the same day.
 | Contract | Before | Now | Lines |
 |---|------:|----:|------:|
 | ChallengeGame | 26% | **64.2%** | 201/313 |
-| TokenCourt | 29% | **83.3%** | 100/120 |
+| TokenCourt (deleted in SHE-269) | 29% | **83.3%** | 100/120 |
 | ExposureLedger | 33% | **83.3%** | 309/371 |
 | ProposerBondEscrow | 34% | **88.6%** | 31/35 |
 

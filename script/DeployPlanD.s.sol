@@ -255,8 +255,8 @@ contract DeployPlanD is ScriptBase {
         console.log("voteWindow (s):       %s", game.voteWindow());
         console.log("challengerBondBps:    %s", game.challengerBondBps());
         console.log("MANUAL NEXT: stand up the OFF-CHAIN bug-bounty program keyed off");
-        console.log("  ChallengeFiled / ChallengeSettled. On-chain a successful challenger only");
-        console.log("  gets its bond BACK - without that program nobody is paid to file at all.");
+        console.log("  ChallengeFiled / ChallengeSettled. On-chain a successful challenger gets its bond");
+        console.log("  back less settleBurnBps, plus prosecutorFeeBps of the forfeited proposer bond.");
         console.log("MANUAL NEXT: review voteWindow against the guardians' real response");
         console.log("  capability - it is their ENTIRE window to notice a filing and decide it.");
         console.log("MANUAL NEXT: hand game ownership to the protocol owner (Ownable2Step: transfer + accept).");

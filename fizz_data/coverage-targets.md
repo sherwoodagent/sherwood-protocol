@@ -57,7 +57,7 @@ that commit's contract set, kept as recorded.
 | StakedWood | Core | 70% | 63.3% (188/297) | ❌ |
 | TierRegistry | Access control | 50% | 61.3% (76/124) | ✅ |
 | SyndicateVault | Core | 70% | 37.1% (142/383) | ❌ |
-| TokenCourt | Core | 70% | 29.5% (43/146) | ❌ |
+| TokenCourt (deleted in SHE-269) | Core | 70% | 29.5% (43/146) | ❌ |
 | ChallengeGame | Core | 70% | 20.3% (77/380) | ❌ |
 | GuardianRegistry | Access control | 50% | 19.8% (80/404) | ❌ |
 | ExposureLedger | Core | 70% | 19.3% (88/457) | ❌ |
@@ -122,7 +122,7 @@ genuinely in the same build.
 | ProposerBondEscrow | Peripheral | 40% | 8.5% | 34% | ❌ |
 | ExposureLedger | Core | 70% | 19.3% | 33% | ❌ |
 | ChallengeGame | Core | 70% | 20.3% | 26% | ❌ |
-| TokenCourt | Core | 70% | 29.5% | 29% | ❌ |
+| TokenCourt (deleted in SHE-269) | Core | 70% | 29.5% | 29% | ❌ |
 
 **5/13 at target.** The LP and governance lanes are well covered; the
 accountability chain (challenge → vote → slash) is not.
