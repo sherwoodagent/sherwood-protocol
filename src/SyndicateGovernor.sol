@@ -442,9 +442,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // in it carry no veto; that checkpoint is readable only once the second has ended.
         uint256 snap = proposal.snapshotTimestamp;
         if (block.timestamp <= snap + 1) revert NotWithinVotingPeriod();
-        uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, snap);
-        uint256 atPropose = IVotes(proposal.vault).getPastVotes(msg.sender, snap + 1);
-        if (atPropose < weight) weight = atPropose;
+        uint256 weight = _voteWeight(proposal.vault, msg.sender, snap);
         if (weight == 0) revert NoVotingPower();
         // The electorate reads the same two instants, so no share flow in the propose second
         // can lift the castable weight above it; independent of the deposit lock.
@@ -920,7 +918,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Draft proposals have snapshotTimestamp == 0, so reading
         // getPastVotes would silently return 0. Revert instead.
         if (proposal.snapshotTimestamp == 0) revert ProposalInDraft();
-        return IVotes(proposal.vault).getPastVotes(voter, proposal.snapshotTimestamp);
+        // Matches `vote()`: nothing is castable until the propose second has ended.
+        if (block.timestamp <= proposal.snapshotTimestamp + 1) return 0;
+        return _voteWeight(proposal.vault, voter, proposal.snapshotTimestamp);
+    }
+
+    /// @dev Snapshot votes capped at the end of the propose second (`snap + 1`).
+    function _voteWeight(address vault, address voter, uint256 snap) private view returns (uint256 weight) {
+        weight = IVotes(vault).getPastVotes(voter, snap);
+        uint256 atPropose = IVotes(vault).getPastVotes(voter, snap + 1);
+        if (atPropose < weight) weight = atPropose;
     }
 
     /// @inheritdoc ISyndicateGovernor
