@@ -123,7 +123,6 @@ interface IChallengeGame {
     error NothingToFreeze();
     error WrongStatus();
     error DelayNotElapsed();
-    error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
     /// @dev The ledger could not price the bond: no WOOD price source (feed and

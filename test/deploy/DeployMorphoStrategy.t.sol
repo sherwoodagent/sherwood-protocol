@@ -33,10 +33,11 @@ contract VaultStub {
     }
 }
 
-/// @dev `_templateKeys()` is `internal pure`, and it IS the allowlist — a
-///      template missing from it can never be proposed, because
-///      `StrategyFactory`'s approval map starts empty and nothing else
-///      populates it. Exposing it is the only way to pin that set.
+/// @dev Both mixins are abstract; these harnesses make them concrete. `_templateKeys()`
+///      IS the allowlist — a template missing from it can never be proposed, because
+///      `StrategyFactory`'s approval map starts empty and nothing else populates it.
+contract DeployMorphoStrategyHarness is DeployMorphoStrategy {}
+
 contract DeployStrategyFactoryHarness is DeployStrategyFactory {
     function exposed_templateKeys() external pure returns (string[] memory) {
         return _templateKeys();
@@ -57,7 +58,7 @@ contract DeployStrategyFactoryHarness is DeployStrategyFactory {
 ///         the DEPLOY STEP: that the script yields a locked, clonable template
 ///         and that the factory's key list actually names it.
 contract DeployMorphoStrategyTest is Test {
-    DeployMorphoStrategy internal script;
+    DeployMorphoStrategyHarness internal script;
     ERC20Mock internal usdg;
     MockMorpho internal mockMorpho;
     MockIrm internal irm;
@@ -67,7 +68,7 @@ contract DeployMorphoStrategyTest is Test {
     address internal proposer = makeAddr("proposer");
 
     function setUp() public {
-        script = new DeployMorphoStrategy();
+        script = new DeployMorphoStrategyHarness();
 
         usdg = new ERC20Mock("USDG", "USDG", 6);
         irm = new MockIrm();
@@ -88,10 +89,17 @@ contract DeployMorphoStrategyTest is Test {
         vaultStub = new VaultStub(address(usdg), address(status));
     }
 
+    /// @dev `deploy()` bootstraps the Create3Factory at `msg.sender` and then calls
+    ///      `c3.deploy` as the SCRIPT, so the broadcaster stand-in must be the script itself.
+    function _deploy() internal returns (MorphoSupplyStrategy) {
+        vm.prank(address(script));
+        return script.deploy();
+    }
+
     // ── The template ──
 
     function test_deploy_producesTheStrategyTemplate() public {
-        MorphoSupplyStrategy template = script.deploy();
+        MorphoSupplyStrategy template = _deploy();
 
         assertEq(template.name(), "Morpho Supply", "name");
         assertEq(template.vault(), address(0), "a template binds no vault");
@@ -104,7 +112,7 @@ contract DeployMorphoStrategyTest is Test {
     ///      template that could be initialized would let anyone seize the
     ///      contract every proposal clones from.
     function test_deploy_templateCannotBeInitializedDirectly() public {
-        MorphoSupplyStrategy template = script.deploy();
+        MorphoSupplyStrategy template = _deploy();
 
         vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
         template.initialize(address(vaultStub), proposer, abi.encode(address(mockMorpho), mp, uint256(1)));
@@ -115,7 +123,7 @@ contract DeployMorphoStrategyTest is Test {
     ///      Deploying a template nothing can clone would satisfy the test above
     ///      while leaving the strategy just as unreachable.
     function test_deploy_templateIsClonableAndInitializes() public {
-        MorphoSupplyStrategy template = script.deploy();
+        MorphoSupplyStrategy template = _deploy();
 
         MorphoSupplyStrategy clone = MorphoSupplyStrategy(Clones.clone(address(template)));
         clone.initialize(address(vaultStub), proposer, abi.encode(address(mockMorpho), mp, uint256(100_000e6)));
@@ -128,11 +136,8 @@ contract DeployMorphoStrategyTest is Test {
 
     // ── The allowlist ──
 
-    /// @dev THE DEPLOY STEP IS HALF THE FIX. A template the factory never
-    ///      approves is as unreachable as one that was never deployed —
-    ///      `DeployStrategyFactory`'s loop SKIPS absent keys and only requires
-    ///      `approved > 0`, so a missing entry degrades silently rather than
-    ///      failing the run.
+    /// @dev THE DEPLOY STEP IS HALF THE FIX. A template the factory never approves is
+    ///      as unreachable as one that was never deployed.
     function test_templateKeys_nameTheMorphoTemplate() public {
         string[] memory keys = new DeployStrategyFactoryHarness().exposed_templateKeys();
 

@@ -354,16 +354,23 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         uint256 p1 = 1;
         uint256 p2 = 2;
         swood.setStake(guardian, 10_000e18); // enough to fully back both proposals
+        // HALF EACH, NOT `type(uint256).max`: a whole-budget declaration on P1
+        // leaves P2 with no free budget, so P2 never booked and the sweep below
+        // had nothing to sweep. SHE-240 turned that silent zero booking into a
+        // revert, which is what surfaced it.
+        uint256 half = 5_000e18;
 
         mgov.set(_requiredCoverage6(1_000e18));
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
+        ledger.recordApproval(address(mgov), p1, guardian, half);
 
         mgov.set(_requiredCoverage6(1_000e18));
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p2, guardian, type(uint256).max);
+        ledger.recordApproval(address(mgov), p2, guardian, half);
+        (address[] memory seated,) = ledger.pledgedOf(address(mgov), p2);
+        assertEq(seated.length, 1, "non-vacuity: P2 really did book before the sweep");
 
         uint256 expiry = ledger.epochGenesis() + ledger.epochLength() + ledger.challengeWindow();
         vm.warp(expiry + 1); // both P1 and P2's buckets are now provably dead

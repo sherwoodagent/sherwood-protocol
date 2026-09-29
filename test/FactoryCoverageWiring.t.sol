@@ -16,7 +16,6 @@ import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
-import {MockL2Registrar} from "./mocks/MockL2Registrar.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 
 /// @dev A contract that answers `vault()` with a vault this factory really
@@ -42,7 +41,6 @@ contract FactoryCoverageWiringTest is Test {
     SyndicateVault public vaultImpl;
     ERC20Mock public usdc;
     ERC20Mock public wood;
-    MockL2Registrar public ensRegistrar;
     MockAgentRegistry public agentRegistry;
 
     TierRegistry public tierReg;
@@ -66,7 +64,6 @@ contract FactoryCoverageWiringTest is Test {
         wood = new ERC20Mock("Wood", "WOOD", 18);
         executorLib = new BatchExecutorLib();
         vaultImpl = new SyndicateVault();
-        ensRegistrar = new MockL2Registrar();
         agentRegistry = new MockAgentRegistry();
 
         ProtocolConfig protocolCfg = new ProtocolConfig(owner);
@@ -84,7 +81,6 @@ contract FactoryCoverageWiringTest is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
                     beacon: address(beacon),
                     protocolConfig: address(protocolCfg),

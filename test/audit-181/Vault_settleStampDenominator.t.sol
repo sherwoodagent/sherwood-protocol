@@ -84,6 +84,7 @@ contract VaultSettleStampDenominatorTest is Test {
         vault.setWithdrawalQueue(address(queue));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         // No open proposal at genesis.
         _setProposal(0, 0, 0);
 
@@ -171,37 +172,34 @@ contract VaultSettleStampDenominatorTest is Test {
 
     // ==================== FINDING #13 ====================
 
-    /// @notice THE DEAD WINDOW STAYS CLOSED, now from the other side (SHE-287).
-    ///         Finding #13 was a Pending state with NO deposit path: instant
-    ///         closed on the open-proposal count and the async lane closed on
-    ///         `getActiveProposal()`. Today the two gates are one predicate,
-    ///         `depositsLocked()` = executed: while Pending the INSTANT path is
-    ///         open and the lane is shut; once executed they swap, and the lane
-    ///         tags the request with the active pid so `stampSettlement` covers
-    ///         it. Exactly one deposit path is open in every state.
-    function test_exactlyOneDepositPathIsOpen_instantWhilePending_laneOnceExecuted() public {
-        // Pending: instant open, lane shut.
+    /// @notice THE DEAD WINDOW IS CLOSED. While a proposal is Pending
+    ///         (`openProposalCount() != 0`, `getActiveProposal() == 0` — not
+    ///         yet executed), instant deposit is already closed
+    ///         (`_depositsLocked`), and pre-fix `requestDeposit` gated on
+    ///         `redemptionsLocked()` (`getActiveProposal() != 0`) was ALSO
+    ///         closed — leaving no way to deposit at all. `requestDeposit`
+    ///         must now succeed here, and must tag the request with the
+    ///         Pending proposal's id (via `_openProposalPid()`'s
+    ///         `proposalCount()` fallback, since `getActiveProposal()` is
+    ///         still 0) so `stampSettlement` covers it once that proposal
+    ///         executes and settles.
+    function test_requestDeposit_succeedsWhileProposalPending_andTagsTheOpenPid() public {
+        // Instant deposit is closed in this state — confirms the window is
+        // real, not just a mock artifact.
         _setProposal(0, 1, 1);
         vm.prank(newcomer);
-        vm.expectRevert(ISyndicateVault.DepositsNotLocked.selector);
-        vault.requestDeposit(NEWCOMER_ASSETS, newcomer);
-        vm.prank(newcomer);
-        assertGt(vault.deposit(NEWCOMER_ASSETS / 2, newcomer), 0, "instant deposit open while Pending");
-
-        // Executed: instant shut, lane open and tagged to the active pid.
-        _setProposal(1, 1, 1);
-        vm.prank(newcomer);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(NEWCOMER_ASSETS / 2, newcomer);
+        vault.deposit(NEWCOMER_ASSETS, newcomer);
 
+        // The async path must be open instead.
         vm.prank(newcomer);
-        uint256 requestId = vault.requestDeposit(NEWCOMER_ASSETS / 2, newcomer);
-        assertGt(requestId, 0, "requestDeposit must succeed once executed");
+        uint256 requestId = vault.requestDeposit(NEWCOMER_ASSETS, newcomer);
+        assertGt(requestId, 0, "requestDeposit must succeed while Pending, not revert");
 
         IVaultWithdrawalQueue.Request memory r = queue.getRequest(requestId);
-        assertEq(r.amount, NEWCOMER_ASSETS / 2, "assets escrowed in full");
+        assertEq(r.amount, NEWCOMER_ASSETS, "assets escrowed in full");
         assertEq(uint256(r.kind), uint256(IVaultWithdrawalQueue.RequestKind.Deposit));
-        assertEq(r.pid, 1, "tagged to the executing proposal");
+        assertEq(r.pid, 1, "tagged to the open (Pending) proposal, not pid 0");
         assertFalse(r.claimed);
         assertFalse(r.cancelled);
     }

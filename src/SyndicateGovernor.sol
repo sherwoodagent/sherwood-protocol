@@ -10,6 +10,7 @@ import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -57,7 +58,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         WHAT THIS BOUNDS, STATED PLAINLY. The floor does not close the
     ///         dilution attack; it prices it. An attacker who delivers 10% of
     ///         the capital instead of 0% settles just above the bar and mints
-    ///         at ~10x the fair share count, then `sweep()` returns the
+    ///         at ~10x the fair share count, then a later batch returns the
     ///         withheld remainder. For a queued deposit `D` against vault
     ///         assets `TA` that is `10D / (TA + 10D)` of the vault: ~60% at
     ///         `D = 0.2·TA`, ~82% at `D = TA`. What changes is the price of the
@@ -406,10 +407,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // param change. Packed (executionWindow << 128 | votingPeriod).
             _draftTimingSnap[proposalId] =
                 (uint256(uint128(_params.executionWindow)) << 128) | uint256(uint128(_params.votingPeriod));
-            // A Draft binds the vault and holds the redeem lock: the electorate
-            // is stamped at the final approve, whose readiness is public, so no
-            // exit may land ahead of it. A Draft-window deposit is accepted —
-            // it buys weight with capital locked until settle.
+            // Locks the vault at Draft creation: an unlocked Draft would let
+            // an attacker deposit between propose and the final approve,
+            // inflating the balance counted in the Pending snapshot.
             unchecked {
                 ++_openProposalCount;
             }
@@ -438,12 +438,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: the electorate was recorded at the stamp and
-        // no share is burned while a proposal is open (`SyndicateVault.redemptionsLocked`),
-        // so no live cap. The one gap is the stamping block itself — see
-        // veto-votable-supply design.md Decision 2 (phantom weight).
-        uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
+        // Weight is capped at the end of the propose second, so shares redeemed ahead of `propose`
+        // in it carry no veto; that checkpoint is readable only once the second has ended.
+        uint256 snap = proposal.snapshotTimestamp;
+        if (block.timestamp <= snap + 1) revert NotWithinVotingPeriod();
+        uint256 weight = _voteWeight(proposal.vault, msg.sender, snap);
         if (weight == 0) revert NoVotingPower();
+        // The electorate reads the same two instants, so no share flow in the propose second
+        // can lift the castable weight above it; independent of the deposit lock.
+        uint256 votable = _votableSupplyAt(proposal.vault, snap + 1);
+        if (votable < proposal.votableSupply) proposal.votableSupply = votable;
 
         _hasVoted[proposalId][msg.sender] = true;
         // Approval is optimistic: only Against votes are tallied, for the veto.
@@ -528,6 +532,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             .executeGovernorBatch(
                 _loadCalls(_settlementCalls, proposalId), _loadCaps(_effectiveSettlementCallCaps, proposalId), 0
             );
+        // A leg that skips `strategy.settle()` would leave capital on the clone (`unstick` refuses it too).
+        // No answer skips the check: registration already required `executed()` to answer.
+        (bool ok, bytes memory ret) = proposal.strategy.staticcall(abi.encodeCall(IStrategy.executed, ()));
+        if (ok && ret.length == 32 && abi.decode(ret, (bool))) revert StrategyNotSettled(proposal.strategy);
 
         _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
 
@@ -910,7 +918,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Draft proposals have snapshotTimestamp == 0, so reading
         // getPastVotes would silently return 0. Revert instead.
         if (proposal.snapshotTimestamp == 0) revert ProposalInDraft();
-        return IVotes(proposal.vault).getPastVotes(voter, proposal.snapshotTimestamp);
+        // Matches `vote()`: nothing is castable until the propose second has ended.
+        if (block.timestamp <= proposal.snapshotTimestamp + 1) return 0;
+        return _voteWeight(proposal.vault, voter, proposal.snapshotTimestamp);
+    }
+
+    /// @dev Snapshot votes capped at the end of the propose second (`snap + 1`).
+    function _voteWeight(address vault, address voter, uint256 snap) private view returns (uint256 weight) {
+        weight = IVotes(vault).getPastVotes(voter, snap);
+        uint256 atPropose = IVotes(vault).getPastVotes(voter, snap + 1);
+        if (atPropose < weight) weight = atPropose;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1044,22 +1061,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
-    /// @dev The veto electorate for the direct path, read live at `propose`:
-    ///      every share that exists minus the ones parked in the withdrawal
-    ///      queue, which cannot vote. Live on both terms because instant redeem
-    ///      is open right up to this call, so a redeem ordered ahead of it in
-    ///      the same block is already reflected.
-    function _votableSupplyOf(address vault) private view returns (uint256) {
-        uint256 supply = IERC20(vault).totalSupply();
-        address queue = ISyndicateVault(vault).withdrawalQueue();
-        if (queue == address(0)) return supply;
-        uint256 queued = IERC20(vault).balanceOf(queue);
-        return supply > queued ? supply - queued : 0;
-    }
-
-    /// @dev Both terms at the snapshot instant, so a same-block queued redeem cannot
-    ///      shrink the bar. Recorded electorate == castable weight because the vault
-    ///      refuses delegation away from the holder and self-delegates the queue.
+    /// @dev Supply less the queue, both at `at`: every holder self-delegates, so this is exactly
+    ///      the weight castable at that instant. `vote` re-reads it at the end of the propose
+    ///      second, the instant that catches an exit ahead of the stamp (NM 6.4-F2).
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();
@@ -1073,9 +1077,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      Reads `vault` from storage (already written by caller) to keep
     ///      the call-site arg count to two.
     function _initPendingProposal(StrategyProposal storage p, uint256 reviewPeriod_) private {
-        // -1 closes the same-block flash-delegate window.
+        // -1 closes the same-block acquisition window, on both terms below.
         p.snapshotTimestamp = block.timestamp - 1;
-        p.votableSupply = _votableSupplyOf(p.vault);
+        p.votableSupply = _votableSupplyAt(p.vault, p.snapshotTimestamp);
         p.voteEnd = block.timestamp + _params.votingPeriod;
         p.reviewEnd = p.voteEnd + reviewPeriod_;
         p.executeBy = p.reviewEnd + _params.executionWindow;

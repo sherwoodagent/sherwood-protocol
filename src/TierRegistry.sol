@@ -411,8 +411,9 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Certify every `StrategyFactory` clone of `template` for `selector`.
-    /// @dev The owner must verify off-chain that `template` binds every init-supplied
-    ///      address and is not itself a proxy; nothing here can check that.
+    /// @dev The owner must verify off-chain that `template` binds every init-supplied address,
+    ///      gates every value move on `onlyVault` (a class admits clones bound to ANY vault),
+    ///      and is not itself a proxy; nothing here can check that.
     function certifyClass(
         address template,
         bytes4 selector,

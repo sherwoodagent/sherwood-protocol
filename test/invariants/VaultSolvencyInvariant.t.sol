@@ -123,6 +123,7 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         // ── Seed deposits — pre-fund two LPs so the fuzzer always has a
         //    non-zero `totalSupply` to operate against (the rich-state
@@ -320,6 +321,7 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         // No seed deposits — totalSupply starts at 0.
 

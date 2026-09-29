@@ -189,3 +189,7 @@ governor by that vault's owner.
 ## Docs
 
 Full protocol, governance, and integration documentation: **https://docs.sherwood.sh/**
+
+## License
+
+MIT. See [LICENSE](./LICENSE).

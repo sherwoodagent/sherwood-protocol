@@ -46,7 +46,8 @@ interface IAggregatorV3Clock {
  *           - USDG (6 dec) is the canonical stable — there is no USDC.
  *           - Official Uniswap v3 (SwapRouter02 + QuoterV2).
  *           - Chainlink push feeds (AggregatorV3, 8 dec, 24h heartbeat).
- *           - No ENS / ERC-8004 → factory gets address(0) for both.
+ *           - No ENS. The canonical ERC-8004 IdentityRegistry IS live on 4663,
+ *             but v1 leaves identity gating off: address(0) for both registrars.
  *
  * @dev Skips if ROBINHOOD_RPC_URL is not set (shared fork-test convention).
  *
@@ -70,8 +71,8 @@ interface IAggregatorV3Clock {
  *        ROBINHOOD_RPC_URL       required; empty → the suite skips.
  *        ROBINHOOD_FORK_BLOCK    default 0 = fork at LATEST. Set to pin.
  *        ROBINHOOD_FORK_CHAIN_ID default 4663. Set 9994663 for the Tenderly vnet.
- *      (`script/robinhood-mainnet/Deploy.s.sol` uses the same
- *      ROBINHOOD_FORK_CHAIN_ID convention.)
+ *      (The ceremony scripts read NO environment variable at all — posture comes
+ *      from `block.chainid`. This convention is this suite's own.)
  *
  *      Run explicitly:
  *        set -a; source .env; set +a
@@ -80,6 +81,9 @@ interface IAggregatorV3Clock {
  *        forge test --match-path \
  *          "test/integration/strategies/PortfolioMainnetFork.t.sol" -vv
  */
+/// @notice `DeploySherwood` is an abstract mixin; this makes it concrete for `deployCore`.
+contract DeploySherwoodHarness is DeploySherwood {}
+
 abstract contract RobinhoodMainnetIntegrationTest is Test {
     // ── Robinhood Chain mainnet addresses ──
     address constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
@@ -214,17 +218,9 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
     }
 
     function _deployProtocol() internal {
-        DeploySherwood deployScript = new DeploySherwood();
-        DeploySherwood.Config memory cfg = DeploySherwood.Config({
-            ensRegistrar: address(0),
-            agentRegistry: address(0),
-            managementFeeBps: 50,
-            maxStrategyDays: 14,
-            votingPeriod: 1 days,
-            woodToken: address(wood),
-            slashAppealSeed: 0,
-            epochZeroSeed: 0
-        });
+        DeploySherwoodHarness deployScript = new DeploySherwoodHarness();
+        DeploySherwood.Config memory cfg =
+            DeploySherwood.Config({agentRegistry: address(0), managementFeeBps: 50, woodToken: address(wood)});
         // deployCore's internal c3.deploy calls run as the script address, so
         // prank as the script to keep the Create3Factory owner consistent.
         vm.prank(address(deployScript));
@@ -522,8 +518,8 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         requestId = vault.requestRedeem(shares, who);
     }
 
-    /// @notice Queue an async deposit (requires an EXECUTING proposal — reverts
-    ///         `DepositsNotLocked` otherwise). The vault pulls the assets straight
+    /// @notice Queue an async deposit (requires an OPEN proposal — reverts
+    ///         `NoOpenProposal` otherwise). The vault pulls the assets straight
     ///         into queue custody, so the approval is owner → vault.
     function _requestDeposit(address who, uint256 assets) internal returns (uint256 requestId) {
         address asset_ = vault.asset();

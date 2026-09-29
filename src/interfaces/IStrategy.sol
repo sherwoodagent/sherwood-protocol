@@ -45,7 +45,8 @@ interface IStrategy {
     /// @notice The agent who proposed this strategy
     function proposer() external view returns (address);
 
-    /// @notice Whether the strategy has been executed
+    /// @notice True from `execute()` until `settle()`.
+    /// @dev `settleProposal` and `unstick` refuse to close a proposal while its strategy answers true.
     function executed() external view returns (bool);
 
     /// @notice Human-readable name of the strategy template

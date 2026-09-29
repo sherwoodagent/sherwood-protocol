@@ -1,17 +1,11 @@
 # Deposit → Withdraw Flow
 
 The vault is a standard ERC-4626 with one twist: liquidity is **instant while no
-strategy is live, async while one is**. Two predicates, read through the governor:
-
-- `redemptionsLocked()` = `openProposalCount() != 0` — a proposal is open (Draft
-  → settle). Instant redeem closes, the redeem lane opens: every share in the veto
-  electorate stays at risk for the outcome, and no exit can land ahead of the
-  electorate stamp.
-- `depositsLocked()` = `getActiveProposal() != 0` — a proposal is executing
-  (execute → settle). Instant deposit closes, the deposit lane opens: the only
-  window in which the share price is not knowable.
-
-Everything below follows from that.
+proposal is open, async while one is**. One predicate, read through the governor:
+`redemptionsLocked()` = `depositsLocked()` = `openProposalCount() != 0` — a proposal
+is open, from `propose` (Draft included) to settle. Instant deposit and redeem close,
+both queue lanes open: no share is minted or burned while a proposal is open, so the
+veto electorate cannot move. Everything below follows from that.
 
 ## The full flow
 
@@ -19,7 +13,7 @@ Everything below follows from that.
 flowchart TD
     U([LP / depositor]) --> W{Whitelist?\nopenDeposits or\nisApprovedDepositor}
     W -- not approved --> X1[revert NotApprovedDepositor]
-    W -- approved --> S{Strategy live?\ndepositsLocked}
+    W -- approved --> S{Proposal open?\ndepositsLocked}
 
     %% ---- instant path ----
     S -- no --> D1["deposit / mint\n(instant, current NAV)"]
@@ -27,10 +21,10 @@ flowchart TD
     SH --> V[(SyndicateVault\nERC-4626 + ERC20Votes)]
 
     %% ---- proposal lifecycle around the vault ----
-    V -.-> P1[Agent proposes strategy:\nredemptions LOCK]
+    V -.-> P1[Agent proposes strategy:\ndeposits + redemptions LOCK]
     P1 -.-> P2[LP optimistic vote:\nelectorate recorded]
     P2 -.-> P3[Guardian review]
-    P3 -.-> P4[executeProposal:\ncapital swept to strategy,\ndeposits LOCK]
+    P3 -.-> P4[executeProposal:\ncapital swept to strategy]
     P4 -.-> P5[Strategy runs\n1h – 30d]
     P5 -.-> P6[settleProposal:\ncapital returns, fees charged,\nfrozen settle price stamped,\nboth UNLOCK]
 
@@ -63,9 +57,7 @@ flowchart TD
 - Gate 1 — whitelist: `receiver` must be approved unless the vault is in
   open-deposit mode (`_openDeposits`). Owner manages via `approveDepositor(s)` /
   `setOpenDeposits`.
-- Gate 2 — `depositsLocked()` must be false (no proposal executing). Pending,
-  review and Approved keep instant deposit open; a deposit after the vote snapshot
-  buys no weight.
+- Gate 2 — `depositsLocked()` must be false (no proposal open); a Draft closes it.
 - Shares minted at current NAV; the fund's first deposit seeds the performance
   high-water mark; shares auto-delegate to the receiver so depositors get voting
   power without a separate transaction.
@@ -81,24 +73,22 @@ flowchart TD
 
 ## Locked paths
 
-From `propose` (`openProposalCount() != 0`, Draft included):
-
-- `maxWithdraw`/`maxRedeem` return 0; `withdraw`/`redeem` are closed.
-
-From `executeProposal` (`getActiveProposal() != 0`):
+From `propose` (`openProposalCount() != 0`, Draft included) to settle:
 
 - `deposit`/`mint` revert `DepositsLocked` (`src/SyndicateVault.sol:1340`).
+- `maxWithdraw`/`maxRedeem` return 0; `withdraw`/`redeem` are closed.
 
 Both lanes run through the per-vault `VaultWithdrawalQueue`:
 
 ### Async deposit (`requestDeposit`, `src/SyndicateVault.sol:1462`)
 
-1. Only callable while a proposal is executing (`DepositsNotLocked` guard) and only
-   for approved receivers. Zero assets rejected.
+1. Only callable while a proposal is open (`NoOpenProposal` guard) and only for
+   approved receivers. Zero assets rejected.
 2. Assets transfer straight into the **queue** — off-vault custody. They never
    inflate `totalAssets`, never count toward the strategy's capital, and can never
    be swept by a batch.
-3. The request is tagged with the active proposal id. Request id is always > 0.
+3. The request is tagged with the executing proposal id, else the latest. Request
+   id is always > 0.
 
 ### Async redeem (`requestRedeem`, `src/SyndicateVault.sol:1426`)
 
@@ -149,7 +139,5 @@ shuts once its proposal settles — the claim then exists at the frozen price.
 | Situation | Entry | Exit |
 |---|---|---|
 | No proposal open | instant `deposit` | instant `withdraw` up to idle float |
-| Collaborative Draft | instant `deposit` | `requestRedeem` → claim after settle |
-| Proposal in vote/review/approved (not yet executed) | instant `deposit` | `requestRedeem` → claim after settle |
-| Strategy live (executed, not settled) | `requestDeposit` → claim after settle | `requestRedeem` → claim after settle |
+| Proposal open (Draft through settle) | `requestDeposit` → claim after settle | `requestRedeem` → claim after settle |
 | Worst-case wait while live | — | `strategyDuration` remainder (≤ 30 d default cap), then permissionless settle |

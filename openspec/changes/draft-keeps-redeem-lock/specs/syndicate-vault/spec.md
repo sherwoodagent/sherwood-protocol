@@ -1,75 +1,25 @@
 ## Purpose
 
-Split the two LP-flow locks, which were one predicate. The redeem lock keeps
-starting at Draft creation; the deposit lock starts at execute.
+Keep both LP-flow locks on one predicate from Draft creation to settle (v1-deploy's
+deposit lock, restored in the v2 merge), and refuse delegation away from the holder.
 
 ## MODIFIED Requirements
 
-### Requirement: Instant deposit flow
-
-`deposit`/`mint` SHALL succeed only when the vault is not paused and no proposal is
-EXECUTING (governor `getActiveProposal() == 0`); from execute to settle they SHALL
-revert `DepositsLocked` and depositors use the async queue (`requestDeposit`). The
-lock tracks the one window in which the share price is not knowable — capital
-deployed in a strategy — and nothing else: a deposit made before execute mints at a
-live NAV the vault can compute. A deposit after the electorate stamp (`propose` on
-the direct path, the final `approveCollaboration` on the collaborative path) buys no
-vote weight, because weight is read at the proposal's `snapshotTimestamp` and the
-veto electorate was recorded at the same instant. The whitelist check SHALL run against the `receiver` (the share holder), not
-the caller, so pay-on-behalf funding is permitted.
-
-#### Scenario: Deposit outside any open proposal
-
-- **WHEN** no proposal is open and the receiver is eligible (deposits open, or
-  receiver whitelisted)
-- **THEN** the deposit mints shares at the current NAV
-
-#### Scenario: Deposit while a proposal is Pending, GuardianReview or Approved
-
-- **WHEN** a proposal is stamped but has not executed
-- **THEN** `deposit`/`mint` succeed at the live NAV, and the depositor gains no
-  voting power over that proposal
-
-#### Scenario: Deposit while a collaborative proposal is Draft
-
-- **WHEN** a collaborative Draft is open and its electorate is not yet stamped
-- **THEN** `deposit`/`mint` succeed at the live NAV, the shares are inside the
-  electorate stamped at the final `approveCollaboration` and vote on that proposal
-  (the accepted Sherlock #8 trade), and they cannot exit before settle
-
-#### Scenario: Mid-execution deposit is locked
-
-- **WHEN** a proposal is Executed and not yet Settled
-- **THEN** `deposit`/`mint` revert `DepositsLocked` and the depositor's path is
-  `requestDeposit`
-
-#### Scenario: Non-whitelisted receiver in closed mode
-
-- **WHEN** `openDeposits` is false and the receiver is not an approved depositor
-- **THEN** the deposit reverts `NotApprovedDepositor`
-
-#### Scenario: maxDeposit reflects every deposit gate
-
-- **WHEN** the vault is paused, `depositsLocked()` is true, or the receiver is
-  not an approved depositor in closed mode
-- **THEN** `maxDeposit(receiver)`/`maxMint(receiver)` return 0; otherwise they
-  return `type(uint256).max`
-
 ### Requirement: Vote checkpointing and auto-delegation
 
-The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL auto-delegate an undelegated recipient to itself, after balances update, so checkpointed voting power tracks balance for every holder. Voting power SHALL NOT be delegated away from the holder: `delegate` and `delegateBySig` SHALL revert `DelegationLocked` for any delegatee other than the account itself (including `address(0)`), so every share in the veto denominator is castable by its holder and the recorded electorate equals the castable weight at the snapshot.
+The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder. Voting power SHALL NOT be delegated away from the holder: `delegate` and `delegateBySig` SHALL revert `DelegationDisabled` for any delegatee other than the account itself (including `address(0)`), so every share in the veto denominator is castable by its holder and the recorded electorate equals the castable weight at the snapshot.
 
 #### Scenario: Recipient auto-delegates on receipt
-- **WHEN** shares are transferred or minted to an address whose delegate is unset
+- **WHEN** shares are transferred or minted to an address that is not delegated to itself
 - **THEN** the recipient is delegated to itself and its post-receipt balance is checkpointed
 
 #### Scenario: Permissionless heal via zero-value transfer
-- **WHEN** anyone transfers 0 shares to an undelegated legacy holder
+- **WHEN** anyone transfers 0 shares to a holder that is not self-delegated
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
 #### Scenario: Delegation to another address is refused
 - **WHEN** a holder calls `delegate` or `delegateBySig` with a delegatee that is not itself (another holder, the queue, or `address(0)`)
-- **THEN** the call reverts `DelegationLocked` and the holder's shares keep voting for the holder
+- **THEN** the call reverts `DelegationDisabled` and the holder's shares keep voting for the holder
 
 #### Scenario: Self-delegation is a no-op
 - **WHEN** a holder calls `delegate(self)`
@@ -122,17 +72,6 @@ strictly greater than 0 SHALL be returned with `RedeemRequested` emitted.
 - **WHEN** no proposal is open
 - **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the
   correct path)
-
-### Requirement: Async deposit requests (Lane B)
-`requestDeposit(assets, receiver)` SHALL be callable only while `depositsLocked()` is true (a proposal is executing), the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, `DepositsNotLocked` otherwise, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted. Exactly one deposit path SHALL be open in every state: the instant one until execute, the lane from execute to settle.
-
-#### Scenario: Escrowed deposit does not inflate NAV
-- **WHEN** assets are escrowed via `requestDeposit` during an executing proposal
-- **THEN** `totalAssets()` is unchanged until the request is claimed and assets are pushed into the vault
-
-#### Scenario: Lane closed before execution
-- **WHEN** a proposal is open but not executing and a depositor calls `requestDeposit`
-- **THEN** the call reverts `DepositsNotLocked`, because the instant path is the open one
 
 ### Requirement: Pause and emergency behavior
 

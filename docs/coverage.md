@@ -52,13 +52,13 @@ The ledger locks `min(lockWood, free budget)` WOOD, where
 free budget = kNumerator * slashableStake(guardian) − openExposure(guardian)
 ```
 
-all in WOOD. Nothing is converted to USD on this path and no price is read. A
-guardian with no free budget is **not rejected at vote time** — the ledger locks
-zero, the vote still counts as weight, and the cap shows up as an execute-time
-shortfall rather than a reverted vote. An asset-feed outage likewise locks
-nothing rather than reverting, so Block votes cannot keep working while Approve
-votes fail; a WOOD-feed outage is not a failure case at all, because the lock
-needs no price.
+all in WOOD. **An Approve books a lock or reverts** (SHE-240): the vote is
+refused `ApproveLockBelowFloor` when the booked lock is worth less than
+`1/APPROVER_SLOTS` of the need — or, for a guardian whose whole budget is below
+that share, less than that whole budget, admitted only while fewer than half the
+slots are booked (v1 audit F3). An unreadable or unpriceable need and a
+settlement past the horizon also revert. The registry's approver push unwinds
+with the revert, so no slot is held without a lock behind it.
 
 `releaseApproval` unwinds Approve → Block (`CoverageFrozen` while a challenge
 is live); `retireApproval` clears a lock once its proposal is past
@@ -118,11 +118,40 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **WOOD is priced by one feed, capped by governance.** `woodPriceX8()` reads a
   single `AggregatorV3`-shaped WOOD/USD feed, takes `min(feed, woodUsdPriceX8)`
   — the cap is never served as a price — and applies `woodHaircutBps`. On chain
-  4663 that feed is `WoodPoolFeed`: the lower of the Uniswap and Sushiswap
-  WOOD/WETH pools' TWAPs over a window of at least 24h, converted through
-  ETH/USD; every snapshot syncs both pairs first, so there is no idle tail, and
-  each pool is held to a WETH depth floor. A stale or shallow reading yields no
-  price at all — `NoWoodPrice` — rather than a wrong one.
+  4663 that feed is `WoodPoolFeed`: the lower of two WOOD/WETH TWAPs over a
+  window of at least 24h, converted through ETH/USD. One leg is the Uniswap V2
+  pair, synced before each snapshot so there is no idle tail, held to a WETH
+  reserve floor; the other is the Uniswap V3 pool `0xF683…1C69`, held to an
+  in-range `liquidity()` floor instead. **Both legs are averaged from
+  accumulator readings the keeper snapshots** — the pair's cumulative price and
+  the pool's `observe([0])` tick cumulative — so neither leg depends on history
+  anyone else stores. The V3 leg's near end is the pool's live `observe([0])`,
+  so a crash there is tracked between rolls, not hidden until the next one. A backward `observe([window])` would: the observation ring
+  is written by ANY swapper, one slot per SECOND in which the pool is touched,
+  and `observationCardinality` is a `uint16`, so the longest ring anyone can pay
+  for reaches 18h12m against a per-second writer and no ring size can serve a 24h
+  window (v1 audit F2). `DeployWoodPoolFeed` pre-flights only that the pool
+  serves `observe([0])`, which any initialised pool does.
+  **`min` means the SHALLOWER venue binds**, and today that is the V3 pool
+  (~$122k of notional against the V2 pair's ~$330k), so the cost of pushing the
+  reported price DOWN is set by the V3 pool's depth and `woodHaircutBps` should
+  be sized against it rather than against the pair. **The V3 pool's liquidity is
+  a single full-range position**, so `MIN_V3_LIQUIDITY` is also the point at
+  which that one LP burning below it halts WOOD pricing protocol-wide
+  (`NoWoodPrice`, so nothing proposes and nothing executes); the deploy default
+  of `1e22` leaves only 2.1x headroom today and is a launch parameter to size
+  deliberately against what the protocol is willing to halt for. The two depth
+  floors also bind at different times: the V2 leg's WETH floor is checked at
+  SNAPSHOT time as well as at read time, so a pair that was thin during the
+  averaged span never enters the average, while the V3 leg's `liquidity()` floor
+  is checked only at read time, so a pool thin for most of the window but topped
+  up just before the read passes it. Accepted: neither leg carries a staleness
+  gate of its own, so a pool that stops trading keeps averaging its last tick,
+  and the pair keeps averaging its last synced spot. `updatedAt` is the
+  V2 leg's latest snapshot — the older of the two legs, the V3 leg being live — so
+  `WOOD_FEED_MAX_DELAY` at the ledger is what bounds the whole feed's age. A
+  stale or shallow reading yields no price at all — `NoWoodPrice` — rather than
+  a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
   `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;

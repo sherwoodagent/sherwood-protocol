@@ -103,18 +103,17 @@ abstract contract SyndicateVaultHandler is Properties {
     }
 
     function syndicateVault_secondary(uint8 selector, uint256 arg0, address arg1) public {
-        selector = uint8(selector % 12);
+        selector = uint8(selector % 11);
         if (selector == 0) _syndicateVault_approve(toActor(arg1), arg0);
         else if (selector == 1) _syndicateVault_approveDepositor(toActor(arg1));
         else if (selector == 2) _syndicateVault_removeDepositor(toActor(arg1));
-        else if (selector == 3) _syndicateVault_delegate(toActor(arg1));
-        else if (selector == 4) _syndicateVault_pause();
-        else if (selector == 5) _syndicateVault_unpause();
-        else if (selector == 6) _syndicateVault_setOpenDeposits(arg0 % 2 == 0);
-        else if (selector == 7) _syndicateVault_setAgentFeeBps(clampBetween(arg0, 0, 2_500));
-        else if (selector == 8) _syndicateVault_setMinBufferBps(uint16(clampBetween(arg0, 0, 10_000)));
-        else if (selector == 9) _syndicateVault_registerAgent(arg0 % 1_000, toActor(arg1));
-        else if (selector == 10) _syndicateVault_removeAgent(toActor(arg1));
+        else if (selector == 3) _syndicateVault_pause();
+        else if (selector == 4) _syndicateVault_unpause();
+        else if (selector == 5) _syndicateVault_setOpenDeposits(arg0 % 2 == 0);
+        else if (selector == 6) _syndicateVault_setAgentFeeBps(clampBetween(arg0, 0, 2_500));
+        else if (selector == 7) _syndicateVault_setMinBufferBps(uint16(clampBetween(arg0, 0, 10_000)));
+        else if (selector == 8) _syndicateVault_registerAgent(arg0 % 1_000, toActor(arg1));
+        else if (selector == 9) _syndicateVault_removeAgent(toActor(arg1));
         else _syndicateVault_rescueERC20(address(wood), toActor(arg1), arg0);
     }
 
@@ -156,10 +155,6 @@ abstract contract SyndicateVaultHandler is Properties {
 
     function _syndicateVault_approve(address spender, uint256 value) internal asActor {
         vault.approve(spender, value);
-    }
-
-    function _syndicateVault_delegate(address delegatee) internal asActor {
-        vault.delegate(delegatee);
     }
 
     // ── Secondary: owner-gated ──

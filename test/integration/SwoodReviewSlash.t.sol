@@ -117,6 +117,10 @@ contract SwoodReviewSlashTest is Test {
         return address(governor);
     }
 
+    function depositsRestricted() external pure returns (bool) {
+        return false;
+    }
+
     function setUp() public {
         factoryEoa = address(this);
 

@@ -22,7 +22,7 @@ interface IProposalStatus {
     /// @notice Id of the proposal currently binding the vault (0 = none).
     function getActiveProposal() external view returns (uint256);
     /// @notice Count of non-terminal proposals, Drafts included. Nonzero ⇒ instant
-    ///         redemption is locked (vault `redemptionsLocked`), `propose` and
+    ///         deposit and redemption are locked (vault `redemptionsLocked`), `propose` and
     ///         `whenNoActiveProposal` refuse, the factory swap gates and the owner's
     ///         `requestUnstakeOwner` rescue path are closed.
     function openProposalCount() external view returns (uint256);

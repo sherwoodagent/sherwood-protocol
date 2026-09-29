@@ -158,6 +158,16 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         strategy.rerange();
     }
 
+    /// @notice A registry that stops resolving after execute fails `rerange()` closed.
+    function test_rerange_unresolvedRegistryReverts() public {
+        _execute();
+        _moveToTrigger();
+        _warpPastInterval();
+        status.setTierRegistry(address(0));
+        vm.expectRevert(ConcentratedLiquidityStrategy.TierRegistryUnresolved.selector);
+        strategy.rerange();
+    }
+
     function test_rerange_insideMinIntervalReverts() public {
         _execute();
         _moveToTrigger();

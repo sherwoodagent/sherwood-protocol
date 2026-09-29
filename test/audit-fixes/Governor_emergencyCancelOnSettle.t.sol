@@ -145,6 +145,7 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         GuardianRegistry regImpl = new GuardianRegistry(6 hours);
@@ -196,6 +197,8 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
         wood.approve(address(swood), type(uint256).max);
         vm.prank(guardianB);
         swood.stakeAsGuardian(GUARDIAN_STAKE, 2);
+        // The emergency electorate is read at the propose-time snapshot (`t - 1`).
+        vm.warp(vm.getBlockTimestamp() + 1);
     }
 
     function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {

@@ -91,6 +91,7 @@ contract GovernorHardeningTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(leadAgent), leadAgent);
@@ -204,7 +205,8 @@ contract GovernorHardeningTest is Test {
         vm.prank(co1);
         governor.approveCollaboration(proposalId);
 
-        // Pending now — snapshotTimestamp is stamped.
+        // Pending now — snapshotTimestamp is stamped; weight reads once the stamp second ends.
+        vm.warp(vm.getBlockTimestamp() + 1);
         assertGt(governor.getVoteWeight(proposalId, lp1), 0);
     }
 

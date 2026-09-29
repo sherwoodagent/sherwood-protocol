@@ -43,7 +43,7 @@ stateDiagram-v2
 Deadlines derived at proposal creation (`src/SyndicateGovernor.sol:1067-1093`):
 
 ```
-snapshotTimestamp = now − 1            // closes same-block flash-delegate
+snapshotTimestamp = now − 1            // closes same-block acquisition
 voteEnd   = now + votingPeriod
 reviewEnd = voteEnd + registry.reviewPeriod()
 executeBy = reviewEnd + executionWindow
@@ -105,11 +105,10 @@ Cross-contract timing invariants (all enforced at the setters):
   WOOD (allowance alone is not enough). See [proposer-bond.md](proposer-bond.md).
 - With co-proposers → `Draft`; each co-proposer must `approveCollaboration` within
   `collaborationWindow` or the draft expires. The lead can `rejectCollaboration`.
-- Vault funds: **untouched**. Instant deposits stay open through propose, vote,
-  review and approval — only execution locks them (`depositsLocked`). Instant
-  withdrawals lock from propose, `Draft` included (`redemptionsLocked`): whoever
-  can vote stays at risk for the outcome, and no exit can land ahead of the
-  electorate stamp.
+- Vault funds: **untouched**, but instant deposits and withdrawals lock from
+  propose, `Draft` included, until settle (`depositsLocked` = `redemptionsLocked`):
+  no share is minted or burned while a proposal is open. LPs use the queue lanes
+  (`requestDeposit` / `requestRedeem`) meanwhile.
 
 ### 1. Vote (`vote`, `src/SyndicateGovernor.sol:378`)
 
@@ -117,11 +116,9 @@ Cross-contract timing invariants (all enforced at the setters):
   checkpoints; snapshot is `now − 1` so same-block flash-delegation cannot vote).
 - **Optimistic:** the proposal passes by default when `voteEnd` arrives; it is
   rejected only if AGAINST votes reach `vetoThresholdBps` (20–80%) of the
-  proposal's `votableSupply` — total supply minus the withdrawal queue's
-  balance, recorded at the Draft → Pending transition: live on the direct path
-  (nothing can move between the read and the stamp), at `snapshotTimestamp` on
-  the collaborative path (the redeem lane is open for the whole Draft, so a live
-  queue term could be shrunk by a same-block `requestRedeem` that keeps its weight).
+  proposal's `votableSupply` — supply minus the withdrawal queue at the snapshot,
+  recorded at the Draft → Pending transition and lowered by the first vote to the
+  same read at the end of the propose second, the two instants vote weight reads.
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
   (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
 
@@ -155,7 +152,7 @@ Cross-contract timing invariants (all enforced at the setters):
   empty / zero aggregate reverts `InsufficientApproveCoverage`) → the voted
   batch runs via `executeGovernorBatch` under that effective cap. See
   [coverage.md](coverage.md).
-- Effects: capital snapshot taken, `_activeProposal = id` (**deposits lock** —
+- Effects: capital snapshot taken, `_activeProposal = id` (deposits and
   redemptions have been locked since propose, `Draft` included), management-fee clock starts.
 - Batch metering: per-call caps (`CallCapExceeded`), net outflow ≤ `maxCapital`
   (`MaxNetOutflowExceeded`), queue reserve untouchable (`QueueReserveBreached`),

@@ -36,19 +36,20 @@ SHALL equal the asset's `decimals()`, cached once at initialization.
 - **THEN** the virtual-shares offset is 6, yielding 12-decimal shares
 
 ### Requirement: Vote checkpointing and auto-delegation
-The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL auto-delegate an undelegated recipient to itself, after balances update, so checkpointed voting power tracks balance for every holder that has not explicitly delegated elsewhere.
+The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder.
 
 #### Scenario: Recipient auto-delegates on receipt
-- **WHEN** shares are transferred or minted to an address whose delegate is unset
+- **WHEN** shares are transferred or minted to an address that is not delegated to itself
 - **THEN** the recipient is delegated to itself and its post-receipt balance is checkpointed
 
 #### Scenario: Permissionless heal via zero-value transfer
-- **WHEN** anyone transfers 0 shares to an undelegated legacy holder
+- **WHEN** anyone transfers 0 shares to a holder that is not self-delegated
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
-#### Scenario: Explicit delegation preserved
-- **WHEN** shares arrive at a holder that has already delegated to another address
-- **THEN** the existing delegation choice is unchanged
+#### Scenario: Delegation away from the holder is refused
+- **WHEN** any caller invokes `delegate` or `delegateBySig` naming a delegatee other than itself
+- **THEN** the call reverts `DelegationDisabled`, so every holder's checkpointed votes
+  equal its own balance; `delegate(self)` succeeds as a no-op
 
 ### Requirement: Instant deposit flow
 
@@ -78,7 +79,8 @@ so pay-on-behalf funding is permitted.
 #### Scenario: maxDeposit reflects every deposit gate
 
 - **WHEN** the vault is paused, `depositsLocked()` is true, or the receiver is
-  not an approved depositor in closed mode
+  not an approved depositor in closed mode (including closed by the factory's
+  `depositsRestricted`)
 - **THEN** `maxDeposit(receiver)`/`maxMint(receiver)` return 0; otherwise they
   return `type(uint256).max`
 
@@ -92,6 +94,11 @@ The vault owner SHALL control deposit access via an open/closed mode flag (`setO
 #### Scenario: Pagination clamp
 - **WHEN** a paginated view is called with `limit > 100`
 - **THEN** at most 100 rows are returned
+
+#### Scenario: Factory-wide deposit restriction
+- **WHEN** the factory owner has set `depositsRestricted` via `setDepositsRestricted(true)`
+- **THEN** every vault the factory created accepts `deposit`, `mint` and `requestDeposit` only for approved depositors, as in closed mode, whatever its own `openDeposits`
+- **AND** withdrawals, redemptions, redeem requests and claims of already-queued deposits are unaffected, and `setDepositsRestricted(false)` restores each vault's own setting
 
 ### Requirement: Instant withdrawal flow and capacity
 

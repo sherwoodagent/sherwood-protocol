@@ -150,6 +150,7 @@ contract OpenProposalCountTest is Test {
         // Per-vault governor: the vault resolves its governor via its factory
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         GuardianRegistry regImpl = new GuardianRegistry(6 hours);
@@ -791,14 +792,13 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 1, "counter at 1 after fresh propose");
     }
 
-    /// @notice A Draft holds the redeem lock but not the deposit lock: instant redeem
-    ///         is closed from Draft creation (no exit can land ahead of the electorate
-    ///         stamp), instant deposit stays open until execute. Sherlock run #1
-    ///         finding #8 (a Draft-window deposit buys vote weight) is ACCEPTED under
-    ///         SHE-287 — that capital is locked until settle, which is the price of
-    ///         the vote — and the electorate is recorded at the stamp, so the
-    ///         finding's "counted at vote time" mechanism no longer exists.
-    function test_draft_locksRedeemNotDeposit() public {
+    /// @notice Sherlock run #1 finding #8 — once a Draft exists, the vault
+    ///         is bound and new deposits are blocked (vault's
+    ///         `_depositsLocked` reads `governor.openProposalCount > 0`).
+    ///         Pre-fix, Draft sat outside the counter, so depositors could
+    ///         front-run the Draft→Pending snapshot during the up-to-7-day
+    ///         collab window and have their fresh balance counted at vote time.
+    function test_draft_locksDeposits() public {
         address agent2 = makeAddr("agent2");
         uint256 agent2Id = agentRegistry.mint(agent2);
         vm.prank(owner);
@@ -808,7 +808,7 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        uint256 pid = governor.propose(
+        governor.propose(
             address(vault),
             address(0),
             "ipfs://draft-lock",
@@ -821,32 +821,20 @@ contract OpenProposalCountTest is Test {
             coProps
         );
 
+        // openProposalCount = 1; vault's _depositsLocked() returns true.
         assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");
-        assertFalse(vault.depositsLocked(), "deposit lock waits for execute");
-        assertTrue(vault.redemptionsLocked(), "redeem lock is held from Draft creation");
 
-        // Deposit during the Draft window: open.
+        // Attempt to deposit during the Draft window — must revert.
         address depositor = makeAddr("depositor");
         usdc.mint(depositor, 1_000e6);
         vm.startPrank(depositor);
         usdc.approve(address(vault), type(uint256).max);
-        assertGt(vault.deposit(1_000e6, depositor), 0, "instant deposit open during a Draft");
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, depositor);
         vm.stopPrank();
-
-        // Instant redeem during the Draft window: closed, for everyone.
-        assertEq(vault.maxRedeem(lp1), 0, "instant redeem closed during a Draft");
-        assertEq(vault.maxRedeem(depositor), 0, "including the Draft-window depositor");
-
-        // The accepted trade: the Draft-window deposit buys weight at the stamp,
-        // and that capital stays locked until settle.
-        vm.warp(vm.getBlockTimestamp() + 1);
-        vm.prank(agent2);
-        governor.approveCollaboration(pid);
-        assertGt(governor.getVoteWeight(pid, depositor), 0, "the Draft-window deposit votes");
-        assertTrue(vault.redemptionsLocked(), "and cannot leave until settle");
     }
 
-    /// @notice A lead cancel of a Draft releases the vault: the redeem lock a Draft
+    /// @notice A lead cancel of a Draft releases the vault: the locks a Draft
     ///         holds must lift with the binding.
     function test_cancelProposal_draftReleasesTheLock() public {
         uint256 pid = _proposeDraftWithCoAgent();
@@ -856,7 +844,7 @@ contract OpenProposalCountTest is Test {
         governor.cancelProposal(pid);
         assertEq(governor.openProposalCount(), 0, "cancel released the binding");
         assertFalse(vault.redemptionsLocked(), "and the lock");
-        assertFalse(vault.depositsLocked(), "deposit lock never held");
+        assertFalse(vault.depositsLocked(), "and the deposit lock");
     }
 
     /// @notice The lazy Draft -> Expired commit is the fifth Draft exit; same pin.

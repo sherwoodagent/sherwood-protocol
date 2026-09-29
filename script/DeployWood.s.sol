@@ -26,6 +26,9 @@ contract DeployWood is ScriptBase {
     uint256 constant DEFAULT_WOOD_MINT = 100_000_000e18;
 
     function run() external {
+        // Robinhood mainnet uses the EXTERNAL WOOD; a stale ALLOW_FIXTURE_WOOD here would
+        // overwrite WOOD_TOKEN in the committed book with a fixture.
+        require(block.chainid != 4663, "never on Robinhood mainnet: WOOD_TOKEN is the external token");
         require(vm.envOr("ALLOW_FIXTURE_WOOD", false), "set ALLOW_FIXTURE_WOOD=true (fork/beta only; never mainnet)");
         uint256 mintAmount = vm.envOr("WOOD_MINT", DEFAULT_WOOD_MINT);
 

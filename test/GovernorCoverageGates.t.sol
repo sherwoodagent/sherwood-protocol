@@ -251,6 +251,7 @@ contract GovernorCoverageGatesTest is Test {
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(governor))
         );
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
         vm.mockCall(
             address(this),
             abi.encodeWithSignature("governorOf(address)", address(unwiredVault)),
@@ -710,6 +711,11 @@ contract GovernorCoverageGatesTest is Test {
     ///         and accepted (design D5): execution still proceeds (there IS an
     ///         identified, nonzero-bonded signer, so the R1 floor is met), but
     ///         the batch's net-outflow ceiling is 0.
+    ///
+    /// @dev    SHE-240 keeps this reachable: the slot floor is the SMALLER of
+    ///         one slot's share of the need and the guardian's whole budget, so
+    ///         a guardian this small still takes a slot by committing all of it.
+    ///         What it may not do is take a slot while holding budget back.
     function test_execute_dustCoverage_floorsEffectiveMaxCapitalToZero() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);
@@ -1078,6 +1084,7 @@ contract GovernorCoverageGatesTest is Test {
 
         // lp1 holds the entire share supply; voting Against clears the 4000 bps
         // veto threshold, so the proposal resolves Rejected at voteEnd.
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         vm.warp(governor.getProposal(pid).voteEnd + 1);

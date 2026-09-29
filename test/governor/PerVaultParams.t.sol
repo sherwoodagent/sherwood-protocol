@@ -92,6 +92,7 @@ contract PerVaultParamsTest is Test {
         );
         governor = SyndicateGovernor(address(new BeaconProxy(address(beacon), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
 
         usdc.mint(lp1, 100_000e6);
         vm.startPrank(lp1);
