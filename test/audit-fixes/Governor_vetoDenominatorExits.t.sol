@@ -479,6 +479,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(
             governor.getProposal(pid).votableSupply, honest + attackerShares - queued, "electorate is G + X - queued"
         );
+        vm.warp(vm.getBlockTimestamp() + 1); // weight is castable once the stamp second ends
         assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "capital at risk still buys a vote");
         // Every share's votes are somewhere -- no holder walked out of the snapshot...
         assertEq(
@@ -536,8 +537,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         );
     }
 
-    /// @notice An exit ordered ahead of `propose` in the same block keeps its snapshot vote
-    ///         weight, but the electorate counts only weight still backed by shares in the vault.
+    /// @notice An exit ordered ahead of `propose` in the same block keeps its snapshot checkpoint
+    ///         but no castable weight, and the electorate counts only weight still backed by shares.
     function test_directPathElectorateIsTheCastableWeightStillBackedByShares() public {
         _deposit(lp1, 100_000e6);
         _deposit(attacker, 200_000e6);
@@ -549,7 +550,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         uint256 pid = _propose();
         uint256 s = governor.getProposal(pid).snapshotTimestamp;
 
-        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "the exit keeps its snapshot weight");
+        assertEq(vault.getPastVotes(attacker, s), attackerShares, "the exit keeps its snapshot checkpoint");
+        assertEq(governor.getVoteWeight(pid, attacker), 0, "but no castable weight");
         assertEq(
             governor.getProposal(pid).votableSupply,
             vault.getPastVotes(lp1, s),
@@ -719,6 +721,31 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         assertEq(governor.getProposal(pid).votesAgainst, vault.balanceOf(lp1), "an untouched holder votes in full");
+    }
+
+    /// @notice `getVoteWeight` reports exactly what `vote()` records: 0 in the propose second, capped after it.
+    function test_getVoteWeightAgreesWithVote() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 200_000e6);
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(attackerShares, attacker, attacker); // propose second, ahead of propose
+        uint256 pid = _proposeNoWarp();
+        assertEq(governor.getVoteWeight(pid, lp1), 0, "nothing is castable inside the propose second");
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.getPastVotes(attacker, s), attackerShares, "the snapshot still holds the redeemed shares");
+        assertEq(governor.getVoteWeight(pid, attacker), 0, "the view applies the propose-second cap");
+        vm.prank(attacker);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        uint256 viewed = governor.getVoteWeight(pid, lp1);
+        assertGt(viewed, 0, "an untouched holder has weight");
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        assertEq(governor.getProposal(pid).votesAgainst, viewed, "the view equals the weight vote() records");
     }
 
     /// @notice lp3's stamped 50k park is claimed by the attacker in the propose second, ahead of propose.
