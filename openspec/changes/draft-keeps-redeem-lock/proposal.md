@@ -40,9 +40,9 @@ made a Draft-window deposit a fair trade (Sherlock run #1 finding #8, accepted a
   instead of live. The redeem lane is open for the whole Draft and the final
   approve's readiness is public, so a live queue term could be shrunk by a
   same-block `requestRedeem` whose owner keeps `t − 1` weight (`veto-votable-supply`
-  Decision 3). Both terms at `t − 1` see one set. The direct path keeps its live read:
-  instant redeem is open right up to `propose`, and a `t − 1` read there would count
-  shares that already left.
+  Decision 3). Both terms at `t − 1` see one set. The direct path reads the same
+  instant; an exit ahead of `propose` in its second is caught when `vote` lowers the
+  electorate to the read at `t` (a845b781).
 - `delegate`/`delegateBySig` to anyone but the holder revert `DelegationDisabled`
   (`SyndicateVault._delegate`). Without it the two `t − 1` terms are not one set: a
   holder that undelegates (`delegate(address(0))`) a block before the stamp stays in

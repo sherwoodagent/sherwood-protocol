@@ -13,9 +13,9 @@
 
 ## 2. Governor
 
-- [x] 2.1 `approveCollaboration` stamps `votableSupply` at `snapshotTimestamp`
-      (`_votableSupplyAt`: `getPastTotalSupply − getPastVotes(queue)`); `propose`
-      keeps the live `_votableSupplyOf`.
+- [x] 2.1 Both paths stamp `votableSupply` at `snapshotTimestamp`
+      (`_votableSupplyAt`: `getPastTotalSupply − getPastVotes(queue)`), and `vote`
+      lowers it to the same read at `snapshot + 1` (a845b781).
 - [x] 2.2 No storage change.
 
 ## 3. Tests
