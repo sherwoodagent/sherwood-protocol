@@ -164,6 +164,7 @@ contract CoverageEndToEndTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         protocolConfig = new ProtocolConfig(owner);
         adapter = new NoopAdapter();
         tierRegistry = new TierRegistry(address(this));
@@ -210,6 +211,7 @@ contract CoverageEndToEndTest is Test {
             address(this), abi.encodeWithSignature("governorOf(address)", address(vaultA)), abi.encode(address(govA))
         );
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vaultB)), abi.encode(address(govB))
         );

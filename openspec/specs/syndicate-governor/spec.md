@@ -44,11 +44,17 @@ The governor SHALL bind at most one non-terminal proposal lifecycle to its vault
 - **THEN** `approveCollaboration` SHALL revert with `VaultHasOpenProposal`
 
 ### Requirement: Proposal creation validation
-`propose` SHALL only be callable by a registered agent of the governor's vault, and SHALL validate: the `vault` argument equals the governor's bound vault; `strategyDuration` is within `[minStrategyDuration, maxStrategyDuration]`; `executeCalls` and `settlementCalls` are both non-empty and each at most 64 calls; `metadataURI` is at most 512 bytes; `envelope.maxCapital` is nonzero and at most `totalAssets() * maxCapitalBps / 10_000` at propose time; and `envelope.maxDrawdownBps` is at most 10_000. The proposal SHALL snapshot at propose time: the agent performance fee (clamped to `maxPerformanceFeeBps`), the protocol and guardian fee bps and recipients from ProtocolConfig, the strategy's `selfManagesFees` flag, and the risk envelope — all immutable for the proposal's lifetime.
+`propose` SHALL only be callable by a registered agent of the governor's vault and, while the factory's `ownerOnlyProposals` is true, only by the vault owner and only without co-proposers; the flag SHALL be read live at propose time, so it binds agents registered before it was set. `propose` SHALL validate: the `vault` argument equals the governor's bound vault; `strategyDuration` is within `[minStrategyDuration, maxStrategyDuration]`; `executeCalls` and `settlementCalls` are both non-empty and each at most 64 calls; `metadataURI` is at most 512 bytes; `envelope.maxCapital` is nonzero and at most `totalAssets() * maxCapitalBps / 10_000` at propose time; and `envelope.maxDrawdownBps` is at most 10_000. The proposal SHALL snapshot at propose time: the agent performance fee (clamped to `maxPerformanceFeeBps`), the protocol and guardian fee bps and recipients from ProtocolConfig, the strategy's `selfManagesFees` flag, and the risk envelope — all immutable for the proposal's lifetime.
 
 #### Scenario: Non-agent proposer rejected
 - **WHEN** an address that is not a registered agent of the vault calls `propose`
 - **THEN** the call SHALL revert with `NotRegisteredAgent`
+
+#### Scenario: Owner-only proposals
+- **WHEN** the factory's `ownerOnlyProposals` is true and a registered agent other than the vault owner calls `propose`
+- **THEN** the call SHALL revert with `ProposerNotOwner`
+- **AND** the vault owner, registered as an agent, SHALL propose as usual, while a proposal with co-proposers SHALL revert with `CollaborationDisabled`
+- **AND** `setOwnerOnlyProposals(false)` SHALL restore proposing by every registered agent
 
 #### Scenario: maxCapital ceiling enforced
 - **WHEN** a proposer declares `envelope.maxCapital` greater than `totalAssets() * maxCapitalBps / 10_000`
@@ -175,6 +181,10 @@ A proposal submitted with co-proposers SHALL enter `Draft` and require every co-
 - **WHEN** the vault owner changes `votingPeriod` while a collaborative Draft awaits approvals
 - **THEN** the Draft's eventual Pending timeline SHALL use the values snapshotted at propose time
 
+#### Scenario: Collaboration refused under owner-only proposals
+- **WHEN** the factory's `ownerOnlyProposals` is true and a co-proposer calls `approveCollaboration` on a Draft created before it was set
+- **THEN** the call SHALL revert with `CollaborationDisabled`, leaving the Draft to be rejected, cancelled, or to expire
+
 #### Scenario: Near-quorum cancel blocked
 - **WHEN** the lead calls `cancelProposal` on a Draft with more than one co-proposer where all but one have approved
 - **THEN** the call SHALL revert with `CancelNotAllowedNearQuorum`
@@ -280,6 +290,14 @@ Every per-vault governor SHALL be deployed as a `BeaconProxy` reading its implem
 #### Scenario: Duplicate subdomain rejected
 - **WHEN** `config.subdomain` already maps to an existing syndicate
 - **THEN** the call SHALL revert with `SubdomainTaken`
+
+#### Scenario: Agent registry re-pointed or disabled
+- **WHEN** the factory owner calls `setAgentRegistry(newRegistry)`
+- **THEN** `AgentRegistryUpdated(old, new)` SHALL be emitted and both `createSyndicate` and every factory vault's `registerAgent` SHALL check identity against `newRegistry` from then on, skipping the check when it is zero; any other caller SHALL revert
+
+#### Scenario: Factory launch flags
+- **WHEN** the factory owner calls `setDepositsRestricted(bool)` or `setOwnerOnlyProposals(bool)`
+- **THEN** the flag SHALL be stored and `DepositsRestrictedUpdated` / `OwnerOnlyProposalsUpdated` emitted, both flags SHALL apply to every syndicate the factory created, and any other caller SHALL revert
 
 #### Scenario: Sponsored creation waives one fee
 - **WHEN** the factory owner has called `setCreationSponsored(creator, true)` and a creation fee is configured

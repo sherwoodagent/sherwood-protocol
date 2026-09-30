@@ -48,6 +48,7 @@ contract DeployStrategyFactoryWiringTest is Test {
 
         usdc = new ERC20Mock("USDC", "USDC", 6);
         MockAgentRegistry agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
@@ -91,6 +92,7 @@ contract DeployStrategyFactoryWiringTest is Test {
         // The test contract is the syndicate factory.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(address(this), abi.encodeWithSignature("vaultToSyndicate(address)"), abi.encode(uint256(1)));
 
         uint256 agentId = agentRegistry.mint(agent);

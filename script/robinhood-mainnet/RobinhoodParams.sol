@@ -10,8 +10,8 @@ library RobinhoodParams {
     // Deterministic deployment proxy (same address on every EVM chain); mints the Create3Factory.
     address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
-    // ERC-8004 IdentityRegistry is live on 4663 but v1 leaves identity gating off.
-    address internal constant AGENT_REGISTRY = address(0);
+    // Canonical ERC-8004 IdentityRegistry on 4663: gates `createSyndicate` and `registerAgent`.
+    address internal constant AGENT_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
 
     // Factory / governor. 200 bps is the guardian-budget floor, stamped once per vault at initialize.
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;

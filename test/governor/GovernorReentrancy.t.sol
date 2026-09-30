@@ -56,6 +56,7 @@ contract GovernorReentrancyTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         registry = new ReentrantRegistry();
         registry.setReviewPeriod(REVIEW_PERIOD);
         agentNftId = agentRegistry.mint(agent);
@@ -106,6 +107,7 @@ contract GovernorReentrancyTest is Test {
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         registry.setGovernor(address(governor));
 
         usdc.mint(lp1, 100_000e6);

@@ -106,7 +106,7 @@ contract SyndicateVault is
     /// @notice If true, anyone can deposit (skip whitelist check)
     bool private _openDeposits;
 
-    /// @notice ERC-8004 agent identity registry (ERC-721)
+    /// @dev Retired: init-time snapshot, never read; `registerAgent` uses the factory's live `agentRegistry()`.
     IERC721 private _agentRegistry;
 
     // ── Governor / Factory storage ──
@@ -290,8 +290,10 @@ contract SyndicateVault is
     ///      Re-querying on every execution would add a per-call external view to
     ///      the hot path and hard-couple the vault to an external registry;
     ///      off-chain monitoring should trigger `removeAgent` instead.
+    ///      The registry is the factory's current one, so the factory owner can re-point or disable it.
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
-        SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, _agentRegistry, owner());
+        IERC721 registry = IERC721(ISyndicateFactory(_factory).agentRegistry());
+        SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, registry, owner());
     }
 
     /// @inheritdoc ISyndicateVault

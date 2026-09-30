@@ -250,8 +250,8 @@ abstract contract DeployAllFixture is Test {
         assertEq(factory.beacon(), s.core.beacon, "factory.beacon");
         assertEq(factory.protocolConfig(), s.core.protocolConfig, "factory.protocolConfig");
         assertEq(factory.managementFeeBps(), RobinhoodParams.MANAGEMENT_FEE_BPS, "factory.managementFeeBps");
-        // v1 ships with identity gating off, so the agent registry is deliberately zero.
-        assertEq(address(factory.agentRegistry()), address(0), "factory.agentRegistry");
+        // Identity gating is on: the canonical ERC-8004 IdentityRegistry on 4663.
+        assertEq(address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY, "factory.agentRegistry");
         assertEq(StakedWood(s.core.swoodProxy).registry(), s.core.registryProxy, "swood.registry");
         assertEq(address(StakedWood(s.core.swoodProxy).wood()), address(wood), "swood.wood");
     }
@@ -429,6 +429,9 @@ contract DeployAllTest is DeployAllFixture {
         assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "creation fee set in run 1");
         assertEq(address(factory.creationFeeToken()), i.wood, "fee paid in WOOD");
         assertEq(factory.creationFeeRecipient(), address(safe), "fee goes to the Safe");
+        assertTrue(factory.ownerOnlyProposals(), "owner-only proposals set in run 1");
+        // Pinned literally, not via RobinhoodParams, so zeroing or mistyping the constant fails here.
+        assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
 
         _primeWoodFeed(first.woodUsdFeed);
 
@@ -443,6 +446,42 @@ contract DeployAllTest is DeployAllFixture {
         _assertTwoStepPending(s, address(safe));
         script.exposed_validateAll(s, i, Checkpoint.Complete);
         assertTrue(script.stageOf(s, address(safe)) == Stage.Done, "stageOf == Done");
+    }
+
+    /// @notice Validation refuses a run-1 factory whose owner-only-proposals flag was lifted.
+    function test_mainnet_validateAllRefusesLiftedOwnerOnlyProposals() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        (Stack memory first,) = _runCeremony(Posture.Mainnet);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        vm.prank(deployer);
+        SyndicateFactory(first.core.factoryProxy).setOwnerOnlyProposals(false);
+
+        vm.expectRevert(bytes("factory.ownerOnlyProposals"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+    }
+
+    /// @notice Validation refuses a run-1 creation fee that is not 1M WOOD paid to the Safe.
+    function test_mainnet_validateAllRefusesADriftedCreationFee() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        (Stack memory first,) = _runCeremony(Posture.Mainnet);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
+        uint256 fee = RobinhoodParams.INVITE_ONLY_CREATION_FEE;
+
+        vm.prank(deployer);
+        factory.setCreationFee(i.wood, fee - 1, address(safe));
+        vm.expectRevert(bytes("factory.creationFee"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+
+        vm.prank(deployer);
+        factory.setCreationFee(i.weth, fee, address(safe));
+        vm.expectRevert(bytes("factory.creationFeeToken mismatch"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+
+        vm.prank(deployer);
+        factory.setCreationFee(i.wood, fee, deployer);
+        vm.expectRevert(bytes("factory.creationFeeRecipient mismatch"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
     }
 
     // ── Case 3: idempotency ──
