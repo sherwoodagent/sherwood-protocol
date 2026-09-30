@@ -40,6 +40,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
         cfg.setProtocolFeeRecipient(owner);
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         agentReg = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentReg)));
         uint256 nft = agentReg.mint(agent);
         ISyndicateVault.InitParams memory ip = ISyndicateVault.InitParams(
             address(usdc),
@@ -68,6 +69,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
             SyndicateGovernor(address(new ERC1967Proxy(address(new SyndicateGovernor(24 hours, 1 hours)), gInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
     }
 

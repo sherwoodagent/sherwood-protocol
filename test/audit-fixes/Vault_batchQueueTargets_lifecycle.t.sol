@@ -83,6 +83,7 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         uint256 agentNftId = agentRegistry.mint(agent);
 
@@ -136,6 +137,7 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 

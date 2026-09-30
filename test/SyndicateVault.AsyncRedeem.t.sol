@@ -45,6 +45,7 @@ contract VaultAsyncRedeemTest is Test {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(
@@ -70,6 +71,7 @@ contract VaultAsyncRedeemTest is Test {
         // Mock governor + active proposal to false by default
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         // MS-H4: vault `_deposit` reads `openProposalCount(address)` — mock to 0.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));

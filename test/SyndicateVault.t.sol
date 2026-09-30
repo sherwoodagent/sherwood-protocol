@@ -47,6 +47,7 @@ contract SyndicateVaultTest is Test {
 
         // Deploy ERC-8004 agent registry
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         // Mint ERC-8004 identity NFTs for agents
         agent1NftId = agentRegistry.mint(agentAddr);
@@ -89,6 +90,7 @@ contract SyndicateVaultTest is Test {
         // `redemptionsLocked()` fails closed on governor == address(0).
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
@@ -354,6 +356,7 @@ contract SyndicateVaultTest is Test {
         // Re-mock the factory to return address(0) as governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(0)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         vm.expectRevert(ISyndicateVault.GovernorNotSet.selector);
         vault.redemptionsLocked();
@@ -1195,6 +1198,7 @@ contract SyndicateVaultTest is Test {
         // Route the vault's `onlyGovernor` through the reentrant target.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(target)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
         vm.mockCall(

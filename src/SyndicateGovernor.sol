@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
+import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
@@ -329,6 +330,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ) external returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
+        _requireLaunchProposer(vault, coProposers.length);
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
         // Blocks new proposals while the vault has a non-terminal lifecycle bound to it
@@ -799,6 +801,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         _requireCoProposer(proposalId);
         if (!ISyndicateVault(proposal.vault).isAgent(msg.sender)) revert NotRegisteredAgent();
+        // A Draft opened before the flag went on must not reach Pending.
+        if (ISyndicateFactory(factory).ownerOnlyProposals()) revert CollaborationDisabled();
         if (coProposerApprovals[proposalId][msg.sender]) revert AlreadyApproved();
 
         coProposerApprovals[proposalId][msg.sender] = true;
@@ -1423,6 +1427,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             settlementCallCount,
             p.metadataURI
         );
+    }
+
+    /// @dev Limited launch: with the factory's `ownerOnlyProposals` on, only the vault owner
+    ///      proposes, alone. Read live, so a flip binds already-registered agents.
+    function _requireLaunchProposer(address vault, uint256 coProposerCount) internal view {
+        if (!ISyndicateFactory(factory).ownerOnlyProposals()) return;
+        if (msg.sender != ISyndicateVault(vault).owner()) revert ProposerNotOwner();
+        if (coProposerCount != 0) revert CollaborationDisabled();
     }
 
     /// @dev Verify caller is a co-proposer on the given proposal

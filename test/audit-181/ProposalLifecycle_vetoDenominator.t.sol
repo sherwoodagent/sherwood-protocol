@@ -91,6 +91,7 @@ contract ProposalLifecycleVetoDenominatorTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         agentNftId = agentRegistry.mint(agent);
 
         // ── Vault + async withdrawal queue ──
@@ -123,6 +124,7 @@ contract ProposalLifecycleVetoDenominatorTest is Test {
         // lifecycle. No open proposal at genesis.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         _setVaultProposal(0, 0, 0);
 
         // ── Real governor, bound to the SAME vault, for the veto check ──

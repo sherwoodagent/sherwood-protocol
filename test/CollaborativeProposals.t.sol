@@ -54,6 +54,7 @@ contract CollaborativeProposalsTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
 
         leadNftId = agentRegistry.mint(leadAgent);
@@ -107,6 +108,7 @@ contract CollaborativeProposalsTest is Test {
         // contract is the vault's factory, so mock the lookup.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         // Register agents
         vm.startPrank(owner);

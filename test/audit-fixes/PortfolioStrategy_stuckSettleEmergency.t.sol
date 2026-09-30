@@ -110,6 +110,7 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         uint256 agentNftId = agentRegistry.mint(agent);
 
         SyndicateVault vaultImpl = new SyndicateVault();
@@ -180,6 +181,7 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         GuardianRegistry regImpl = new GuardianRegistry(6 hours);

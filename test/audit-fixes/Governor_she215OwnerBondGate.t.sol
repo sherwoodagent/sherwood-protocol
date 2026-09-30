@@ -49,6 +49,7 @@ contract GovernorShe215OwnerBondGateTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
 
         SyndicateVault vaultImpl = new SyndicateVault();
@@ -100,6 +101,7 @@ contract GovernorShe215OwnerBondGateTest is Test {
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
         usdc.mint(lp1, 100_000e6);
