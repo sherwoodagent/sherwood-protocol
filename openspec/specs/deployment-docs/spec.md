@@ -202,7 +202,7 @@ A full one-fund lifecycle (owner stake → fund create → deposit → strategy 
 - **THEN** it trips `StalePrice`; passing `--max-price-ages 2592000` (or refreshing `updatedAt`) clears it
 
 ### Requirement: Guardian-network simulation preconditions
-To make guardian blocking real (not the cold-start bypass), total staked guardian weight at review-open SHALL exceed `MIN_COHORT_STAKE_AT_OPEN` = 50,000 WOOD — e.g. ≥6 wallets staking 10,000 WOOD each. `agentId = 0` is acceptable (identity gating is off at v1). Guardians become active at `block.timestamp`, and checkpoints are read at `t−1`, so the operator SHALL advance time by ≥1s (`evm_increaseTime 1`) between staking and opening a review.
+To make guardian blocking real (not the cold-start bypass), total staked guardian weight at review-open SHALL exceed `MIN_COHORT_STAKE_AT_OPEN` = 50,000 WOOD — e.g. ≥6 wallets staking 10,000 WOOD each. `agentId = 0` is acceptable (a guardian's `agentId` is recorded, never checked against the identity registry). Guardians become active at `block.timestamp`, and checkpoints are read at `t−1`, so the operator SHALL advance time by ≥1s (`evm_increaseTime 1`) between staking and opening a review.
 
 Clearing the cohort floor is necessary but NOT sufficient, because the two sides of the block-quorum comparison are measured differently: `cohortTooSmall` and the quorum denominator read `getPastTotalVotes`, which is RAW staked WOOD ("totals stay raw"), while a blocker's contribution reads `getPastVotes`, which applies `_ageFactorBps` on top. Fresh stake therefore counts in full against the bar it must clear and at only `ageFloorBps` (25%) toward clearing it. A cohort whose stake is all fresh cannot reach a 30% block quorum even at 100% participation — 0.25 × 60,000 = 15,000 against the 18,000 required. This asymmetry is deliberate: it denies an attacker a veto bought with stake parked seconds before the review. The operator SHALL therefore age the cohort before opening a review that is meant to be blocked, advancing time by at least `maturationPeriod × (blockQuorumBps − ageFloorBps) / (10 000 − ageFloorBps)` — 2 days at the fork's defaults (30 d, 30%, 25%) — and proportionally more when participation is partial.
 
@@ -399,11 +399,11 @@ This requirement and `script/DeployTokenCourt.s.sol` are removed TOGETHER with S
 - **THEN** `_wireCourt` reverts PRE-FLIGHT 5 — the court must not be granted ruling authority over a game whose verdicts cannot execute
 
 ### Requirement: Chain-specific factory identity configuration
-On Robinhood Chain the factory SHALL be deployed with `address(0)` for `agentRegistry` (identity gating disabled), and validation SHALL assert it reads back as zero. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663); the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`) IS live there, so the zero `agentRegistry` is a v1 product decision, not a chain constraint, and wiring it later is a factory-config change with no redeploy.
+On Robinhood Chain the factory SHALL be deployed with the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, `RobinhoodParams.AGENT_REGISTRY`) as `agentRegistry`, so `createSyndicate` requires the creator to own `creatorAgentId` and `registerAgent` requires the agent NFT to be owned by the agent or the vault owner. Validation SHALL assert it reads back as that address at both ceremony checkpoints. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663).
 
-#### Scenario: Identity disabled on Robinhood
+#### Scenario: Identity enabled on Robinhood
 - **WHEN** post-deploy validation runs on 4663 or its fork
-- **THEN** `factory.agentRegistry() == address(0)`
+- **THEN** `factory.agentRegistry() == 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`
 
 ### Requirement: Accepted oracle risks are stated in the deploy runbook
 Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period gate (`src/libraries/ChainlinkReader.sol`'s `SequencerDown`/`GracePeriodNotOver`) cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still clearing the aggregator's own publication heartbeat.

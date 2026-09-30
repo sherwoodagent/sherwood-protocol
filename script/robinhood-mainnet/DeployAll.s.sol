@@ -127,6 +127,8 @@ contract DeployAll is
         // Invite-only launch: whitelist-only across every vault; the Safe lifts it later.
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
         if (!factory.depositsRestricted()) factory.setDepositsRestricted(true);
+        // Sponsored funds are single-operator: only the vault owner proposes; the Safe lifts it later.
+        if (!factory.ownerOnlyProposals()) factory.setOwnerOnlyProposals(true);
         // Creation is sponsorship-only in practice from the first run; the Safe lowers the fee at public launch.
         if (factory.creationFee() == 0) {
             address feeTo = i.ownerMultisig != address(0) ? i.ownerMultisig : i.deployer;
@@ -450,6 +452,7 @@ contract DeployAll is
 
         _validateMainnet(s.core, deployer, handedOff ? i.ownerMultisig : address(0), i.wood);
         require(SyndicateFactory(s.core.factoryProxy).depositsRestricted(), "factory.depositsRestricted");
+        require(SyndicateFactory(s.core.factoryProxy).ownerOnlyProposals(), "factory.ownerOnlyProposals");
         require(SyndicateFactory(s.core.factoryProxy).creationFee() > 0, "factory.creationFee");
         _checkAddr("strategyFactory.owner", Ownable(s.strategyFactory).owner(), finalOwner);
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.portfolioTemplate), "template: portfolio");

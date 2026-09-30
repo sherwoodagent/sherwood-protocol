@@ -6,6 +6,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {DeployRobinhoodMainnet} from "../../script/robinhood-mainnet/Deploy.s.sol";
+import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -82,8 +83,9 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         multisig = new MockMultisig();
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
-        DeploySherwood.Config memory cfg =
-            DeploySherwood.Config({agentRegistry: address(0), managementFeeBps: 200, woodToken: address(wood)});
+        DeploySherwood.Config memory cfg = DeploySherwood.Config({
+            agentRegistry: RobinhoodParams.AGENT_REGISTRY, managementFeeBps: 200, woodToken: address(wood)
+        });
 
         // `deployCore`'s inner `c3.deploy` calls run as the harness address, so
         // prank as the harness to keep the `Create3Factory` owner consistent —
