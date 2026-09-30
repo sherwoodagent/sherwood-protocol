@@ -85,6 +85,7 @@ contract VaultSettleStampDenominatorTest is Test {
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         // No open proposal at genesis.
         _setProposal(0, 0, 0);
 

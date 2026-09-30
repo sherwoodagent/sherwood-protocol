@@ -121,6 +121,10 @@ contract SwoodReviewSlashTest is Test {
         return false;
     }
 
+    function ownerOnlyProposals() external pure returns (bool) {
+        return false;
+    }
+
     function setUp() public {
         factoryEoa = address(this);
 

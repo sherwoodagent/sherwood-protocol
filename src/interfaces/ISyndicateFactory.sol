@@ -22,6 +22,7 @@ interface ISyndicateFactory {
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     event WiringPushed(address indexed governor);
     event DepositsRestrictedUpdated(bool restricted);
+    event OwnerOnlyProposalsUpdated(bool enabled);
     event CreationSponsored(address indexed creator, bool sponsored);
 
     /// @notice Emitted by `setExecutorImpl` — the shared `BatchExecutorLib`
@@ -57,6 +58,8 @@ interface ISyndicateFactory {
     function isFactoryGovernor(address governor) external view returns (bool);
     /// @notice While true, every vault takes deposits from approved depositors only.
     function depositsRestricted() external view returns (bool);
+    /// @notice While true, only each vault's owner may propose, and never with co-proposers.
+    function ownerOnlyProposals() external view returns (bool);
     /// @notice Whether `creator`'s next `createSyndicate` skips the creation fee.
     function creationSponsored(address creator) external view returns (bool);
 
@@ -67,6 +70,7 @@ interface ISyndicateFactory {
     function setExposureLedger(address newLedger) external;
     function setBondEscrow(address newEscrow) external;
     function setDepositsRestricted(bool restricted) external;
+    function setOwnerOnlyProposals(bool enabled) external;
     function setCreationSponsored(address creator, bool sponsored) external;
     /// @notice Push the factory's current tierRegistry / exposureLedger / bondEscrow
     ///         into an EXISTING factory-deployed governor.

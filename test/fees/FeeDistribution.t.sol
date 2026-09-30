@@ -100,6 +100,7 @@ contract FeeDistributionTest is Test {
         governor = SyndicateGovernor(address(new BeaconProxy(address(beacon), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         usdc.mint(lp1, 100_000_000e6);
         vm.startPrank(lp1);
@@ -391,6 +392,7 @@ contract FeeDistributionTest is Test {
         vm.clearMockedCalls();
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         vm.prank(guardianRecipient);
         governor.claimUnclaimedFees(address(vault), address(usdc));

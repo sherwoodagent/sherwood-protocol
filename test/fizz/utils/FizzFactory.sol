@@ -45,6 +45,11 @@ contract FizzFactory {
         return false;
     }
 
+    /// @notice The factory-wide owner-only-proposals flag the governor reads; never set here.
+    function ownerOnlyProposals() external pure returns (bool) {
+        return false;
+    }
+
     /// @notice Forward an arbitrary call so factory-gated setters
     ///         (`setWithdrawalQueue`, `SyndicateGovernor.set*`,
     ///         `GuardianRegistry.addGovernor`) run with this contract as

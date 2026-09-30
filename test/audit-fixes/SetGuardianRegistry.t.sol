@@ -56,6 +56,7 @@ contract SetGuardianRegistryTest is Test {
         // (this test contract). Mock governorOf(vault) -> the deployed governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         // Factory proxy (wired with governor + initial registry)
         BatchExecutorLib executorLib = new BatchExecutorLib();

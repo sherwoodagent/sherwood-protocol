@@ -238,6 +238,7 @@ contract SlashGasCeilingTest is Test {
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(gov))
         );
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         // Hoisted: a cheatcode in argument position is consumed by the inner
         // call — `agentRegistry.mint` would eat the prank before `registerAgent`.
         uint256 agentId = agentRegistry.mint(agent);

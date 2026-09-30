@@ -165,6 +165,7 @@ contract StructuralBatchRulesTest is Test {
         // The test contract is the syndicate factory.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(address(this), abi.encodeWithSignature("vaultToSyndicate(address)"), abi.encode(uint256(1)));
         strategyFactory = new StrategyFactory(address(this), address(this));
         tierRegistry.setStrategyFactory(address(strategyFactory));

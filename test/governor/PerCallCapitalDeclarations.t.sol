@@ -93,6 +93,7 @@ contract PerCallCapitalDeclarationsTest is Test {
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(agent), agent);
