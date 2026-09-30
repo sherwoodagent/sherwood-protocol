@@ -14,8 +14,8 @@ no ENS/Durin registrar, and no sequencer-uptime feed. The canonical ERC-8004
 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, same address as
 Base) and EAS v1.4.0 (`chains/4663.json` → `EAS`, `EAS_SCHEMA_REGISTRY`, deployed
 by `DeployEAS` + `SeedAttestations` in #278) are both live. The v1 factory has no ENS
-registrar and takes `address(0)` for `agentRegistry` — a deploy decision
-(identity gating off), not a chain limit. EAS is not part of this ceremony.
+registrar and takes the IdentityRegistry as `agentRegistry` (identity gating on:
+creators and agents need an ERC-8004 identity). EAS is not part of this ceremony.
 
 ---
 
@@ -169,6 +169,16 @@ Not one-time steps. Nothing below is enforced on-chain.
   ```bash
   forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
   ```
+
+- **Incident: the ERC-8004 registry breaks.** It is a third-party UUPS proxy
+  whose owner is an outside EOA. If `ownerOf` starts reverting, then
+  `createSyndicate` and every vault's `registerAgent` revert with it. The Safe
+  calls `SyndicateFactory.setAgentRegistry(address(0))`. That turns identity
+  gating off for creation and for every existing vault at once. Proposing and
+  already-registered agents are unaffected. Point it back with
+  `setAgentRegistry(0x8004A169FB4a3325136EB29fA0ceB6D2e539a432)` once the
+  registry is healthy, and expect `verify-robinhood.sh` to flag the registry
+  check while it is zero.
 
 ## 5. Accepted oracle risks (v1)
 

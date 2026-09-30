@@ -334,6 +334,10 @@ interface ISyndicateGovernor {
     /// @notice The vault's owner-stake slot is unbound, exiting, claimed or
     ///         slashed, so nothing is slashable behind the proposal lane.
     error OwnerBondNotLive();
+    /// @notice The factory's `ownerOnlyProposals` is on and the proposer is not the vault owner.
+    error ProposerNotOwner();
+    /// @notice The factory's `ownerOnlyProposals` is on, which refuses collaborative proposals.
+    error CollaborationDisabled();
 
     // ── Guardian-review emergency settle errors ──
     error OwnerBondInsufficient();

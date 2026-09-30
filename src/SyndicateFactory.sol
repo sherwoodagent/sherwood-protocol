@@ -186,6 +186,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         from its approved depositors only, whatever its own `openDeposits`.
     bool public depositsRestricted;
 
+    /// @notice Limited launch: while true only each vault's owner may propose, never collaboratively.
+    bool public ownerOnlyProposals;
+
     /// @notice Single-use creation-fee waiver granted by the owner to `creator`.
     mapping(address creator => bool) public creationSponsored;
 
@@ -206,6 +209,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event VaultUpgraded(address indexed vault, address indexed newImpl);
     event UpgradesEnabledUpdated(bool enabled);
     event DepositsRestrictedUpdated(bool restricted);
+    event OwnerOnlyProposalsUpdated(bool enabled);
+    event AgentRegistryUpdated(address oldRegistry, address newRegistry);
     event CreationSponsored(address indexed creator, bool sponsored);
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
@@ -477,6 +482,19 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     function setDepositsRestricted(bool restricted) external onlyOwner {
         depositsRestricted = restricted;
         emit DepositsRestrictedUpdated(restricted);
+    }
+
+    /// @notice Restrict every governor's `propose` to the vault owner, or lift it (owner only).
+    function setOwnerOnlyProposals(bool enabled) external onlyOwner {
+        ownerOnlyProposals = enabled;
+        emit OwnerOnlyProposalsUpdated(enabled);
+    }
+
+    /// @notice Re-point ERC-8004 identity gating for `createSyndicate` and every vault's
+    ///         `registerAgent`; zero turns it off, e.g. if the registry breaks (owner only).
+    function setAgentRegistry(address newRegistry) external onlyOwner {
+        emit AgentRegistryUpdated(address(agentRegistry), newRegistry);
+        agentRegistry = IERC721(newRegistry);
     }
 
     /// @notice Waive the creation fee for `creator`'s next `createSyndicate`, or revoke it (owner only).

@@ -33,6 +33,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         gov = new MockGovernorMinimal();
         vm.mockCall(factory, abi.encodeWithSignature("governorOf(address)"), abi.encode(address(gov)));
         vm.mockCall(factory, abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(factory, abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         StakedWood impl = new StakedWood();
         bytes memory initData = abi.encodeCall(

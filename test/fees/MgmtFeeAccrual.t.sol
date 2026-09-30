@@ -41,6 +41,7 @@ contract MgmtFeeAccrualTest is Test {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(
@@ -62,6 +63,7 @@ contract MgmtFeeAccrualTest is Test {
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         _setLocked(false);
 
         usdc.mint(alice, 10_000_000e6);

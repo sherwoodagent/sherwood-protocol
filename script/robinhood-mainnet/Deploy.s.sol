@@ -7,15 +7,15 @@ import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {DeploySherwood} from "../Deploy.s.sol";
+import {RobinhoodParams} from "./RobinhoodParams.sol";
 
 /// @notice The Robinhood-specific half of the core ceremony: the owner-gated writes that only the
 ///         deployer can make, and the post-deploy validation table. `DeployAll._handoffAll` owns
 ///         the handoff itself — this mixin no longer carries one.
 ///         An abstract mixin — `DeployAll` owns `run()`, the broadcast and the address book.
 ///
-///         Robinhood Chain is an Arbitrum Orbit L2 with no ENS registrar. The canonical ERC-8004
-///         IdentityRegistry is live on 4663, but v1 ships with identity gating OFF, so the factory
-///         is deployed with address(0) for both registrars.
+///         Robinhood Chain is an Arbitrum Orbit L2 with no ENS registrar. Identity gating is ON:
+///         the factory takes the canonical ERC-8004 IdentityRegistry (`RobinhoodParams.AGENT_REGISTRY`).
 abstract contract DeployRobinhoodMainnet is DeploySherwood {
     /// @notice Every `onlyOwner` write the deployer must make before `DeployAll._handoffAll` moves
     ///         the owner. Grouped so the set can be asserted as a set.
@@ -71,7 +71,7 @@ abstract contract DeployRobinhoodMainnet is DeploySherwood {
         // `createSyndicate`. Plan B's `TIER2_CALL_CAP_BPS` is a PRINTED policy figure for the
         // vault owner (`setTier2CallCapBps` is `onlyVaultOwner`); `CheckSyndicateParams` is the gate.
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
-        _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
+        _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY);
 
         _checkAddr("swood.wood", address(StakedWood(d.swoodProxy).wood()), wood);
         _checkAddr("swood.registry", StakedWood(d.swoodProxy).registry(), d.registryProxy);
