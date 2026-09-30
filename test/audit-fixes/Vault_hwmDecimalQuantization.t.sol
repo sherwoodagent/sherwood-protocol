@@ -45,6 +45,7 @@ contract VaultHwmDecimalQuantizationTest is Test {
         weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(

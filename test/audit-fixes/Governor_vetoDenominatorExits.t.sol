@@ -40,6 +40,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
         cfg.setProtocolFeeRecipient(owner);
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         agentReg = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentReg)));
         uint256 nft = agentReg.mint(agent);
         ISyndicateVault.InitParams memory ip = ISyndicateVault.InitParams(
             address(usdc),

@@ -210,6 +210,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event UpgradesEnabledUpdated(bool enabled);
     event DepositsRestrictedUpdated(bool restricted);
     event OwnerOnlyProposalsUpdated(bool enabled);
+    event AgentRegistryUpdated(address oldRegistry, address newRegistry);
     event CreationSponsored(address indexed creator, bool sponsored);
     event OwnerRotated(address indexed vault, address indexed newOwner);
     event WithdrawalQueueDeployed(address indexed vault, address indexed queue);
@@ -487,6 +488,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     function setOwnerOnlyProposals(bool enabled) external onlyOwner {
         ownerOnlyProposals = enabled;
         emit OwnerOnlyProposalsUpdated(enabled);
+    }
+
+    /// @notice Re-point ERC-8004 identity gating for `createSyndicate` and every vault's
+    ///         `registerAgent`; zero turns it off, e.g. if the registry breaks (owner only).
+    function setAgentRegistry(address newRegistry) external onlyOwner {
+        emit AgentRegistryUpdated(address(agentRegistry), newRegistry);
+        agentRegistry = IERC721(newRegistry);
     }
 
     /// @notice Waive the creation fee for `creator`'s next `createSyndicate`, or revoke it (owner only).

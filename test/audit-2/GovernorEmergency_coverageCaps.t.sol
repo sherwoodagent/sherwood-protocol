@@ -109,6 +109,7 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistryMock = new MockRegistryMinimal();
 
         // ── Ledger: $0.05 WOOD (via the feed), $1.00 USDG feed, generous cap.
@@ -394,6 +395,7 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         agentNftId = agentRegistry.mint(agent);
 
         SyndicateVault vaultImpl = new SyndicateVault();

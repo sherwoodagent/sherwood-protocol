@@ -25,10 +25,17 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 contract FizzFactory {
     mapping(address vault => address governor) private _governorOf;
 
+    /// @notice The identity registry every vault's `registerAgent` reads live.
+    address public agentRegistry;
+
     /// @notice Deploy an ERC-1967 proxy from this contract's context so the
     ///         callee records `msg.sender == address(this)` as its factory.
     function deployProxy(address impl, bytes calldata initData) external returns (address) {
         return address(new ERC1967Proxy(impl, initData));
+    }
+
+    function setAgentRegistry(address registry) external {
+        agentRegistry = registry;
     }
 
     function setGovernor(address vault, address governor) external {

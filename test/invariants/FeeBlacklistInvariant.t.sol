@@ -72,6 +72,7 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
         usdc = new BlacklistingERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         agentNftId = agentRegistry.mint(agent);
         coAgentNftId = agentRegistry.mint(coAgent);

@@ -237,6 +237,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         tierRegistry = new TierRegistry(address(this));
         tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
         fizzFactory = new FizzFactory();
+        fizzFactory.setAgentRegistry(address(agentRegistry));
         adapter = new FizzAdapter();
 
         // $1.00, 8-decimal asset feed.

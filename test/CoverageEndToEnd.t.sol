@@ -164,6 +164,7 @@ contract CoverageEndToEndTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         protocolConfig = new ProtocolConfig(owner);
         adapter = new NoopAdapter();
         tierRegistry = new TierRegistry(address(this));

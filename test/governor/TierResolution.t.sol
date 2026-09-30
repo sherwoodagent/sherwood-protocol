@@ -47,6 +47,7 @@ contract TierResolutionTest is Test {
         mockAdapter = new ERC20Mock("Adapter", "ADP", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
         tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));

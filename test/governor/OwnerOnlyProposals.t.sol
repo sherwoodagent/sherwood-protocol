@@ -38,6 +38,7 @@ contract OwnerOnlyProposalsTest is Test {
     function setUp() public {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
@@ -194,6 +195,7 @@ contract OwnerOnlyProposalsFactoryTest is Test {
     function setUp() public {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         GovernorBeacon beacon = new GovernorBeacon(address(new SyndicateGovernor(24 hours, 1 hours)), owner);
         bytes memory init = abi.encodeCall(
             SyndicateFactory.initialize,

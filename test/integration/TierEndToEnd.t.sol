@@ -75,6 +75,7 @@ contract TierEndToEndTest is Test {
         adapter = new MockDeployAdapter();
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
         tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));

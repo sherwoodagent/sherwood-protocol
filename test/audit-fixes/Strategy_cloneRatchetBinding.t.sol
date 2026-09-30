@@ -132,6 +132,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         uint256 agentNftId = agentRegistry.mint(agent);
 
@@ -504,6 +505,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         ERC20Mock usdc = new ERC20Mock("USD Coin", "USDC", 6);
         BatchExecutorLib executorLib = new BatchExecutorLib();
         MockAgentRegistry agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         MockRegistryMinimal guardianRegistry = new MockRegistryMinimal();
         uint256 agentNftId = agentRegistry.mint(agent);
 

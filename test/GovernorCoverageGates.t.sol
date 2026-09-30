@@ -201,6 +201,7 @@ contract GovernorCoverageGatesTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
 
         // ── Ledger: $0.05 WOOD, $1.00 USDG feed, generous cap, default bps 100.

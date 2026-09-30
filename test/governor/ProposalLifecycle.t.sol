@@ -100,6 +100,7 @@ contract ProposalLifecycleTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         agentNftId = agentRegistry.mint(agent);
         coAgentNftId = agentRegistry.mint(coAgent);
 

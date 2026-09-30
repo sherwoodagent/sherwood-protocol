@@ -37,6 +37,7 @@ contract GovernorProposeCooldownTest is Test {
         cfg.setProtocolFeeRecipient(owner);
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         MockAgentRegistry reg = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(reg)));
         uint256 nft = reg.mint(agent);
         ISyndicateVault.InitParams memory ip = ISyndicateVault.InitParams(
             address(usdc), "Sherwood Vault", "swUSDC", owner, address(new BatchExecutorLib()), true, address(reg), 0

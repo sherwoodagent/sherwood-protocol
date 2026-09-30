@@ -47,6 +47,7 @@ contract SyndicateVaultTest is Test {
 
         // Deploy ERC-8004 agent registry
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         // Mint ERC-8004 identity NFTs for agents
         agent1NftId = agentRegistry.mint(agentAddr);

@@ -291,6 +291,10 @@ Every per-vault governor SHALL be deployed as a `BeaconProxy` reading its implem
 - **WHEN** `config.subdomain` already maps to an existing syndicate
 - **THEN** the call SHALL revert with `SubdomainTaken`
 
+#### Scenario: Agent registry re-pointed or disabled
+- **WHEN** the factory owner calls `setAgentRegistry(newRegistry)`
+- **THEN** `AgentRegistryUpdated(old, new)` SHALL be emitted and both `createSyndicate` and every factory vault's `registerAgent` SHALL check identity against `newRegistry` from then on, skipping the check when it is zero; any other caller SHALL revert
+
 #### Scenario: Factory launch flags
 - **WHEN** the factory owner calls `setDepositsRestricted(bool)` or `setOwnerOnlyProposals(bool)`
 - **THEN** the flag SHALL be stored and `DepositsRestrictedUpdated` / `OwnerOnlyProposalsUpdated` emitted, both flags SHALL apply to every syndicate the factory created, and any other caller SHALL revert

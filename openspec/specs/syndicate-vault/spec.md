@@ -322,11 +322,15 @@ The vault SHALL expose an initialization-time `managementFeeBps` and an owner-se
 - **THEN** `agentFeeBps()` returns 0, not the 5% default
 
 ### Requirement: Agent registration and removal
-The owner SHALL manage the registered-agent set: `registerAgent(agentId, agentAddress)` SHALL reject the zero address, an already-active agent (`AgentAlreadyRegistered`), and any registration that would exceed `MAX_AGENTS_PER_VAULT` (32; `AgentCapExceeded`). When an ERC-8004 agent registry is configured, the `agentId` NFT SHALL be owned by the agent address or the vault owner at registration time (`NotAgentOwner` otherwise); ownership is checked at registration only — later NFT transfers do not revoke vault privileges until `removeAgent`. `removeAgent` SHALL fully delete the agent's config (`AgentNotActive` if inactive) so stale entries cannot be reused. Membership SHALL be readable via `isAgent`, `getAgentCount`, and paginated `agentsPaginated`.
+The owner SHALL manage the registered-agent set: `registerAgent(agentId, agentAddress)` SHALL reject the zero address, an already-active agent (`AgentAlreadyRegistered`), and any registration that would exceed `MAX_AGENTS_PER_VAULT` (32; `AgentCapExceeded`). The registry SHALL be the factory's current `agentRegistry()`, read live at each registration (the vault's init-time snapshot is not consulted), so a factory re-point or disable applies to existing vaults. When that registry is non-zero, the `agentId` NFT SHALL be owned by the agent address or the vault owner at registration time (`NotAgentOwner` otherwise); ownership is checked at registration only — later NFT transfers do not revoke vault privileges until `removeAgent`. `removeAgent` SHALL fully delete the agent's config (`AgentNotActive` if inactive) so stale entries cannot be reused. Membership SHALL be readable via `isAgent`, `getAgentCount`, and paginated `agentsPaginated`.
 
 #### Scenario: Registration on a registry-less chain
-- **WHEN** the vault was initialized with a zero agent registry
+- **WHEN** the factory's `agentRegistry()` is zero
 - **THEN** `registerAgent` skips the NFT-ownership check
+
+#### Scenario: Registration follows the factory's current registry
+- **WHEN** the factory owner re-points `agentRegistry` after a vault was created
+- **THEN** that vault's next `registerAgent` checks NFT ownership against the new registry, not the one it was initialized with
 
 #### Scenario: Agent cap enforced
 - **WHEN** 32 agents are registered and a 33rd registration is attempted

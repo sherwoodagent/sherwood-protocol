@@ -76,6 +76,7 @@ contract Governor_settlementOrdering_Test is Test {
         hookedAsset = new HookedAsset("Hooked Stable", "hUSD", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
 
         SyndicateVault vaultImpl = new SyndicateVault();

@@ -65,6 +65,7 @@ contract SyndicateGovernorIntegrationTest is Test {
         comptroller = new MockComptroller();
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         agentNftId = agentRegistry.mint(agent);
 
