@@ -118,6 +118,12 @@ check "factory.tierRegistry"          "$(call "$FACTORY" 'tierRegistry()(address
 check "factory.guardianRegistry"      "$(call "$FACTORY" 'guardianRegistry()(address)')" "$REGISTRY"
 # Identity gating is ON: the canonical ERC-8004 IdentityRegistry on 4663.
 check "factory.agentRegistry (ERC-8004)" "$(call "$FACTORY" 'agentRegistry()(address)')" "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
+# Limited-launch posture, set in run 1. These fail once the Safe opens the launch — update them then.
+check "factory.depositsRestricted"    "$(call "$FACTORY" 'depositsRestricted()(bool)')"  "true"
+check "factory.ownerOnlyProposals"    "$(call "$FACTORY" 'ownerOnlyProposals()(bool)')"  "true"
+check "factory.creationFee == 1M WOOD" "$(call "$FACTORY" 'creationFee()(uint256)')"     "1000000000000000000000000"
+check "factory.creationFeeToken == WOOD" "$(call "$FACTORY" 'creationFeeToken()(address)')" "$WOOD"
+check "factory.creationFeeRecipient"  "$(call "$FACTORY" 'creationFeeRecipient()(address)')" "$FINAL"
 # A beacon serving address(0) mints governors that are pure fallback.
 BIMPL=$(call "$BEACON" 'implementation()(address)')
 if [ "$BIMPL" != "$ZERO" ] && [ -n "$BIMPL" ]; then

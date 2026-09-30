@@ -460,6 +460,30 @@ contract DeployAllTest is DeployAllFixture {
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
     }
 
+    /// @notice Validation refuses a run-1 creation fee that is not 1M WOOD paid to the Safe.
+    function test_mainnet_validateAllRefusesADriftedCreationFee() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        (Stack memory first,) = _runCeremony(Posture.Mainnet);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
+        uint256 fee = RobinhoodParams.INVITE_ONLY_CREATION_FEE;
+
+        vm.prank(deployer);
+        factory.setCreationFee(i.wood, fee - 1, address(safe));
+        vm.expectRevert(bytes("factory.creationFee"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+
+        vm.prank(deployer);
+        factory.setCreationFee(i.weth, fee, address(safe));
+        vm.expectRevert(bytes("factory.creationFeeToken mismatch"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+
+        vm.prank(deployer);
+        factory.setCreationFee(i.wood, fee, deployer);
+        vm.expectRevert(bytes("factory.creationFeeRecipient mismatch"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+    }
+
     // ── Case 3: idempotency ──
 
     /// @notice A resumed run mints nothing, writes nothing and returns the same table.

@@ -451,9 +451,17 @@ contract DeployAll is
         address finalOwner = handedOff ? i.ownerMultisig : deployer;
 
         _validateMainnet(s.core, deployer, handedOff ? i.ownerMultisig : address(0), i.wood);
-        require(SyndicateFactory(s.core.factoryProxy).depositsRestricted(), "factory.depositsRestricted");
-        require(SyndicateFactory(s.core.factoryProxy).ownerOnlyProposals(), "factory.ownerOnlyProposals");
-        require(SyndicateFactory(s.core.factoryProxy).creationFee() > 0, "factory.creationFee");
+        // Limited-launch posture: the same set script/verify-robinhood.sh pins.
+        SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
+        require(factory.depositsRestricted(), "factory.depositsRestricted");
+        require(factory.ownerOnlyProposals(), "factory.ownerOnlyProposals");
+        require(factory.creationFee() == RobinhoodParams.INVITE_ONLY_CREATION_FEE, "factory.creationFee");
+        _checkAddr("factory.creationFeeToken", address(factory.creationFeeToken()), i.wood);
+        _checkAddr(
+            "factory.creationFeeRecipient",
+            factory.creationFeeRecipient(),
+            i.ownerMultisig != address(0) ? i.ownerMultisig : i.deployer
+        );
         _checkAddr("strategyFactory.owner", Ownable(s.strategyFactory).owner(), finalOwner);
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.portfolioTemplate), "template: portfolio");
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.morphoSupplyTemplate), "template: morpho");

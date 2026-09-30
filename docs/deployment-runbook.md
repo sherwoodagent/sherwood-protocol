@@ -176,6 +176,16 @@ Not one-time steps. Nothing below is enforced on-chain.
   forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
   ```
 
+- **Incident: the ERC-8004 registry breaks.** It is a third-party UUPS proxy
+  whose owner is an outside EOA. If `ownerOf` starts reverting, then
+  `createSyndicate` and every vault's `registerAgent` revert with it. The Safe
+  calls `SyndicateFactory.setAgentRegistry(address(0))`. That turns identity
+  gating off for creation and for every existing vault at once. Proposing and
+  already-registered agents are unaffected. Point it back with
+  `setAgentRegistry(0x8004A169FB4a3325136EB29fA0ceB6D2e539a432)` once the
+  registry is healthy, and expect `verify-robinhood.sh` to flag the registry
+  check while it is zero.
+
 ## 5. Accepted oracle risks (v1)
 
 Stated here because an operator has to see them, not only the source natspec.

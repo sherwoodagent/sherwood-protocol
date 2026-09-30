@@ -399,7 +399,7 @@ This requirement and `script/DeployTokenCourt.s.sol` are removed TOGETHER with S
 - **THEN** `_wireCourt` reverts PRE-FLIGHT 5 — the court must not be granted ruling authority over a game whose verdicts cannot execute
 
 ### Requirement: Chain-specific factory identity configuration
-On Robinhood Chain the factory SHALL be deployed with the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, `RobinhoodParams.AGENT_REGISTRY`) as `agentRegistry`, so `createSyndicate` requires the creator to own `creatorAgentId` and `registerAgent` requires the agent NFT to be owned by the agent or the vault owner. Validation SHALL assert it reads back as that address at both ceremony checkpoints. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663).
+On Robinhood Chain the factory SHALL be deployed with the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, `RobinhoodParams.AGENT_REGISTRY`) as `agentRegistry`, so `createSyndicate` requires the creator to own `creatorAgentId` and `registerAgent` requires the agent NFT to be owned by the agent or the vault owner. Validation SHALL assert it reads back as that address at both ceremony checkpoints. Because the registry is a third-party upgradeable contract, it is a liveness dependency: if it breaks, the owner Safe SHALL call `setAgentRegistry(address(0))`, which turns identity gating off for creation and for every existing vault's `registerAgent` without a redeploy. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663).
 
 #### Scenario: Identity enabled on Robinhood
 - **WHEN** post-deploy validation runs on 4663 or its fork
