@@ -145,6 +145,9 @@ Also publish the new addresses (handbook item 94): `sherwood/cli/src/lib/address
 
 Not one-time steps. Nothing below is enforced on-chain.
 
+- **Upgrading a live v1 deployment to `post-audit-v2`:** follow
+  [`upgrade-v1-to-v2-runbook.md`](upgrade-v1-to-v2-runbook.md), not this ceremony.
+
 - **Keep `woodUsdPriceX8` above market.** It is a manipulation cap, never a
   price — seeded at or below market it binds permanently and pins every bond.
   Review monthly; lowering it is the emergency brake and is not rate-limited
