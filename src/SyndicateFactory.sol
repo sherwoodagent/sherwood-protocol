@@ -652,9 +652,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         IGuardianRegistry reg = IGuardianRegistry(guardianRegistry);
         // Registry exposes no `hasOwnerStake` view; inline the equivalent check.
         if (reg.ownerStake(vault) > 0) revert VaultStillStaked();
-        ISyndicateGovernor gov = ISyndicateGovernor(_governorOf[vault]);
-        if (gov.getActiveProposal() != 0) revert ProposalActive();
-        if (gov.openProposalCount() != 0) revert ProposalsOpen();
+        // Same-owner rotation is a re-bond (e.g. after a blocked emergency round), allowed mid-proposal.
+        if (newOwner != currentOwner) {
+            ISyndicateGovernor gov = ISyndicateGovernor(_governorOf[vault]);
+            if (gov.getActiveProposal() != 0) revert ProposalActive();
+            if (gov.openProposalCount() != 0) revert ProposalsOpen();
+        }
 
         SyndicateVault(payable(vault)).rotateOwnership(newOwner);
         // Owner-stake slot lives on sWOOD.
