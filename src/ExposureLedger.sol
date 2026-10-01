@@ -594,6 +594,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      guardian backs is still fully covered by what remains. That is the
     ///      containment property, and it holds with no pro-rata bookkeeping
     ///      because nothing is ever shared — each lock is its own collateral.
+    ///      It holds only while every lock is at least `minSlashBps` of stake:
+    ///      below that, sWOOD's floored burn exceeds the lock.
     ///
     ///      ANY `k > 1` IS DELIBERATE LEVERAGE THAT TRADES EXACTLY THAT AWAY. A
     ///      guardian may then lock more WOOD across proposals than it holds, and

@@ -312,6 +312,12 @@ Anti-griefing details:
   released or zero lock owes nothing and is skipped.
 - The slash transaction carries a gas floor (`180 000 × approvers + 2 000 000`) so an
   under-gassed caller cannot burn a verdict.
+- **Sibling challenges must be referred.** When several challenges share one
+  completed counter-bond pool, only the one that completed it reaches the court.
+  If that one is ruled Guilty, each sibling must still be `refer`red before its
+  referral clock runs out (day 24 after filing at shipped parameters), or at
+  `disputeTimeout` it forfeits its bond to the pool, i.e. to the convicted
+  guardians. A referral nobody votes on ends Inconclusive and refunds it.
 
 ## TokenCourt — adjudication
 

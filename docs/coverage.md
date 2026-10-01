@@ -61,8 +61,12 @@ settlement past the horizon also revert. The registry's approver push unwinds
 with the revert, so no slot is held without a lock behind it.
 
 `releaseApproval` unwinds Approve → Block (`CoverageFrozen` while a challenge
-is live); `retireApproval` clears a lock once its proposal is past
-challengeability. The execute-time quorum reads the ledger's own `_approversOf`
+is live). `retireApproval` clears a lock only once its epoch bucket expires
+(`epochGenesis + (epoch + 1)·epochLength + challengeWindow`), whether or not the
+proposal executed. A lock on a cancelled or expired proposal is therefore
+retained (23–74 days at shipped parameters for a 7- to 30-day strategy) and gates the guardian's unstake
+meanwhile; it carries no slash risk, since an unexecuted proposal cannot be
+challenged. The execute-time quorum reads the ledger's own `_approversOf`
 list, never the registry.
 
 ## Declared coverage locks
@@ -93,7 +97,10 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   starve nor inflate a guardian's budget.
 - **`kNumerator = 1` contains a conviction.** At the default, `Σ locks ≤ stake`,
   so burning proposal A's lock leaves `stake − lock_A ≥ Σ other locks`: every
-  other proposal the guardian backs stays fully covered. Any `k > 1` is
+  other proposal the guardian backs stays fully covered — while every lock is
+  at least `minSlashBps` of stake. Below that the floored burn exceeds the lock
+  and the other locks are short by the difference (at most `minSlashBps` of one
+  convicted guardian's stake). Any `k > 1` is
   deliberate leverage that gives exactly that property up — a guardian may lock
   more across proposals than they hold, and one conviction may leave the others
   under-covered by the excess. The adversary is an operator raising `k` for
