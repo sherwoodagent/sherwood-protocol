@@ -2,6 +2,7 @@
 
 - [x] 1.1 `AssetCallRules.spenderOf` admits only `transfer`, `transferFrom` from the vault and the approve family; other selectors revert `UnrecognizedAssetSelector`.
 - [x] 1.2 `ISyndicateVault.UnrecognizedAssetSelector(bytes4)`.
+- [x] 1.4 `structural-batch-rules` asset requirement amended in place (no dangling MODIFIED).
 - [x] 1.3 Regression test `test/audit-fixes/AssetCallRules_v101UnrecognizedSelector.t.sol`; `StructuralBatchRules.t.sol` tests that pinned the open rule changed direction.
 
 ## 2. Morpho market counterparties (V1-04)
@@ -13,5 +14,5 @@
 ## 3. CL venue binding and rerange floor (V1-07, V2-03)
 
 - [x] 3.1 `positionManager.factory() == uniswapFactory` at init.
-- [x] 3.2 `halfWidthTicks × triggerBps >= 10_000` at init.
-- [x] 3.3 Regression tests `test/audit-fixes/CLStrategy_v107PmFactoryBinding.t.sol`, `test/audit-fixes/CLStrategy_v203RerangeTriggerFloor.t.sol`; fork-test policies updated.
+- [x] 3.2 Rerange trigger threshold floored at one tick spacing in `_requireTriggerReached`.
+- [x] 3.3 Regression tests `test/audit-fixes/CLStrategy_v107PmFactoryBinding.t.sol`, `test/audit-fixes/CLStrategy_v203RerangeTriggerFloor.t.sol`; fork-test first reranges given at least one spacing of TWAP travel.

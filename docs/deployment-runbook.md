@@ -176,6 +176,19 @@ Not one-time steps. Nothing below is enforced on-chain.
   forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
   ```
 
+- **Allowlisting a Morpho market before a strategy uses it.** Before a
+  `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy` clone is
+  initialised, the `TierRegistry` owner calls `setCounterpartyAllowed(<oracle>, true)`
+  for that market's oracle. For the supply strategy, it also calls it for the
+  market's collateral token, unless that token is the vault asset. Otherwise
+  clone-init reverts `CounterpartyNotAllowed`. Execute re-checks both; settle
+  does not. Never allowlist `address(0)`, so a market with
+  `oracle == address(0)` stays refused. The known 4663 USDG market
+  (id `0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114`)
+  needs:
+  - oracle `0xe694c531F65c4BaBc88A52d7178476e095e51574`
+  - collateral `0xde770c84FE66E063336b31737cFE9790f18c4087`
+
 - **Incident: the ERC-8004 registry breaks.** It is a third-party UUPS proxy
   whose owner is an outside EOA. If `ownerOf` starts reverting, then
   `createSyndicate` and every vault's `registerAgent` revert with it. The Safe

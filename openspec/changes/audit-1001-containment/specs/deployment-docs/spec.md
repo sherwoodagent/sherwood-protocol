@@ -2,7 +2,7 @@
 
 ### Requirement: Each Morpho market's oracle and collateral are counterparty-allowlisted before its proposal
 
-Morpho Blue market creation is permissionless for any oracle and collateral token, so the market a strategy clone names is only as sound as the oracle that prices it. `ConcentratedLiquidityStrategy._initialize` SHALL bind `marketParams.oracle` through `isCounterpartyAllowed` and re-check it at `execute()` and `rerange()`. `MorphoSupplyStrategy._initialize` SHALL bind `marketParams.oracle`, and `marketParams.collateralToken` unless it equals the vault asset, and re-check both at `execute()`. A no-collateral market (`oracle == address(0)`) SHALL be refused like any other unlisted oracle.
+Morpho Blue market creation is permissionless for any oracle and collateral token, so the market a strategy clone names is only as sound as the oracle that prices it. `ConcentratedLiquidityStrategy._initialize` SHALL bind `marketParams.oracle` through `isCounterpartyAllowed` and re-check it at `execute()` and `rerange()`. `MorphoSupplyStrategy._initialize` SHALL bind `marketParams.oracle`, and `marketParams.collateralToken` unless it equals the vault asset, and re-check both at `execute()`. A market with `oracle == address(0)` SHALL be refused, and the registry owner SHALL NOT allowlist `address(0)`.
 
 This is a PER-PROPOSAL obligation, not a ceremony step: the market is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setCounterpartyAllowed(<oracle>, true)` (and, for the supply strategy, `setCounterpartyAllowed(<collateral>, true)`) for each market a proposal is expected to use, before clone-init. Settle paths are NOT gated on it, so a demotion cannot strand the funds it is meant to protect.
 
