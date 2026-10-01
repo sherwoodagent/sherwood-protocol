@@ -39,3 +39,5 @@ None.
 - `script/Deploy.s.sol`, `script/DeployPlanB.s.sol`, `script/robinhood-mainnet/*.s.sol` — ceremony text and seeding.
 - Tests: `SelectorGuard`, `CalleeGate`, `Vault_assetSelectorGuard`, the registry allowlist suites and every fixture calling `setAdapterAllowed` are deleted or re-pinned; new `test/vault/StructuralBatchRules.t.sol`.
 - Storage: `SyndicateVault` and `SyndicateGovernor` layouts unchanged (only constants and functions are deleted). `TierRegistry` is constructor-deployed, not golden-guarded.
+
+> **Note (2026-10-01):** the tier-policy main spec was corrected directly to match the code (PR #367), so this change's tier-policy delta no longer ADDs the counterparty requirement or REMOVEs the allowlist and callee-axis requirements: both are already reflected there.

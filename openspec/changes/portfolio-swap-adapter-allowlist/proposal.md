@@ -117,3 +117,5 @@ mid-flight demotion into stranded LP capital.
   adapter-onboarding runbook.
 
 Closes #147.
+
+> **Note (2026-10-01):** this change's tier-policy delta was withdrawn. It modified "Adapter allowlist is a separate axis from tiers", which `structural-batch-rules` removed from the code; the tier-policy spec no longer carries that requirement, and the counterparty allowlist replaces it.
