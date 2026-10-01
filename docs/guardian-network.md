@@ -355,7 +355,17 @@ the verdict. No panel, no appeal.
   `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD at `:210`, and the posted bond must be
   strictly positive) and opens a fresh guardian review (block-only voting). A
   block slashes the **owner's bond**, not guardians. Finalize executes with
-  per-call caps disabled — the escape hatch for a settlement leg stuck on a cap.
+  per-call caps disabled — the escape hatch for a settlement leg stuck on a cap —
+  and a net egress budget of zero: the batch cannot send vault float out, though
+  it can pass on what the strategy returns in the same batch (the guardian veto
+  is the control for that). Funds an unwind needs, such as a repay, are sent to
+  the strategy from outside the vault.
+- After a blocked round burns the bond, the same owner re-bonds with
+  `prepareOwnerStake` → `approveOwnerStakeBinding(vault)` →
+  `rotateOwner(vault, owner)`, which is allowed while the stuck proposal is still
+  open (rotation to any other address still waits until nothing is open), then
+  opens a new round. Each blocked round costs a bond. The rotation drains the
+  vault's agent set, so the owner calls `registerAgent` again before proposing.
 
 ### Migrating a vault created under the zero-bond sentinel
 
