@@ -90,6 +90,8 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         );
         bool fresh = _predict(c3, DeploySalts.WOOD_USD_FEED).code.length == 0;
         feed = WoodPoolFeed(_c3(c3, DeploySalts.WOOD_USD_FEED, initcode));
+        // An adopted feed keeps the bound it was minted with; refuse one that predates this value.
+        require(feed.ethUsdMaxAge() == p.ethUsdMaxAge, "PRE-FLIGHT: adopted WOOD feed has a different ETH_USD_MAX_AGE");
 
         // BASELINE ONLY, AND ONLY ON THE MINTING RUN, and only on the V2 leg.
         // `latestRoundData` still needs a SECOND snapshot a full window later (the

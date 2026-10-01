@@ -140,6 +140,16 @@ contract DeployWoodPoolFeedTest is Test {
         assertEq(afterTs, tsBefore, "no second baseline on a resumed run");
     }
 
+    /// @notice A resumed run refuses to adopt a feed minted with a different ETH/USD bound.
+    function test_deploy_refusesToAdoptAFeedWithADifferentEthUsdMaxAge() public {
+        _deploy(script, _params());
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.ethUsdMaxAge = ETH_USD_MAX_AGE + 1;
+        vm.prank(address(script));
+        vm.expectRevert(bytes("PRE-FLIGHT: adopted WOOD feed has a different ETH_USD_MAX_AGE"));
+        script.deploy(p);
+    }
+
     // ── Pre-flights ──
 
     /// @notice Audit 2026-10-01 V1-06: an ETH/USD bound at the 24h heartbeat is refused.

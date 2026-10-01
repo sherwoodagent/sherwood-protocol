@@ -97,10 +97,11 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   starve nor inflate a guardian's budget.
 - **`kNumerator = 1` contains a conviction.** At the default, `Σ locks ≤ stake`,
   so burning proposal A's lock leaves `stake − lock_A ≥ Σ other locks`: every
-  other proposal the guardian backs stays fully covered — while every lock is
-  at least `minSlashBps` of stake. Below that the floored burn exceeds the lock
-  and the other locks are short by the difference (at most `minSlashBps` of one
-  convicted guardian's stake). Any `k > 1` is
+  other proposal the guardian backs stays fully covered — provided the
+  CONVICTED lock is at least `minSlashBps` of the guardian's stake. A smaller
+  convicted lock is burned at the `minSlashBps` floor, more than the lock, and
+  the other locks are short by the difference (at most `minSlashBps` of that
+  guardian's stake). Any `k > 1` is
   deliberate leverage that gives exactly that property up — a guardian may lock
   more across proposals than they hold, and one conviction may leave the others
   under-covered by the excess. The adversary is an operator raising `k` for
