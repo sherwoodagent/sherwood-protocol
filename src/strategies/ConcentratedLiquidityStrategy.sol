@@ -175,7 +175,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         Also raised when `pool` itself holds no code: the key the factory
     ///         is asked about is read off the pool with typed calls, and an
     ///         address that cannot be asked what pair it trades was never a pool
-    ///         the factory created.
+    ///         the factory created. Also raised when `positionManager.factory()`
+    ///         is not `uniswapFactory`: the mint would land in another venue's pool.
     /// @dev    Deliberately does NOT read `pool.factory()`. That answer comes
     ///         from the party being checked; see check (1) in `_initialize` for
     ///         why asking the factory is the only direction that establishes
@@ -184,7 +185,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice A proposer-supplied counterparty is not allowlisted in the
     ///         `TierRegistry` the vault's own governor gates batch approvals
     ///         against. Covers `swapAdapter`, `positionManager`, `morpho`,
-    ///         `marketParams.collateralToken`, `uniswapFactory` and the pool's
+    ///         `marketParams.oracle`, `marketParams.collateralToken`, `uniswapFactory` and the pool's
     ///         volatile leg (`otherToken`) — every address this contract
     ///         approves or calls with vault funds, plus the factory whose word
     ///         the pool's provenance rests on.
@@ -436,6 +437,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // proposer-authored factory vouching for a proposer-authored pool is
             // the same self-attestation one hop further out.
             _requireAllowedCounterparty(registry, p.uniswapFactory);
+            _requireAllowedCounterparty(registry, p.marketParams.oracle);
             if (p.marketParams.collateralToken != vaultAsset) {
                 _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
             }
@@ -449,6 +451,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         {
             bytes memory call_ = abi.encodeCall(IUniswapV3Factory.getPool, (t0, t1, pool_.fee()));
             if (_readAddress(p.uniswapFactory, call_) != p.pool) revert PoolNotFromFactory();
+            // The position manager mints into its own factory's pool: it must be the one measured.
+            call_ = abi.encodeCall(INonfungiblePositionManager.factory, ());
+            if (_readAddress(p.positionManager, call_) != p.uniswapFactory) revert PoolNotFromFactory();
         }
         if (t0 == vaultAsset) {
             assetIsToken0 = true;
@@ -616,6 +621,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedCounterparty(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));
+        _requireAllowedCounterparty(registry, _marketParams.oracle);
         // The volatile leg re-checks on the same terms as the rest: `rerange()`
         // is permissionless and re-issues `forceApprove(otherToken, …)` to both
         // the adapter and the position manager on every call, so a leg demoted
@@ -691,6 +697,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
         if (r.halfWidthTicks > MAX_HALF_WIDTH_TICKS) revert InvalidRerangePolicy();
         if (r.triggerBps == 0 || r.triggerBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
+        // A threshold that floors to zero ticks would let anyone spend the rerange budget on demand.
+        if (uint256(int256(r.halfWidthTicks)) * r.triggerBps < BPS_DENOMINATOR) revert InvalidRerangePolicy();
         if (r.maxReranges > MAX_RERANGE_LIMIT) revert InvalidRerangePolicy();
         if (r.slippageBps == 0 || r.slippageBps > MAX_SLIPPAGE_BPS) revert InvalidRerangePolicy();
         if (r.swapFractionBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();

@@ -464,7 +464,7 @@ contract SyndicateVault is
                 if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);
                 continue;
             }
-            // A zero first argument (`balanceOf(address(0))`) names no spender; resetting it would revert.
+            // A zero first argument (`approve(address(0), 0)`) names no spender; resetting it would revert.
             address spender = AssetCallRules.spenderOf(address(this), calls[i].data);
             if (spender != address(0)) spenders[n++] = spender;
         }

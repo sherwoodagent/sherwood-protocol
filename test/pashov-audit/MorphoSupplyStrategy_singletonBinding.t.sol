@@ -176,6 +176,9 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         realMorpho.createMarket(mp);
 
         registry = new BindingTierRegistry();
+        // V1-04: the market's oracle and collateral are counterparties too; this suite is about the singleton.
+        registry.setAllowed(mp.oracle, true);
+        registry.setAllowed(mp.collateralToken, true);
         governor = new BindingGovernorStub(address(registry));
         vaultStub = new BindingVaultStub(address(usdg), address(governor));
         usdg.mint(address(vaultStub), SUPPLY);

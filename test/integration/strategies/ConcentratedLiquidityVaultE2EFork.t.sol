@@ -223,6 +223,7 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         TierRegistry(tierRegistry).setCounterpartyAllowed(MORPHO, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(UNISWAP_V3_FACTORY, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(mp.collateralToken, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(mp.oracle, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(WETH, true); // the volatile leg
         vm.stopPrank();
 
@@ -289,7 +290,8 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         // `_requireValidRerangePolicy` rejects it (the pool-share cap is
         // preserved at bind time rather than re-checked at rerange).
         r.halfWidthTicks = RERANGE_HALF_WIDTH;
-        r.triggerBps = 1;
+        // halfWidth x triggerBps >= 10_000 (a one-tick threshold); still 0 on the narrow initial band.
+        r.triggerBps = 3;
         r.minInterval = 0;
         r.maxReranges = 2;
         r.slippageBps = 1_000;

@@ -171,7 +171,8 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
             maxTwapDeviationBps: 1_000,
             mintSlippageBps: 1_000,
             rerange: ConcentratedLiquidityStrategy.RerangePolicy({
-                halfWidthTicks: 5000,
+                // halfWidth x triggerBps >= 10_000; the first rerange's threshold is still 0 on the +/-5000 band.
+                halfWidthTicks: 10_000,
                 triggerBps: 1,
                 minInterval: 0,
                 maxReranges: 2,
