@@ -153,6 +153,10 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         require(p.window >= 24 hours, "PRE-FLIGHT: TWAP_WINDOW below MIN_WINDOW (24h)");
         require(p.window <= 7 days, "PRE-FLIGHT: TWAP_WINDOW above MAX_SNAPSHOT_SPAN (7d)");
         require(p.ethUsdMaxAge != 0, "PRE-FLIGHT: ETH_USD_MAX_AGE zero");
+        require(
+            p.ethUsdMaxAge > RobinhoodParams.ETH_USD_HEARTBEAT,
+            "PRE-FLIGHT: ETH_USD_MAX_AGE must EXCEED the ETH/USD heartbeat (24h), or a late round halts WOOD pricing"
+        );
         require(p.minWethReserve != 0, "PRE-FLIGHT: MIN_WETH_RESERVE zero");
         require(p.minV3Liquidity != 0, "PRE-FLIGHT: MIN_V3_LIQUIDITY zero");
 

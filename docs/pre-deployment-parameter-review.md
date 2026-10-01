@@ -304,7 +304,7 @@ commit; re-derive them if it moves. Values not listed here are read from
 | `EXPECTED_CHALLENGE_WINDOW` | `:39` | 14d | Plan B / Plan D drift guard |
 | `WOOD_HAIRCUT_BPS` | `:41` | 5000 | `setWoodHaircutBps`; sits ON the ledger's `MIN_WOOD_HAIRCUT_BPS` floor |
 | `TWAP_WINDOW` | `:44` | 24h | `WoodPoolFeed` constructor |
-| `ETH_USD_MAX_AGE` | `:45` | 1d | `WoodPoolFeed` constructor |
+| `ETH_USD_MAX_AGE` | `:52` | 1d + 2h | `WoodPoolFeed` constructor; feed pre-flight requires it to exceed the 24h ETH/USD heartbeat (`ETH_USD_HEARTBEAT`) — at exactly 24h a round 1s late halts WOOD pricing (audit 2026-10-01 V1-06) |
 | `MIN_WETH_RESERVE` | `:46` | 10 WETH | `WoodPoolFeed` depth floor |
 | `MAX_PAIR_IDLE` | `:47` | 5 min | feed pre-flight: a pair idle past this never snapshots |
 | `KEEPER_CADENCE_SLACK` | `:48` | 2h | feeds `WOOD_FEED_MAX_DELAY` |
