@@ -290,8 +290,10 @@ contract ChallengeEndToEndTest is Test {
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));
         vm.stopPrank();
-        vm.prank(owner);
+        vm.startPrank(owner);
         registry.setExposureLedger(address(ledger));
+        swood.setExposureLedger(address(ledger));
+        vm.stopPrank();
 
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
 

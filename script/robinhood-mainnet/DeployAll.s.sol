@@ -105,13 +105,7 @@ contract DeployAll is
         Create3Factory c3 = _c3Factory(msg.sender);
         s = _predictAll(c3, i.posture);
 
-        DeploySherwood.Deployed memory core = deployCore(
-            Config({
-                agentRegistry: RobinhoodParams.AGENT_REGISTRY,
-                managementFeeBps: RobinhoodParams.MANAGEMENT_FEE_BPS,
-                woodToken: i.wood
-            })
-        );
+        DeploySherwood.Deployed memory core = deployCore(_coreConfig(i));
         // The prediction table and the phases must name the same salts, or `stageOf` reads
         // the wrong slots and `_persist` writes addresses nothing was minted at.
         require(
@@ -129,7 +123,7 @@ contract DeployAll is
         if (!factory.depositsRestricted()) factory.setDepositsRestricted(true);
         // Sponsored funds are single-operator: only the vault owner proposes; the Safe lifts it later.
         if (!factory.ownerOnlyProposals()) factory.setOwnerOnlyProposals(true);
-        // Creation is sponsorship-only in practice from the first run; the Safe lowers the fee at public launch.
+        // Once open (end of run 2 on Mainnet), creation is sponsorship-only in practice; the Safe lowers the fee at public launch.
         if (factory.creationFee() == 0) {
             address feeTo = i.ownerMultisig != address(0) ? i.ownerMultisig : i.deployer;
             factory.setCreationFee(i.wood, RobinhoodParams.INVITE_ONLY_CREATION_FEE, feeTo);
@@ -170,10 +164,29 @@ contract DeployAll is
 
         _requireNoPredictionDrift(c3, s, i.posture);
 
+        // Open creation now that the coverage layer and the game's roles are wired (deployer still
+        // owns the factory). A vault minted earlier would hold a governor with no ledger or escrow.
+        if (address(factory.agentRegistry()) == RobinhoodParams.AGENT_REGISTRY_CLOSED) {
+            require(factory.syndicateCount() == 0, "a syndicate exists before creation was opened");
+            factory.setAgentRegistry(RobinhoodParams.AGENT_REGISTRY);
+        }
+
         // LAST: every phase above is `onlyOwner` on something. On Fork the owner IS the
         // deployer, so this is a no-op rather than a skipped step.
         _handoffAll(s, i.ownerMultisig);
         cp = Checkpoint.Complete;
+    }
+
+    /// @dev Mainnet initialises the factory with the closed registry sentinel, so no vault can
+    ///      exist before run 2's last step opens creation; a fork completes in one run.
+    function _coreConfig(Inputs memory i) internal pure returns (Config memory) {
+        return Config({
+            agentRegistry: i.posture == Posture.Mainnet
+                ? RobinhoodParams.AGENT_REGISTRY_CLOSED
+                : RobinhoodParams.AGENT_REGISTRY,
+            managementFeeBps: RobinhoodParams.MANAGEMENT_FEE_BPS,
+            woodToken: i.wood
+        });
     }
 
     /// @dev Each phase re-derives its own address, and only the eight core fields are checked
@@ -424,6 +437,7 @@ contract DeployAll is
             require(i.ownerMultisig.code.length != 0, "OWNER_MULTISIG must be a contract (Safe), not an EOA");
         }
         require(CREATE2_DEPLOYER.code.length != 0, "CREATE2 deployer not on this chain");
+        require(RobinhoodParams.AGENT_REGISTRY_CLOSED.code.length == 0, "AGENT_REGISTRY_CLOSED holds code");
         require(
             keccak256(type(Create3Factory).creationCode) == DeploySalts.CREATE3_FACTORY_INITCODE_HASH,
             "Create3Factory initcode hash drift"
@@ -450,7 +464,15 @@ contract DeployAll is
         bool handedOff = cp == Checkpoint.Complete && i.posture == Posture.Mainnet;
         address finalOwner = handedOff ? i.ownerMultisig : deployer;
 
-        _validateMainnet(s.core, deployer, handedOff ? i.ownerMultisig : address(0), i.wood);
+        // Creation stays closed (sentinel registry, no syndicates) until run 2's last step.
+        bool closed = cp == Checkpoint.AwaitingWoodFeed;
+        _validateMainnet(
+            s.core,
+            deployer,
+            handedOff ? i.ownerMultisig : address(0),
+            i.wood,
+            closed ? RobinhoodParams.AGENT_REGISTRY_CLOSED : RobinhoodParams.AGENT_REGISTRY
+        );
         // Limited-launch posture: the same set script/verify-robinhood.sh pins.
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
         require(factory.depositsRestricted(), "factory.depositsRestricted");
@@ -469,6 +491,7 @@ contract DeployAll is
 
         if (cp == Checkpoint.AwaitingWoodFeed) {
             require(s.woodUsdFeed.code.length != 0, "the WOOD feed was not minted");
+            require(factory.syndicateCount() == 0, "factory.syndicateCount != 0 before creation opened");
             // Nothing may be armed yet: the deployer has to keep every key until run 2.
             require(Ownable2Step(s.core.protocolConfig).pendingOwner() == address(0), "handoff started too early");
             return;

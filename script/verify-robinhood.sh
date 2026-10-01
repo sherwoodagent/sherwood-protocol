@@ -212,6 +212,18 @@ else
   bad "ledger.woodPriceX8 resolves" "reverts or zero (NoWoodPrice)"
 fi
 check "ledger.protocolConfig.maxStrategyDuration" "$(call "$CONFIG" 'maxStrategyDuration()(uint256)')" "2592000"
+# Every live governor carries the factory's wiring. A vault created between run 1 and
+# run 2 would be minted unwired; the closed registry sentinel prevents it, this re-reads it.
+NSYN=$(call "$FACTORY" 'syndicateCount()(uint256)')
+[ -n "$NSYN" ] || bad "factory.syndicateCount" "unreadable (governor wiring NOT checked)"
+for ((i = 1; i <= ${NSYN:-0}; i++)); do
+  SVAULT=$(cast call "$FACTORY" 'syndicates(uint256)(uint256,address,address,string,uint256,bool,string)' "$i" \
+    --rpc-url "$RPC" 2>/dev/null | sed -n 2p | awk '{print $1}')
+  SGOV=$(call1 "$FACTORY" 'governorOf(address)(address)' "$SVAULT")
+  check "governor #$i.exposureLedger"   "$(call "$SGOV" 'exposureLedger()(address)')"    "$LEDGER"
+  check "governor #$i.bondEscrow"       "$(call "$SGOV" 'bondEscrow()(address)')"        "$ESCROW"
+  check "governor #$i.tierRegistry"     "$(call "$SGOV" 'tierRegistry()(address)')"      "$TIERS"
+done
 
 echo; echo "── Plan D: the three roles, all on THIS game ──"
 check "ledger.coverageFreezer"        "$(call "$LEDGER" 'coverageFreezer()(address)')"   "$GAME"
@@ -248,6 +260,10 @@ fi
 
 echo; echo "── WOOD price source ──"
 check "feed decimals == 8"            "$(call "$WFEED" 'decimals()(uint8)')"             "8"
+# A late 24h heartbeat round must still price WOOD (audit V1-06): 26h = 93600 s.
+if [ "$POSTURE" = "mainnet" ]; then
+  check "feed.ethUsdMaxAge == 26h"    "$(call "$WFEED" 'ethUsdMaxAge()(uint256)')"       "93600"
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

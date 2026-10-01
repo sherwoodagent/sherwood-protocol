@@ -9,7 +9,7 @@ fees, staking fees, or referral fees anywhere in the protocol.
 
 | Fee | Base | Default | Hard cap | Charged |
 |---|---|---|---|---|
-| **Management** | fund assets × time deployed (asset-seconds) | 2%/yr | 3%/yr | every settlement — profit, flat, or loss |
+| **Management** | whole-fund assets (stamped at execute) × time a proposal is Executed (asset-seconds) | 2%/yr | 3%/yr | every settlement — profit, flat, or loss |
 | **Performance** | value above the fund's previous peak price per share (high-water mark) | 20% | 25% protocol ceiling (20% per-vault default cap) | profitable settlements only |
 
 The headline is **2-and-20**. The management number is load-bearing for guardian
@@ -32,9 +32,13 @@ below the high-water mark while review workload is unchanged. See
   reaches new vaults only. A fund created under the wrong rate keeps it forever.
 - **Accrual:** the vault integrates *asset-seconds* — a running sum of
   `fund assets × elapsed time` (`src/SyndicateVault.sol`). The clock only runs
-  while a strategy is deployed: `startManagementAccrual()` starts it at
+  while a proposal is Executed: `startManagementAccrual()` starts it at
   `executeProposal` and `consumeManagementAccrual()` stops and zeroes it at
   settlement. **Idle capital between proposals accrues nothing.**
+- **The base is the whole fund, not the deployed capital.** `totalAssets()` is
+  stamped at execute, before the execute batch runs, so a proposal that deploys
+  a small fraction of the fund, or nothing at all, accrues the same fee as one
+  that deploys all of it for the same time.
 - **Formula:** `fee = assetSeconds × rateBps / (10 000 × 365 days)`
   (`src/SyndicateGovernor.sol`).
 - **Conservative base stamping:** the base re-reads `totalAssets()` behind a

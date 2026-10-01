@@ -90,6 +90,8 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         );
         bool fresh = _predict(c3, DeploySalts.WOOD_USD_FEED).code.length == 0;
         feed = WoodPoolFeed(_c3(c3, DeploySalts.WOOD_USD_FEED, initcode));
+        // An adopted feed keeps the bound it was minted with; refuse one that predates this value.
+        require(feed.ethUsdMaxAge() == p.ethUsdMaxAge, "PRE-FLIGHT: adopted WOOD feed has a different ETH_USD_MAX_AGE");
 
         // BASELINE ONLY, AND ONLY ON THE MINTING RUN, and only on the V2 leg.
         // `latestRoundData` still needs a SECOND snapshot a full window later (the
@@ -153,6 +155,10 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         require(p.window >= 24 hours, "PRE-FLIGHT: TWAP_WINDOW below MIN_WINDOW (24h)");
         require(p.window <= 7 days, "PRE-FLIGHT: TWAP_WINDOW above MAX_SNAPSHOT_SPAN (7d)");
         require(p.ethUsdMaxAge != 0, "PRE-FLIGHT: ETH_USD_MAX_AGE zero");
+        require(
+            p.ethUsdMaxAge > RobinhoodParams.ETH_USD_HEARTBEAT,
+            "PRE-FLIGHT: ETH_USD_MAX_AGE must EXCEED the ETH/USD heartbeat (24h), or a late round halts WOOD pricing"
+        );
         require(p.minWethReserve != 0, "PRE-FLIGHT: MIN_WETH_RESERVE zero");
         require(p.minV3Liquidity != 0, "PRE-FLIGHT: MIN_V3_LIQUIDITY zero");
 

@@ -46,6 +46,10 @@ contract DeployAllHarness is DeployAll {
         _preflight(i);
     }
 
+    function exposed_coreConfig(Inputs memory i) external pure returns (Config memory) {
+        return _coreConfig(i);
+    }
+
     function exposed_validateAll(Stack memory s, Inputs memory i, Checkpoint cp) external view {
         _validateAll(s, i, cp);
     }
@@ -430,8 +434,8 @@ contract DeployAllTest is DeployAllFixture {
         assertEq(address(factory.creationFeeToken()), i.wood, "fee paid in WOOD");
         assertEq(factory.creationFeeRecipient(), address(safe), "fee goes to the Safe");
         assertTrue(factory.ownerOnlyProposals(), "owner-only proposals set in run 1");
-        // Pinned literally, not via RobinhoodParams, so zeroing or mistyping the constant fails here.
-        assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
+        // Creation is closed through run 1 and the gap: a non-zero codeless registry sentinel.
+        assertEq(address(factory.agentRegistry()), 0x000000000000000000000000000000000000dEaD, "closed sentinel");
 
         _primeWoodFeed(first.woodUsdFeed);
 
@@ -446,6 +450,8 @@ contract DeployAllTest is DeployAllFixture {
         _assertTwoStepPending(s, address(safe));
         script.exposed_validateAll(s, i, Checkpoint.Complete);
         assertTrue(script.stageOf(s, address(safe)) == Stage.Done, "stageOf == Done");
+        // Pinned literally, not via RobinhoodParams, so zeroing or mistyping the constant fails here.
+        assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
     }
 
     /// @notice Validation refuses a run-1 factory whose owner-only-proposals flag was lifted.
