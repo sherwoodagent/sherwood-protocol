@@ -17,6 +17,8 @@ library RobinhoodParams {
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
     // Invite-only window: 1M WOOD (~$5.9k) per unsponsored fund, so sponsorship is the way in.
     uint256 internal constant INVITE_ONLY_CREATION_FEE = 1_000_000e18;
+    // Unpayable: creation is closed between run 1 and run 2, so no vault predates the coverage layer.
+    uint256 internal constant CREATION_CLOSED_FEE = type(uint256).max;
     // Governor-impl IMMUTABLE, so this deploy is the only chance to set it. Held at the
     // per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod` itself;
     // the operating value is the factory's 24h default, which owners may now lower.

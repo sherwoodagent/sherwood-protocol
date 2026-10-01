@@ -2,9 +2,10 @@
 pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 import {DeployAllFixture} from "../deploy/DeployAll.t.sol";
-import {Checkpoint, Stage} from "../../script/robinhood-mainnet/DeployAll.s.sol";
+import {Checkpoint} from "../../script/robinhood-mainnet/DeployAll.s.sol";
 import {Posture, Inputs, Stack} from "../../script/robinhood-mainnet/DeployTypes.sol";
 import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
 
@@ -34,8 +35,8 @@ contract GapInertStrategy {
 }
 
 /// @title Deploy_ceremonyGapVault — audit 2026-10-01 V1-05 regression
-/// @notice A vault created between run 1 and run 2 of the mainnet ceremony is wired by run 2
-///         itself, and run 2 refuses (rather than reporting green) while it cannot wire one.
+/// @notice Creation is closed between Mainnet run 1 and run 2 (unpayable fee), so no vault can
+///         predate the coverage layer; run 2 opens it, and every vault is wired at creation.
 contract DeployCeremonyGapVaultTest is DeployAllFixture {
     uint256 internal constant DEPOSIT = 10_000e6; // $10k USDG
     uint256 internal constant STAKE = 10_000e18; // RobinhoodParams.MIN_OWNER_STAKE
@@ -50,31 +51,54 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
 
     // ───────────────────────────── helpers ─────────────────────────────
 
+    /// @dev An outsider with an agent identity, a prepared owner stake and `feeWood` WOOD,
+    ///      approving the factory for everything it holds.
+    function _prepareCreator(Stack memory s, address who, uint256 feeWood) internal returns (uint256 agentId) {
+        agentId = agents.mint(who);
+        wood.mint(who, STAKE + feeWood);
+        vm.startPrank(who);
+        wood.approve(s.core.swoodProxy, STAKE);
+        StakedWood(s.core.swoodProxy).prepareOwnerStake(STAKE);
+        wood.approve(s.core.factoryProxy, type(uint256).max);
+        vm.stopPrank();
+    }
+
+    function _config(string memory sub) internal view returns (SyndicateFactory.SyndicateConfig memory) {
+        return SyndicateFactory.SyndicateConfig({
+            metadataURI: "ipfs://gap",
+            asset: IERC20(address(usdg)),
+            name: "Gap Vault",
+            symbol: "GAPV",
+            openDeposits: false,
+            subdomain: sub
+        });
+    }
+
     function _create(Stack memory s, address who, string memory sub)
         internal
         returns (SyndicateVault vault, SyndicateGovernor gov, uint256 agentId)
     {
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
-        agentId = agents.mint(who);
-        wood.mint(who, STAKE + factory.creationFee());
-        vm.startPrank(who);
-        wood.approve(s.core.swoodProxy, STAKE);
-        StakedWood(s.core.swoodProxy).prepareOwnerStake(STAKE);
-        wood.approve(address(factory), factory.creationFee());
-        (, address v) = factory.createSyndicate(
-            agentId,
-            SyndicateFactory.SyndicateConfig({
-                metadataURI: "ipfs://gap",
-                asset: IERC20(address(usdg)),
-                name: "Gap Vault",
-                symbol: "GAPV",
-                openDeposits: false,
-                subdomain: sub
-            })
-        );
-        vm.stopPrank();
+        agentId = _prepareCreator(s, who, factory.creationFee());
+        vm.prank(who);
+        (, address v) = factory.createSyndicate(agentId, _config(sub));
         vault = SyndicateVault(payable(v));
         gov = SyndicateGovernor(factory.governorOf(v));
+    }
+
+    /// @dev Asserts an outsider holding the invite-only fee cannot create in the gap.
+    function _assertCreationClosed(Stack memory first, address who) internal {
+        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
+        uint256 agentId = _prepareCreator(first, who, RobinhoodParams.INVITE_ONLY_CREATION_FEE);
+        uint256 bal = wood.balanceOf(who);
+        vm.prank(who);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC20Errors.ERC20InsufficientBalance.selector, who, bal, RobinhoodParams.CREATION_CLOSED_FEE
+            )
+        );
+        factory.createSyndicate(agentId, _config("gapfund"));
+        assertEq(factory.syndicateCount(), 0, "no vault predates the coverage layer");
     }
 
     function _fund(Stack memory s, SyndicateVault vault, address owner_, uint256 agentId, address lp)
@@ -141,34 +165,35 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
         assertTrue(cp == Checkpoint.Complete, "run 2 completes");
     }
 
-    function _assertWired(SyndicateFactory factory, SyndicateGovernor gov) internal view {
-        assertEq(gov.exposureLedger(), factory.exposureLedger(), "gap governor: ledger");
-        assertEq(gov.bondEscrow(), factory.bondEscrow(), "gap governor: escrow");
-        assertEq(gov.tierRegistry(), factory.tierRegistry(), "gap governor: tier registry");
-    }
-
     // ───────────────────────────── tests ─────────────────────────────
 
-    /// @notice Run 2 wires the gap governor with no manual step, so the zero-approval
-    ///         full-capital proposal now needs a bond and reverts `InsufficientApproveCoverage`.
-    function test_gapVault_wiredByRun2_executeNeedsCoverage() public {
+    /// @notice After run 1 an outsider with WOOD, a prepared owner stake and an agent identity
+    ///         cannot create a syndicate: the fee is unpayable until run 2.
+    function test_gap_creationClosedAfterRun1() public {
         Stack memory first = _runOne();
-        address gapOwner = makeAddr("gapOwner");
-        (SyndicateVault vault, SyndicateGovernor gov, uint256 agentId) = _create(first, gapOwner, "gapfund");
-        assertEq(gov.exposureLedger(), address(0), "gap: unwired before run 2");
+        assertEq(SyndicateFactory(first.core.factoryProxy).creationFee(), RobinhoodParams.CREATION_CLOSED_FEE, "closed");
+        _assertCreationClosed(first, makeAddr("gapOwner"));
+    }
 
-        Stack memory s = _runTwo(first);
+    /// @notice After run 2 the fee is the invite-only fee, creation works, the governor is wired
+    ///         at creation, and a zero-approval full-capital proposal reverts at execute.
+    function test_afterRun2_creationOpen_governorWired_executeNeedsCoverage() public {
+        Stack memory s = _runTwo(_runOne());
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
-        assertTrue(factory.exposureLedger() != address(0), "factory issues the ledger");
-        _assertWired(factory, gov);
-        script.exposed_validateAll(s, _inputs(Posture.Mainnet), Checkpoint.Complete);
-        assertTrue(script.stageOf(s, address(safe)) == Stage.Done, "stageOf == Done");
+        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "run 2 opens creation");
+        assertEq(factory.creationFeeRecipient(), address(safe), "fee to the Safe");
 
-        address strat = _fund(s, vault, gapOwner, agentId, makeAddr("lp"));
-        wood.mint(gapOwner, 5_000_000e18);
-        vm.prank(gapOwner);
+        address owner_ = makeAddr("postOwner");
+        (SyndicateVault vault, SyndicateGovernor gov, uint256 agentId) = _create(s, owner_, "postfund");
+        assertTrue(factory.exposureLedger() != address(0), "factory issues the ledger");
+        assertEq(gov.exposureLedger(), factory.exposureLedger(), "ledger wired at creation");
+        assertEq(gov.bondEscrow(), factory.bondEscrow(), "escrow wired at creation");
+
+        address strat = _fund(s, vault, owner_, agentId, makeAddr("lp"));
+        wood.mint(owner_, 5_000_000e18);
+        vm.prank(owner_);
         wood.approve(s.proposerBondEscrow, type(uint256).max);
-        uint256 pid = _propose(gov, vault, gapOwner, strat);
+        uint256 pid = _propose(gov, vault, owner_, strat);
         assertGt(gov.getProposal(pid).proposerBondWood, 0, "bond locked");
 
         vm.warp(gov.getProposal(pid).voteEnd + 1);
@@ -180,45 +205,26 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
         assertEq(usdg.balanceOf(address(vault)), DEPOSIT, "vault intact");
     }
 
-    /// @notice A gap governor with an OPEN proposal cannot be wired, so run 2 reverts instead
-    ///         of reporting green; once the proposal ends, re-running run 2 completes and wires it.
-    function test_gapVault_openProposalAtRun2_ceremonyReverts_thenRerunWires() public {
+    /// @notice Validation at `AwaitingWoodFeed` refuses any fee but the closed one.
+    function test_validateAll_awaitingFeed_refusesAnOpenFee() public {
         Stack memory first = _runOne();
-        address gapOwner = makeAddr("gapOwner");
-        (SyndicateVault vault, SyndicateGovernor gov, uint256 agentId) = _create(first, gapOwner, "gapfund");
-        address strat = _fund(first, vault, gapOwner, agentId, makeAddr("lp"));
-        uint256 pid = _propose(gov, vault, gapOwner, strat);
-
-        _primeWoodFeed(first.woodUsdFeed);
         Inputs memory i = _inputs(Posture.Mainnet);
-        vm.prank(deployer);
-        vm.expectRevert(ISyndicateGovernor.ParamsFrozenDuringProposal.selector);
-        script.deployAll(i);
-        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
-        assertEq(factory.exposureLedger(), address(0), "the reverted run left nothing behind");
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
 
-        // Runbook remedy: let the proposal end, commit its state, re-run inside the cooldown.
-        vm.warp(gov.getProposal(pid).executeBy + 1);
-        gov.resolveProposalState(pid);
-        assertEq(uint256(gov.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Expired));
-        _primeWoodFeed(first.woodUsdFeed);
-        Checkpoint cp;
-        Stack memory s;
-        (s, cp) = _runCeremony(Posture.Mainnet);
-        assertTrue(cp == Checkpoint.Complete, "re-run completes");
-        _assertWired(factory, gov);
-        script.exposed_validateAll(s, i, Checkpoint.Complete);
+        vm.prank(deployer);
+        SyndicateFactory(first.core.factoryProxy)
+            .setCreationFee(i.wood, RobinhoodParams.INVITE_ONLY_CREATION_FEE, address(safe));
+        vm.expectRevert(bytes("factory.creationFee"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
     }
 
-    /// @notice The Complete-stage validation refuses a live governor whose wiring lags the factory.
-    function test_validateAll_refusesAnUnwiredGovernor() public {
+    /// @notice Negative pin of the PR #368 review stall: a gap owner who would create a vault,
+    ///         execute a never-settling proposal and freeze its governor cannot even create one,
+    ///         and run 2 completes.
+    function test_gap_reviewStallCannotBeSetUp() public {
         Stack memory first = _runOne();
-        (, SyndicateGovernor gov,) = _create(first, makeAddr("gapOwner"), "gapfund");
+        _assertCreationClosed(first, makeAddr("staller"));
         Stack memory s = _runTwo(first);
-        // Simulate a governor the ceremony missed: clear its ledger slot as the factory.
-        vm.prank(s.core.factoryProxy);
-        gov.setExposureLedger(address(0));
-        vm.expectRevert(bytes("governor #1.exposureLedger mismatch"));
         script.exposed_validateAll(s, _inputs(Posture.Mainnet), Checkpoint.Complete);
     }
 }

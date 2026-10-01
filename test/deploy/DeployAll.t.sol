@@ -424,9 +424,9 @@ contract DeployAllTest is DeployAllFixture {
         _assertOneStepOwners(first, deployer);
         Inputs memory i = _inputs(Posture.Mainnet);
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
-        // Invite-only from run 1: creation already costs the window fee, paid to the Safe.
+        // Creation is closed between the runs (unpayable fee); run 2 opens it at the window fee.
         SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
-        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "creation fee set in run 1");
+        assertEq(factory.creationFee(), RobinhoodParams.CREATION_CLOSED_FEE, "creation closed after run 1");
         assertEq(address(factory.creationFeeToken()), i.wood, "fee paid in WOOD");
         assertEq(factory.creationFeeRecipient(), address(safe), "fee goes to the Safe");
         assertTrue(factory.ownerOnlyProposals(), "owner-only proposals set in run 1");
@@ -446,6 +446,7 @@ contract DeployAllTest is DeployAllFixture {
         _assertTwoStepPending(s, address(safe));
         script.exposed_validateAll(s, i, Checkpoint.Complete);
         assertTrue(script.stageOf(s, address(safe)) == Stage.Done, "stageOf == Done");
+        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "run 2 opens creation");
     }
 
     /// @notice Validation refuses a run-1 factory whose owner-only-proposals flag was lifted.
@@ -460,13 +461,13 @@ contract DeployAllTest is DeployAllFixture {
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
     }
 
-    /// @notice Validation refuses a run-1 creation fee that is not 1M WOOD paid to the Safe.
+    /// @notice Validation refuses a run-1 creation fee that is not the closed fee, in WOOD, to the Safe.
     function test_mainnet_validateAllRefusesADriftedCreationFee() public {
         vm.chainId(MAINNET_CHAIN_ID);
         (Stack memory first,) = _runCeremony(Posture.Mainnet);
         Inputs memory i = _inputs(Posture.Mainnet);
         SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
-        uint256 fee = RobinhoodParams.INVITE_ONLY_CREATION_FEE;
+        uint256 fee = RobinhoodParams.CREATION_CLOSED_FEE;
 
         vm.prank(deployer);
         factory.setCreationFee(i.wood, fee - 1, address(safe));

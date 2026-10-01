@@ -1,8 +1,13 @@
 # management-fee (delta)
 
+## RENAMED Requirements
+
+- FROM: `### Requirement: The management fee base is time-weighted over deployed capital`
+- TO: `### Requirement: The management fee base is the whole fund, time-weighted while a proposal is Executed`
+
 ## MODIFIED Requirements
 
-### Requirement: The management fee base is time-weighted over deployed capital
+### Requirement: The management fee base is the whole fund, time-weighted while a proposal is Executed
 
 The fee owed SHALL be proportional to the integral of the base over time — the
 product of the base and the duration the proposal was Executed — annualized at the

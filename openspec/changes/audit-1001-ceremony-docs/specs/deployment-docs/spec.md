@@ -2,21 +2,21 @@
 
 ## ADDED Requirements
 
-### Requirement: Mainnet run 2 wires every governor created before it
-On Mainnet posture a vault MAY be created between run 1 and run 2 (creation is open behind the fee and identity gates from run 1), and its governor is then minted with no exposure ledger and no bond escrow, because the factory carries neither yet. Run 2 SHALL, after the Plan B phase sets the factory's ledger and escrow and before the handoff, call `SyndicateFactory.pushWiring(governor)` for every governor the factory has deployed (syndicate ids `1..syndicateCount`, each resolved through `governorOf(vault)`) whose `exposureLedger`, `bondEscrow` or `tierRegistry` differs from the factory's. A governor already wired SHALL be skipped, so a resumed run sends nothing. `pushWiring` reverts `ParamsFrozenDuringProposal` while that governor has an open proposal; the ceremony SHALL NOT catch that revert. The Complete-stage validation, and `script/verify-robinhood.sh`, SHALL assert for every live governor that all three slots equal the factory's.
+### Requirement: Syndicate creation is closed between Mainnet run 1 and run 2
+A governor minted before the Plan B phase has wired the factory carries no exposure ledger and no bond escrow, and nothing in the ceremony can reliably wire it afterwards: `pushWiring` reverts while the governor has an open proposal, and a gap-vault owner can keep one open indefinitely. Run 1 SHALL therefore set the creation fee to `type(uint256).max` (`RobinhoodParams.CREATION_CLOSED_FEE`), in WOOD, payable to `OWNER_MULTISIG`, before the stage gate, so `createSyndicate` reverts for every non-sponsored creator. Run 2 SHALL restore `INVITE_ONLY_CREATION_FEE` only after the Plan B phase has wired the factory's ledger and escrow, and only while the fee still equals the closed value, so a resumed run never overwrites a fee the Safe has since set. The `AwaitingWoodFeed` validation SHALL require the closed fee and the `Complete` validation the invite-only fee. Sponsorship (`setCreationSponsored`) bypasses the fee, so the runbook SHALL tell the deployer not to grant it during the gap. `script/verify-robinhood.sh` SHALL still check, read-only, that every live governor's ledger, escrow and tier registry equal the factory's.
 
-#### Scenario: A gap vault is wired by run 2
-- **GIVEN** a vault created after run 1 and before run 2, with no open proposal
+#### Scenario: No vault can be created in the gap
+- **GIVEN** run 1 has completed at `AwaitingWoodFeed`
+- **WHEN** an outsider holding WOOD, a prepared owner stake and an agent identity calls `createSyndicate`
+- **THEN** the call reverts and `syndicateCount()` stays zero
+
+#### Scenario: Run 2 opens creation and every vault is wired at creation
 - **WHEN** run 2 completes
-- **THEN** its governor's `exposureLedger`, `bondEscrow` and `tierRegistry` equal the factory's with no manual step, and a full-capital proposal with no approvals reverts `InsufficientApproveCoverage` at execute
+- **THEN** the creation fee is the invite-only fee, a new syndicate's governor has the factory's `exposureLedger` and `bondEscrow` from creation, and a full-capital proposal with no approvals reverts `InsufficientApproveCoverage` at execute
 
-#### Scenario: A gap vault has an open proposal at run 2
-- **WHEN** run 2 reaches the wiring step while that governor has an open proposal
-- **THEN** the run reverts `ParamsFrozenDuringProposal` instead of reporting green, and the operator re-runs once the proposal has ended and its state is committed (the cooldown that follows keeps the owner from proposing again first)
-
-#### Scenario: Validation refuses an unwired governor
-- **WHEN** any live governor's ledger, escrow or tier registry differs from the factory's at the Complete stage
-- **THEN** `_validateAll` reverts naming the syndicate id and the slot
+#### Scenario: Validation refuses an open fee between the runs
+- **WHEN** `_validateAll` runs at `AwaitingWoodFeed` and the creation fee is anything but the closed value
+- **THEN** it reverts `factory.creationFee`
 
 ### Requirement: The ETH/USD staleness bound exceeds the feed heartbeat
 `RobinhoodParams.ETH_USD_MAX_AGE` SHALL be strictly greater than the 4663 ETH/USD feed's 24h heartbeat (`ETH_USD_HEARTBEAT`); the shipped value is 26 hours, the same 2h allowance as `ASSET_FEED_MAX_DELAY`. At exactly the heartbeat a round published one second late makes `WoodPoolFeed` revert, which halts propose, approve, execute and `ChallengeGame.file` protocol-wide. The WOOD feed phase's pre-flight SHALL refuse a bound at or below the heartbeat before anything is minted.

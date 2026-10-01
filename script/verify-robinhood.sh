@@ -213,8 +213,9 @@ else
 fi
 check "ledger.protocolConfig.maxStrategyDuration" "$(call "$CONFIG" 'maxStrategyDuration()(uint256)')" "2592000"
 # Every live governor carries the factory's wiring. A vault created between run 1 and
-# run 2 was minted unwired; DeployAll's run 2 pushes it, this re-reads it.
+# run 2 would be minted unwired; run 1 closes creation until run 2, this re-reads it.
 NSYN=$(call "$FACTORY" 'syndicateCount()(uint256)')
+[ -n "$NSYN" ] || bad "factory.syndicateCount" "unreadable (governor wiring NOT checked)"
 for ((i = 1; i <= ${NSYN:-0}; i++)); do
   SVAULT=$(cast call "$FACTORY" 'syndicates(uint256)(uint256,address,address,string,uint256,bool,string)' "$i" \
     --rpc-url "$RPC" 2>/dev/null | sed -n 2p | awk '{print $1}')
@@ -259,6 +260,10 @@ fi
 
 echo; echo "── WOOD price source ──"
 check "feed decimals == 8"            "$(call "$WFEED" 'decimals()(uint8)')"             "8"
+# A late 24h heartbeat round must still price WOOD (audit V1-06): 26h = 93600 s.
+if [ "$POSTURE" = "mainnet" ]; then
+  check "feed.ethUsdMaxAge == 26h"    "$(call "$WFEED" 'ethUsdMaxAge()(uint256)')"       "93600"
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

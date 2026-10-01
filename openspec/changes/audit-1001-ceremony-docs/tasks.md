@@ -2,9 +2,9 @@
 
 ## 1. Ceremony (V1-05)
 
-- [x] 1.1 `DeployAll` run 2 pushes wiring into every lagging governor after Plan B, before the handoff.
-- [x] 1.2 `_validateAll` (Complete) and `verify-robinhood.sh` assert per-governor wiring.
-- [x] 1.3 Runbook step, including the open-proposal case.
+- [x] 1.1 `DeployAll` run 1 sets the creation fee to `CREATION_CLOSED_FEE`; run 2 restores the invite-only fee after Plan B.
+- [x] 1.2 `_validateAll` pins the fee per stage; `verify-robinhood.sh` checks per-governor wiring read-only.
+- [x] 1.3 Runbook: creation closed in the gap, no sponsorship in the gap.
 - [x] 1.4 Regression test `test/audit-fixes/Deploy_ceremonyGapVault.t.sol`.
 
 ## 2. ETH/USD bound (V1-06)
