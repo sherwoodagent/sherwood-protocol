@@ -533,9 +533,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     // ── Deciding ──
 
-    /// @notice Cast a guardian's vote on a live challenge. Weight is the
-    ///         voter's staked WOOD one second before the filing — the same
-    ///         instant the challenge's total stake was measured at.
+    /// @notice Cast a guardian's vote on a live challenge. Weight is the lower
+    ///         of the voter's staked WOOD one second before the filing and one
+    ///         second before the proposal executed.
     /// @dev Four parties are refused: the challenger, the proposal's lead
     ///      proposer, its co-proposers, and the approvers the filing accuses.
     ///      Each has a direct stake in the verdict's own payouts.
@@ -552,6 +552,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (address(swood) == address(0)) revert ZeroAddress();
         if (!swood.isActiveGuardian(msg.sender)) revert NoVotableStake();
         uint256 weight = swood.getPastStake(msg.sender, c.filedAt - 1);
+        // Only stake held since before execution votes: stake added later never stood behind the call.
+        uint256 atExec = swood.getPastStake(msg.sender, c.executedAt - 1);
+        if (atExec < weight) weight = atExec;
         if (weight == 0) revert NoVotableStake();
 
         _voted[challengeId][msg.sender] = true;
