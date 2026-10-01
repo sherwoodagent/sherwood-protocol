@@ -35,7 +35,9 @@ proposals become unchallengeable (`file` reverts `NothingToFreeze`) — proven b
 ## 2. Facts to start from
 
 1. **No protocol-wide pause on `propose`.** `GuardianRegistry.pause()` stops review
-   voting and resolution only, for at most 7 days. Proposals keep arriving throughout.
+   voting and resolution only. It has no built-in expiry and the owner can hold it
+   indefinitely, but after `DEADMAN_UNPAUSE_DELAY` (7 days) anyone can `unpause()`.
+   Proposals keep arriving throughout.
 2. **`factory.pushWiring(governor)` is the only way to re-point a live governor.** It
    writes the governor's `tierRegistry`, `exposureLedger` and `bondEscrow` slots
    together, and reverts `ParamsFrozenDuringProposal` while that governor has ANY open
@@ -52,8 +54,9 @@ proposals become unchallengeable (`file` reverts `NothingToFreeze`) — proven b
      live implementation (ERC-1967 slot
      `0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc` of the
      registry proxy).
-   These are bytecode immutables that gate stored live parameters; a mismatch can
-   make later `forceSetParams` / `setReviewPeriod` calls fail.
+   These are bytecode immutables that bound stored live parameters; a mismatch
+   changes which values are accepted — it can loosen the floors, or make later
+   `forceSetParams` / `setReviewPeriod` calls fail.
 5. **`DeployAll` / `DeploySalts` cannot be reused as-is.** Every salt is in the
    `sherwood.robinhood.v1.*` namespace and `DeployAll.stageOf` treats any predicted
    address that already has code as done, so it will not deploy a new game or
@@ -68,27 +71,36 @@ proposals become unchallengeable (`file` reverts `NothingToFreeze`) — proven b
 Do the steps in this order. Assert every precondition on-chain immediately before
 the step.
 
+Global precondition: `owner() == SAFE` on `StakedWood`, `TierRegistry`,
+`ExposureLedger`, `GovernorBeacon`, `GuardianRegistry` and `SyndicateFactory` (and on
+the new game after step 1b). `TierRegistry`, `ExposureLedger`, `ChallengeGame` and the v1
+`TokenCourt` are `Ownable2Step`: the Safe must have called `acceptOwnership()`, so check
+`owner()`, not `pendingOwner()`.
+
 | # | Step | Caller | Call(s) | Assert BEFORE |
 |---|---|---|---|---|
 | 1a | Deploy v2 implementations | deployer | `new SyndicateGovernor(liveMinVoting, liveMinCooldown)`; `new GuardianRegistry(liveMinReviewPeriod)` | Arguments read from the live implementations (§2.4) |
-| 1b | Deploy the v2 game on the EXISTING ledger, new salt | deployer | `new ChallengeGame(SAFE, WOOD, existingLedger, tierRegistry)` — pass the Safe as `initialOwner` so step 5 is one Safe batch | Address is not any v1 salt's address |
-| 1c | Configure the new game | Safe | `newGame.setChallengeWindow(...)` if needed; `setVoteWindow`, `setChallengeQuorumBps`, `setChallengerBondBps`, `setForfeitBurnBps`, `setSettleBurnBps`, `setProsecutorFeeBps` per `docs/pre-deployment-parameter-review.md` | `newGame.challengeWindow() == ledger.challengeWindow() == oldGame.challengeWindow()`. Do not "copy" the old game's parameters: the v1 and v2 setter sets differ |
+| 1b | Deploy the v2 game on the EXISTING ledger, via CREATE3 under a new salt | `Create3Factory` owner (deployer) | `create3Factory.deploy(keccak256("sherwood.robinhood.v2.challenge-game"), abi.encodePacked(type(ChallengeGame).creationCode, abi.encode(SAFE, WOOD, existingLedger, tierRegistry)))` — the Safe is `initialOwner` so step 5 is one Safe batch | `create3Factory.addressOf(salt)` has no code and is not any v1 salt's address |
+| 1c | Configure the new game | Safe | `newGame.setChallengeWindow(...)` if needed; `setVoteWindow`, `setChallengeQuorumBps`, `setChallengerBondBps`, `setForfeitBurnBps`, `setSettleBurnBps`, `setProsecutorFeeBps` per `docs/pre-deployment-parameter-review.md` | `newGame.challengeWindow() == oldGame.challengeWindow()` (`≤ ledger.challengeWindow()` is already enforced by the constructor and `setChallengeWindow`). Do not "copy" the old game's parameters: the v1 and v2 setter sets differ |
 | 2 | Upgrade every governor | Safe | `GovernorBeacon.upgradeTo(govImplV2)` | `govImplV2.MIN_VOTING_PERIOD()` / `MIN_COOLDOWN_PERIOD()` equal the live implementation's |
 | 3 | Upgrade the registry | Safe | `GuardianRegistry.upgradeToAndCall(regImplV2, "")` | `regImplV2.minReviewPeriod()` equals the live implementation's |
 | 4 | Drain the old game | anyone / court | `oldGame.resolve(id)` once due; disputed challenges: `TokenCourt.refer` → `vote` → `finalize` (which calls `oldGame.rule`). Keep the old game as `swood.authorizedSlasher` and `tierRegistry.authorizedDemoter`, and keep `TokenCourt` wired, until done | See §4 for the choice about old-game filings |
-| 5 | Rotate roles — **one Safe transaction (MultiSend), in this order** | Safe | 1. `swood.setAuthorizedSlasher(newGame)` 2. `newGame.setStakedWood(swood)` 3. `tierRegistry.setAuthorizedDemoter(newGame)` 4. `ledger.setCoverageFreezer(newGame)` LAST | (a) `ledger.frozenCoverageCount() == 0`; (b) for `id` in `1..oldGame.challengeCount()`: `oldGame.challengeOf(id).status != Filed`; (c) for every executed proposal: `oldGame.challengeableUntil(keccak256(abi.encode(governor, proposalId))) < block.timestamp` (V2-02) |
+| 5 | Rotate roles — **one Safe transaction through `MultiSendCallOnly` (so `msg.sender` is the Safe for every call), in this order** | Safe | 1. `swood.setAuthorizedSlasher(newGame)` 2. `newGame.setStakedWood(swood)` 3. `tierRegistry.setAuthorizedDemoter(newGame)` 4. `ledger.setCoverageFreezer(newGame)` | (a) `ledger.frozenCoverageCount() == 0`; (b) for every executed proposal: `oldGame.liveChallengeCountOf(governor, proposalId) == 0`; (c) for every executed proposal: `oldGame.challengeableUntil(keccak256(abi.encode(governor, proposalId))) < block.timestamp` (V2-02). Only (a) is enforced on-chain, so once (a)–(c) hold: `oldGame.setFilingsPaused(true)`, re-check (a)–(c), then execute the batch |
 | 6 | Optional: redeploy `TierRegistry` | Safe | §5 | Step 5 done |
 | 7 | Re-point governors — ONLY if a factory pointer changed (e.g. §5) | Safe | `factory.setTierRegistry(TR2)` once, then `factory.pushWiring(governor)` for each governor, each inside its post-proposal cooldown | `governor.openProposalCount() == 0` for that governor; afterwards assert its `tierRegistry()`, `exposureLedger()`, `bondEscrow()` (§7) |
 
-Why the order in step 5 is forced:
+About the order in step 5:
 
-- `newGame.setStakedWood` reverts `RoleNotGranted` until sWOOD names the new game
-  `authorizedSlasher` (`test_rotation_setStakedWoodBeforeSlasherGrant_revertsRoleNotGranted`).
+- Forced by a guard: `newGame.setStakedWood` reverts `RoleNotGranted` until sWOOD names
+  the new game `authorizedSlasher`
+  (`test_rotation_setStakedWoodBeforeSlasherGrant_revertsRoleNotGranted`).
 - `ledger.setCoverageFreezer` reverts `CoverageFrozen` while any key is frozen, i.e.
   while any old-game challenge is live
   (`test_rotation_setCoverageFreezerWhileOldChallengeLive_revertsCoverageFrozen`).
-- The freezer goes last so nothing can be frozen before the new game's verdict path
-  (slasher, sWOOD, demoter) is complete.
+- Freezer last is a choice, not a guard: it keeps the new game unable to freeze until its
+  verdict path (slasher, sWOOD, demoter) is complete, matching `DeployPlanD`. Freezer
+  first would also be safe, since the new game's `file` reverts `ZeroAddress` while its
+  `stakedWood` is unset.
 - One transaction, because `file` is permissionless: a filing on the old game between
   the slasher grant and the freezer rotation freezes a key, makes the freezer call
   revert, and leaves the old game a freezer that can no longer slash. In one batch, such
@@ -108,9 +120,17 @@ Enumeration recipes for the preconditions:
 - Governors: for `i` in `1..factory.syndicateCount()`: `factory.governorOf(factory.syndicates(i).vault)`.
 - Executed proposals: for each governor, `pid` in `1..governor.proposalCount()` with
   `governor.getProposal(pid).executedAt != 0`.
-- Live old-game challenges: `oldGame.challengeOf(id).status == Filed` (v1 stores only
-  `Filed` as live; "disputed" is derived), or per proposal
-  `oldGame.liveChallengeCountOf(governor, proposalId) != 0`.
+- Live old-game challenges: per proposal `oldGame.liveChallengeCountOf(governor, proposalId) != 0`,
+  or per challenge (`id` in `1..oldGame.challengeCount()`)
+  `oldGame.challengeOf(id).status` is `Filed` OR `Disputed`. The v1 `challengeOf` view
+  reports `Disputed` for a live, counter-bonded challenge, so checking `Filed` alone misses
+  exactly the challenges that need `TokenCourt.refer` → `vote` → `finalize`; left
+  un-referred they time out through `resolve`, which re-arms the window.
+
+Why the precondition re-check matters: the Safe collects signatures over time, and only
+(a) is enforced by `setCoverageFreezer`. A challenge filed after the check can end without
+a verdict before the batch executes (e.g. a court `Inconclusive`, which refunds and
+re-arms), leaving (a) true and (c) false. Pausing old-game filings first closes that gap.
 
 ## 4. The drain trade-off — choose explicitly
 
@@ -132,7 +152,8 @@ Keeping the v1 `TierRegistry` is safe: every function v2 calls on it exists with
 same signature. Redeploy only if there is a reason to. If so, all of the following in
 the same Safe batch, BEFORE any governor or the new game is pointed at `TR2`:
 
-1. `new TierRegistry(SAFE)` under a new salt.
+1. Deploy `TierRegistry(SAFE)` the same way as the game in step 1b:
+   `create3Factory.deploy(keccak256("sherwood.robinhood.v2.tier-registry"), ...)`.
 2. `TR2.setStrategyFactory(<existing StrategyFactory>)` — do not redeploy the
    StrategyFactory; existing clones must stay registered.
 3. Replay every certification: `TR2.certify(target, selector, tier, boundBps, expectedCodehash)`
@@ -149,6 +170,10 @@ the same Safe batch, BEFORE any governor or the new game is pointed at `TR2`:
 8. On TR1, cancel every pending certification (`cancelCertification` /
    `cancelClassCertification`), otherwise anyone can complete it after the delay for
    governors still on TR1.
+9. Plan for the v1 registry's submitter bonds: a bond on a pair still certified on TR1
+   becomes releasable only after a TR1 `demote` / `demoteClass` starts its
+   `bondReleaseDelay` timer (then `claimSubmitterBond` / `claimClassSubmitterBond`).
+   Retiring TR1 without demoting leaves those bonds locked.
 
 Then step 7: `factory.setTierRegistry(TR2)` and `pushWiring` each governor in its
 cooldown. Until the last governor is re-pointed, the new game demotes only in TR2; on
@@ -192,3 +217,9 @@ Read on-chain; every line must hold.
 
 Update the address book and downstream consumers (CLI, app, guardian, skill) with the
 new game address by hand; the salt-derived tooling still points at the old one.
+
+## 8. Limitations
+
+The pinned tests use a v2 game standing in for the live v1 game. The behaviour of the
+v1 game and `TokenCourt` during the drain (live-status view, re-arms, court rulings) is
+verified by reading `origin/v1-deploy` source only, not by running v1 bytecode.
