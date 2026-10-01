@@ -562,14 +562,9 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), scaled, "sanity: stdstore write landed");
     }
 
-    /// @notice THE SIBLING FIX: with `effectiveMaxCapital` scaled down to
-    ///         10,000e6 (of a much larger declared `maxCapital`, since
-    ///         `GovEnvelope.permissive` prices it off the vault's full
-    ///         100,000e6 TVL), an owner-supplied rescue call that nets an
-    ///         outflow of 50,000e6 -- well within the OLD `p.maxCapital`
-    ///         widening, and well past the scaled ceiling -- must now
-    ///         revert `MaxNetOutflowExceeded`. Pre-fix this call would have
-    ///         executed under the full, unscaled `p.maxCapital`.
+    /// @notice An owner rescue that nets 50,000e6 out reverts `MaxNetOutflowExceeded(50_000e6, 0)`: since
+    ///         V1-02 the emergency batch has a zero net egress budget at every coverage level, so the
+    ///         scaled `effectiveMaxCapital` (10,000e6 here) no longer sets the bound.
     function test_finalizeEmergencySettle_scaledCeiling_blocksOversizedRescue() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
@@ -591,10 +586,10 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 50_000e6, 10_000e6));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 50_000e6, 0));
         governor.finalizeEmergencySettle(pid);
 
-        assertEq(usdc.balanceOf(sink), 0, "oversized rescue blocked by the scaled batch ceiling");
+        assertEq(usdc.balanceOf(sink), 0, "oversized rescue blocked by the zero egress budget");
         assertEq(
             uint256(governor.getProposal(pid).state),
             uint256(ISyndicateGovernor.ProposalState.Executed),

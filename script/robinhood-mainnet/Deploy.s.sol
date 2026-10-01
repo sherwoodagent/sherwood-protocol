@@ -15,7 +15,8 @@ import {RobinhoodParams} from "./RobinhoodParams.sol";
 ///         An abstract mixin — `DeployAll` owns `run()`, the broadcast and the address book.
 ///
 ///         Robinhood Chain is an Arbitrum Orbit L2 with no ENS registrar. Identity gating is ON:
-///         the factory takes the canonical ERC-8004 IdentityRegistry (`RobinhoodParams.AGENT_REGISTRY`).
+///         the factory takes the canonical ERC-8004 IdentityRegistry (`RobinhoodParams.AGENT_REGISTRY`),
+///         on Mainnet only from run 2's last step (`AGENT_REGISTRY_CLOSED` until then).
 abstract contract DeployRobinhoodMainnet is DeploySherwood {
     /// @notice Every `onlyOwner` write the deployer must make before `DeployAll._handoffAll` moves
     ///         the owner. Grouped so the set can be asserted as a set.
@@ -35,7 +36,14 @@ abstract contract DeployRobinhoodMainnet is DeploySherwood {
 
     /// @param ownerMultisig the Safe the handoff targeted, or `address(0)` when
     ///        the handoff was skipped (fork posture: the deployer keeps all).
-    function _validateMainnet(Deployed memory d, address deployer, address ownerMultisig, address wood) internal view {
+    /// @param agentRegistry the closed sentinel before run 2's last step on Mainnet, else the ERC-8004 registry.
+    function _validateMainnet(
+        Deployed memory d,
+        address deployer,
+        address ownerMultisig,
+        address wood,
+        address agentRegistry
+    ) internal view {
         SyndicateFactory factory = SyndicateFactory(d.factoryProxy);
 
         bool handedOff = ownerMultisig != address(0);
@@ -71,7 +79,7 @@ abstract contract DeployRobinhoodMainnet is DeploySherwood {
         // `createSyndicate`. Plan B's `TIER2_CALL_CAP_BPS` is a PRINTED policy figure for the
         // vault owner (`setTier2CallCapBps` is `onlyVaultOwner`); `CheckSyndicateParams` is the gate.
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
-        _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY);
+        _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), agentRegistry);
 
         _checkAddr("swood.wood", address(StakedWood(d.swoodProxy).wood()), wood);
         _checkAddr("swood.registry", StakedWood(d.swoodProxy).registry(), d.registryProxy);

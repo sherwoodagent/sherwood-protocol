@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Defines the always-on management fee: a time-weighted charge on deployed capital that
+Defines the always-on management fee: a time-weighted charge on the whole fund's assets
+while a proposal is Executed (not only the capital it deploys) that
 is owed whether the fund made money, lost money, or went nowhere, so that the parties
 doing continuous work — the agent managing the book and the guardian network reviewing
 every proposal — are funded in flat months.

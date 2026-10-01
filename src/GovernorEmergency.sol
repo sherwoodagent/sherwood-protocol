@@ -124,9 +124,9 @@ abstract contract GovernorEmergency is ProposalLifecycle {
 
         if (reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
 
-        // The one settle path with an egress budget: an owner unwind may need to fund a repay
-        // from the vault to free stuck collateral. Guardian-reviewed and owner-bonded for it.
-        ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), p.effectiveMaxCapital);
+        // Zero net egress: float may leave inside the batch only if at least as much returns before
+        // it ends (e.g. a fronted repay redeemed back). An insolvent unwind needs an outside donor.
+        ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), 0);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);
     }

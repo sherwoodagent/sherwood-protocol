@@ -12,6 +12,8 @@ library RobinhoodParams {
 
     // Canonical ERC-8004 IdentityRegistry on 4663: gates `createSyndicate` and `registerAgent`.
     address internal constant AGENT_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
+    // Mainnet factory's registry until run 2's last step: non-zero and codeless, so every `createSyndicate` reverts.
+    address internal constant AGENT_REGISTRY_CLOSED = 0x000000000000000000000000000000000000dEaD;
 
     // Factory / governor. 200 bps is the guardian-budget floor, stamped once per vault at initialize.
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
@@ -46,7 +48,10 @@ library RobinhoodParams {
 
     // WoodPoolFeed
     uint256 internal constant TWAP_WINDOW = 24 hours;
-    uint256 internal constant ETH_USD_MAX_AGE = 1 days;
+    // 4663's ETH/USD feed heartbeats at 24h, so a bound of exactly 24h halts every WOOD read on a
+    // round published one second late. Same 2h allowance as `ASSET_FEED_MAX_DELAY`.
+    uint256 internal constant ETH_USD_HEARTBEAT = 1 days;
+    uint256 internal constant ETH_USD_MAX_AGE = ETH_USD_HEARTBEAT + 2 hours;
     uint256 internal constant MIN_WETH_RESERVE = 10e18;
     // The V3 leg's depth floor, in in-range liquidity: half of what the live WOOD/WETH V3 pool carries.
     uint256 internal constant MIN_V3_LIQUIDITY = 1e22;

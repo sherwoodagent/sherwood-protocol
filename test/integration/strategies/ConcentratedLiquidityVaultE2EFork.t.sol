@@ -223,6 +223,7 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         TierRegistry(tierRegistry).setCounterpartyAllowed(MORPHO, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(UNISWAP_V3_FACTORY, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(mp.collateralToken, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(mp.oracle, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(WETH, true); // the volatile leg
         vm.stopPrank();
 
@@ -795,7 +796,11 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         // reverts "Price slippage check" once `o > h/19`. On the +/-360 band the
         // other tests use that is 19 ticks, which is why this pair runs on the
         // wide band instead.
-        _pushTicks(100);
+        // The trigger floors at one spacing (60 here, audit V2-03) of TWAP travel from the band's
+        // midpoint, and a TWAP does not move in-block: push 200, then let half a window elapse so
+        // the TWAP travels ~100 while spot stays ~100 ahead of it.
+        _pushTicks(200);
+        vm.warp(vm.getBlockTimestamp() + TWAP_WINDOW / 2);
         uint256 gap = _tickGap();
         console2.log("gap after push (ticks):", gap);
         assertGt(gap, 0, "no divergence at all - the guard was never exercised");
