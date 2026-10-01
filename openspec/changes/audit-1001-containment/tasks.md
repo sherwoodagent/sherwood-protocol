@@ -14,5 +14,5 @@
 ## 3. CL venue binding and rerange floor (V1-07, V2-03)
 
 - [x] 3.1 `positionManager.factory() == uniswapFactory` at init.
-- [x] 3.2 Rerange trigger threshold floored at one tick spacing in `_requireTriggerReached`.
+- [x] 3.2 Rerange trigger threshold floored at one tick spacing; a rerange onto an unchanged derived range reverts.
 - [x] 3.3 Regression tests `test/audit-fixes/CLStrategy_v107PmFactoryBinding.t.sol`, `test/audit-fixes/CLStrategy_v203RerangeTriggerFloor.t.sol`; fork-test first reranges given at least one spacing of TWAP travel.

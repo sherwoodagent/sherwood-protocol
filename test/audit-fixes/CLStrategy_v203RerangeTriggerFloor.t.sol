@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {CLFixture} from "../strategies/ConcentratedLiquidityStrategy.t.sol";
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
+import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
 
 /// @notice Calls `rerange()` `n` times in one transaction.
 contract RerangeLooper {
@@ -13,8 +14,8 @@ contract RerangeLooper {
     }
 }
 
-/// @notice Audit 2026-10-01 V2-03: the rerange trigger threshold is floored at one tick spacing,
-///         so the rerange budget cannot be spent in one transaction, whatever the TWAP's alignment.
+/// @notice Audit 2026-10-01 V2-03: a one-spacing trigger floor and the refusal of an unchanged derived
+///         range keep the rerange budget from being spent in one transaction, clamped range or not.
 contract CLStrategy_v203RerangeTriggerFloorTest is CLFixture {
     function _policyParams(int24 lower, int24 upper, int24 half, uint256 triggerBps, uint256 minInterval)
         internal
@@ -98,6 +99,55 @@ contract CLStrategy_v203RerangeTriggerFloorTest is CLFixture {
         int24 twap = negative ? -(20 + off) : 20 + off;
         (ConcentratedLiquidityStrategy s, RerangeLooper looper) =
             _deployExecuted(_policyParams(-200, 200, 200, 50, 0), twap);
+        _assertSecondSameTxRerangeReverts(s, looper);
+    }
+
+    /// @dev A spacing-60 pool for the same pair, so a clamped range stays spacing-aligned like a real one.
+    function _spacing60Pool() internal returns (MockUniswapV3Pool p) {
+        p = new MockUniswapV3Pool(address(usdg), address(nvda), 3000, 60, factory);
+        p.setLiquidity(POOL_LIQUIDITY);
+        p.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
+        factoryMock.register(address(usdg), address(nvda), 3000, address(p));
+    }
+
+    function _deployClamped(int24 half, uint256 triggerBps, int24 twap)
+        internal
+        returns (ConcentratedLiquidityStrategy s, RerangeLooper looper)
+    {
+        MockUniswapV3Pool p60 = _spacing60Pool();
+        ConcentratedLiquidityStrategy.InitParams memory params = _policyParams(-60_000, 60_000, half, triggerBps, 0);
+        params.pool = address(p60);
+        s = _newStrategy(params);
+        status.set(1, 1, address(s));
+        vm.prank(address(vaultStub));
+        usdg.approve(address(s), type(uint256).max);
+        p60.setTicks(twap, twap);
+        vm.prank(address(vaultStub));
+        s.execute();
+        looper = new RerangeLooper();
+    }
+
+    /// @notice Full-range policy at a realistic TWAP (-216,400): the clamped range repeats, and is refused.
+    function test_clampedFullRangePolicy_secondSameTxRerangeReverts() public {
+        (ConcentratedLiquidityStrategy s, RerangeLooper looper) =
+            _deployClamped(template.MAX_HALF_WIDTH_TICKS(), 1_000, -216_400);
+        _assertSecondSameTxRerangeReverts(s, looper);
+    }
+
+    /// @notice One-sided clamp (half-width 700k, TWAP +216,400, 1% trigger): one rerange per transaction.
+    function test_clampedOneSided_secondSameTxRerangeReverts() public {
+        (ConcentratedLiquidityStrategy s, RerangeLooper looper) = _deployClamped(700_000, 100, 216_400);
+        _assertSecondSameTxRerangeReverts(s, looper);
+    }
+
+    /// @notice Clamped configurations (large half-width, TWAP far from zero): at most one rerange per transaction.
+    function testFuzz_clampedAtMostOneRerangePerTransaction(int24 half, uint16 triggerBps, int24 twap, bool negative)
+        public
+    {
+        half = int24(bound(half, 690_000, template.MAX_HALF_WIDTH_TICKS()));
+        int24 t = int24(bound(twap, 150_000, 250_000));
+        (ConcentratedLiquidityStrategy s, RerangeLooper looper) =
+            _deployClamped(half, bound(triggerBps, 1, 10_000), negative ? -t : t);
         _assertSecondSameTxRerangeReverts(s, looper);
     }
 

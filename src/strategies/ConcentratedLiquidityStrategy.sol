@@ -151,9 +151,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @dev    A half-width wider than the tick domain itself cannot describe a
     ///         band any voter meant to approve, and letting one through would
     ///         make `_derivedRange` silently clamp to full-range — a materially
-    ///         different position from the one reviewed. Rejected at init so the
-    ///         clamp in `_derivedRange` only ever handles the edge case of a
-    ///         legitimate band running off the domain near an extreme tick.
+    ///         different position from the one reviewed. Below it the clamp still
+    ///         binds whenever `halfWidthTicks + |TWAP tick| > MAX_TICK` — on 4663 pools
+    ///         (~±200k from zero) that is any half-width above ~690k.
     int24 public constant MAX_HALF_WIDTH_TICKS = MAX_TICK;
 
     // ── Errors ──
@@ -974,6 +974,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         int24 twap = _requireSpotNearTwap();
         // (2) Price has reached the approved trigger fraction of the range.
         _requireTriggerReached(twap);
+        // The range depends only on the TWAP, so a same-transaction repeat (clamped or not) is a no-op.
+        (int24 newLower, int24 newUpper) = _derivedRange(twap);
+        if (newLower == tickLower && newUpper == tickUpper) revert RerangeTriggerNotReached();
 
         int24 oldLower = tickLower;
         int24 oldUpper = tickUpper;
@@ -981,8 +984,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         (uint128 liquidityBefore,) = _positionLiquidity(oldTokenId);
         _closePosition(oldTokenId);
-
-        (int24 newLower, int24 newUpper) = _derivedRange(twap);
 
         // Everything freed by the close is redeployed — both legs, which is why
         // the re-mint rebalances from measured balances rather than assuming it
