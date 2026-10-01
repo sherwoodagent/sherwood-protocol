@@ -86,8 +86,8 @@ contract UsdcMock is ERC20Mock {
 
 /// @notice The vault's batch guard is four structural rules and nothing else: every non-asset
 ///         target is a registered strategy; on the asset a call is a metered transfer
-///         (`transferFrom` from the vault only) or allowance-shaped, and every allowance-shaped
-///         call's first argument is reset after the batch; the meters bound the rest.
+///         (`transferFrom` from the vault only) or one of the approve family, whose first argument
+///         is reset after the batch, and any other selector reverts; the meters bound the rest.
 contract StructuralBatchRulesTest is Test {
     SyndicateGovernor governor;
     SyndicateVault vault;
@@ -268,6 +268,8 @@ contract StructuralBatchRulesTest is Test {
         template = new MorphoSupplyStrategy();
         strategyFactory.setTemplateApproval(address(template), true);
         tierRegistry.setCounterpartyAllowed(address(morpho), true);
+        tierRegistry.setCounterpartyAllowed(mp.oracle, true);
+        tierRegistry.setCounterpartyAllowed(mp.collateralToken, true);
     }
 
     function _morphoClone(address template, address proposer, uint256 amount) internal returns (address clone) {
@@ -352,6 +354,7 @@ contract StructuralBatchRulesTest is Test {
         tierRegistry.setCounterpartyAllowed(address(adapter), true);
         tierRegistry.setCounterpartyAllowed(address(posm), true);
         tierRegistry.setCounterpartyAllowed(address(clMorpho), true);
+        tierRegistry.setCounterpartyAllowed(clMp.oracle, true);
         tierRegistry.setCounterpartyAllowed(address(uniFactory), true);
         tierRegistry.setCounterpartyAllowed(address(spUsdc), true);
         tierRegistry.setCounterpartyAllowed(address(nvda), true);
@@ -565,14 +568,22 @@ contract StructuralBatchRulesTest is Test {
         assertEq(usdc.balanceOf(attacker), amount, "admitted within the cap");
     }
 
-    /// @notice Reads and well-formed grants on the asset are admitted; a read's first argument is
-    ///         reset like a spender, which is a no-op.
-    function test_assetReadsAndApproveAreAdmitted() public {
-        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](4);
-        calls[0] = _call(address(usdc), abi.encodeCall(usdc.balanceOf, (address(vault))));
-        calls[1] = _call(address(usdc), abi.encodeCall(usdc.allowance, (lp1, address(vault))));
-        calls[2] = _call(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1)));
-        calls[3] = _call(address(usdc), abi.encodeWithSignature("increaseAllowance(address,uint256)", attacker, 1));
+    /// @notice Reads on the asset are refused (nothing consumes a batch call's return value);
+    ///         well-formed grants are admitted and reset.
+    function test_assetReadsAreRefusedAndApproveIsAdmitted() public {
+        bytes[] memory reads = new bytes[](2);
+        reads[0] = abi.encodeCall(usdc.balanceOf, (address(vault)));
+        reads[1] = abi.encodeCall(usdc.allowance, (lp1, address(vault)));
+        for (uint256 i = 0; i < reads.length; i++) {
+            _expectBatchRevert(
+                _one(address(usdc), reads[i]),
+                0,
+                abi.encodeWithSelector(ISyndicateVault.UnrecognizedAssetSelector.selector, bytes4(reads[i]))
+            );
+        }
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
+        calls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1)));
+        calls[1] = _call(address(usdc), abi.encodeWithSignature("increaseAllowance(address,uint256)", attacker, 1));
         _runBatch(calls, 0);
         assertEq(usdc.allowance(address(vault), attacker), 0, "granted inside, gone after");
         assertEq(usdc.allowance(lp1, address(vault)), type(uint256).max, "the LP's own allowance is not the vault's");
@@ -598,9 +609,9 @@ contract StructuralBatchRulesTest is Test {
         }
     }
 
-    /// @notice Selectors the guard does not name reach the token, which answers for itself:
-    ///         an empty revert (no such function) rather than any guard error.
-    function test_unrecognisedAssetSelectorsReachTheToken() public {
+    /// @notice Selectors the guard does not name are refused before the token sees them; a
+    ///         recognised selector with malformed arguments still reaches the token, which reverts.
+    function test_unrecognisedAssetSelectorsAreRefusedBeforeTheToken() public {
         bytes[] memory shapes = new bytes[](4);
         shapes[0] = abi.encodeWithSignature(
             "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
@@ -618,7 +629,10 @@ contract StructuralBatchRulesTest is Test {
         for (uint256 i = 0; i < shapes.length; i++) {
             (bool ok, bytes memory ret) = address(usdc).call(shapes[i]);
             assertTrue(!ok && ret.length == 0, "control: the token itself reverts empty");
-            _expectBatchRevert(_one(address(usdc), shapes[i]), 0, "");
+            bytes memory err = i < 3
+                ? abi.encodeWithSelector(ISyndicateVault.UnrecognizedAssetSelector.selector, bytes4(shapes[i]))
+                : bytes("");
+            _expectBatchRevert(_one(address(usdc), shapes[i]), 0, err);
         }
     }
 
@@ -694,12 +708,16 @@ contract StructuralBatchRulesTest is Test {
         assertEq(usdc.balanceOf(address(vault)), DEPOSIT, "the float is intact");
     }
 
-    /// @notice A grant through a selector nobody has heard of is reset too: the rule is the
-    ///         shape of the call, not its name.
-    function test_unknownAllowanceShapedAssetSelectorIsReset() public {
+    /// @notice A grant through a selector outside the approve family is refused before it runs.
+    function test_unknownAllowanceShapedAssetSelectorIsRefused() public {
         _deployStack(new GrantSpendMock());
-        _runBatch(_one(address(usdc), abi.encodeWithSignature("grantSpend(address,uint256)", attacker, DEPOSIT)), 0);
-        assertEq(usdc.allowance(address(vault), attacker), 0, "reset without naming the selector");
+        bytes memory grant = abi.encodeWithSignature("grantSpend(address,uint256)", attacker, DEPOSIT);
+        _expectBatchRevert(
+            _one(address(usdc), grant),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.UnrecognizedAssetSelector.selector, bytes4(grant))
+        );
+        assertEq(usdc.allowance(address(vault), attacker), 0, "never granted");
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, attacker, 0, DEPOSIT));
         usdc.transferFrom(address(vault), attacker, DEPOSIT);
@@ -763,10 +781,13 @@ contract StructuralBatchRulesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
     }
 
-    /// @notice A zero first argument on the asset (`balanceOf(address(0))`) names no spender; the
-    ///         reset skips it instead of reverting `ERC20InvalidSpender` and losing the batch.
-    function test_zeroAddressArg0OnTheAssetExecutes() public {
-        _runBatch(_one(address(usdc), abi.encodeCall(usdc.balanceOf, (address(0)))), 0);
+    /// @notice A zero-address read on the asset (`balanceOf(address(0))`) is refused like any read.
+    function test_zeroAddressReadOnTheAssetIsRefused() public {
+        _expectBatchRevert(
+            _one(address(usdc), abi.encodeCall(usdc.balanceOf, (address(0)))),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.UnrecognizedAssetSelector.selector, usdc.balanceOf.selector)
+        );
     }
 
     // ── Propose-time mirror of the asset rules ──
@@ -776,14 +797,16 @@ contract StructuralBatchRulesTest is Test {
     function test_refusedAssetShapesAreRejectedAtPropose() public {
         CustomStrategy c = _custom();
         BatchExecutorLib.Call[] memory good = _one(address(usdc), abi.encodeCall(usdc.approve, (address(c), 0)));
-        bytes[] memory shapes = new bytes[](3);
-        bytes[] memory errs = new bytes[](3);
+        bytes[] memory shapes = new bytes[](4);
+        bytes[] memory errs = new bytes[](4);
         shapes[0] = abi.encodeCall(usdc.transferFrom, (lp1, address(vault), 1));
         errs[0] = abi.encodeWithSelector(ISyndicateVault.TransferFromNotVault.selector, lp1);
         shapes[1] = abi.encodePacked(usdc.approve.selector, new bytes(31));
         errs[1] = abi.encodeWithSelector(ISyndicateVault.MalformedAssetCall.selector, usdc.approve.selector);
         shapes[2] = abi.encodeCall(usdc.totalSupply, ());
         errs[2] = abi.encodeWithSelector(ISyndicateVault.MalformedAssetCall.selector, usdc.totalSupply.selector);
+        shapes[3] = abi.encodeCall(usdc.balanceOf, (address(vault)));
+        errs[3] = abi.encodeWithSelector(ISyndicateVault.UnrecognizedAssetSelector.selector, usdc.balanceOf.selector);
         for (uint256 i = 0; i < shapes.length; i++) {
             BatchExecutorLib.Call[] memory bad = _one(address(usdc), shapes[i]);
             _expectProposeRevert(address(c), good, bad, errs[i]);
@@ -791,12 +814,12 @@ contract StructuralBatchRulesTest is Test {
         }
     }
 
-    /// @notice Control: a metered `transfer` and a 36-byte read in a settle leg still propose.
-    function test_transferAndReadSettleLegsStillPropose() public {
+    /// @notice Control: a metered `transfer` and an `approve` in a settle leg still propose.
+    function test_transferAndApproveSettleLegsStillPropose() public {
         CustomStrategy c = _custom();
         BatchExecutorLib.Call[] memory settle = new BatchExecutorLib.Call[](2);
         settle[0] = _call(address(usdc), abi.encodeCall(usdc.transfer, (attacker, 1)));
-        settle[1] = _call(address(usdc), abi.encodeCall(usdc.balanceOf, (address(0))));
+        settle[1] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(c), 0)));
         uint256 pid = _propose(
             address(c),
             _one(address(usdc), abi.encodeCall(usdc.approve, (address(c), 0))),
