@@ -496,7 +496,8 @@ abstract contract DeployPlanB is ScriptBase {
         // the old unconditional "upgrade the beacon, then pushWiring" is correct on a fresh
         // chain and destroys a populated one.
         if (liveGovernors != 0) {
-            console.log("MANUAL NEXT: factory.pushWiring(<each existing governor>) -- %s syndicates.", liveGovernors);
+            console.log("existing governors need factory.pushWiring -- %s syndicates.", liveGovernors);
+            console.log("  DeployAll pushes it into every one next; a standalone run must do it by hand.");
             console.log("  DO *NOT* UPGRADE THE GOVERNOR BEACON: the layout was re-baselined");
             console.log("  non-append-only, so every live proxy would read garbage. No upgrade is");
             console.log("  needed -- pre-flight 5 confirmed the impl already exposes the Plan B wiring.");

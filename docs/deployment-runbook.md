@@ -54,9 +54,21 @@ Nothing is read from the environment. Every number comes from
    `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
    key owns every contract for this whole interval; that is the cost of the
    warm-up, and it is why step 2 hands nothing off.
-4. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
-   TokenCourt deploy, the handoff runs, and `deployAll` returns
-   `Checkpoint.Complete`. Addresses are written to `chains/4663.json` last.
+   **Before launch, record who holds the WOOD/WETH liquidity**: the V3 full-range
+   position and the V2 LP tokens, and whether each is locked. Below
+   `MIN_V3_LIQUIDITY` or `MIN_WETH_RESERVE` the feed reverts, which halts propose,
+   approve, execute and `ChallengeGame.file` until it recovers. Recovery is the
+   Safe deploying and keeping alive a replacement aggregator, then
+   `ExposureLedger.setWoodFeed(replacement, maxDelay)`.
+4. **Second run.** The same command. The stage gate passes, Plan B deploys, and
+   the run calls `factory.pushWiring` on every governor created since run 1 (those
+   vaults were minted with no ledger and no bond escrow); then Plan D and TokenCourt
+   deploy, the handoff runs, and `deployAll` returns `Checkpoint.Complete`.
+   Addresses are written to `chains/4663.json` last.
+   **If a governor has an open proposal, run 2 reverts** with
+   `ParamsFrozenDuringProposal` (forge simulates before it broadcasts, so nothing
+   is sent). Wait for that proposal to settle, be cancelled or expire, commit its
+   state (`resolveProposalState`), and re-run inside the cooldown that follows.
 5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
    `ExposureLedger`, `ChallengeGame` and `TokenCourt` (the one-step contracts —
    beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already
@@ -66,7 +78,9 @@ Nothing is read from the environment. Every number comes from
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
 6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
-   address from the book's `CREATE3_FACTORY` and fails on any disagreement.
+   address from the book's `CREATE3_FACTORY` and fails on any disagreement, and
+   checks that every live governor carries the factory's ledger, escrow and tier
+   registry.
 
 **Fork — one run.** Chain 9994663, `chains/9994663.json` committed. Same command
 with `--unlocked --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` instead of

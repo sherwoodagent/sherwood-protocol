@@ -212,6 +212,17 @@ else
   bad "ledger.woodPriceX8 resolves" "reverts or zero (NoWoodPrice)"
 fi
 check "ledger.protocolConfig.maxStrategyDuration" "$(call "$CONFIG" 'maxStrategyDuration()(uint256)')" "2592000"
+# Every live governor carries the factory's wiring. A vault created between run 1 and
+# run 2 was minted unwired; DeployAll's run 2 pushes it, this re-reads it.
+NSYN=$(call "$FACTORY" 'syndicateCount()(uint256)')
+for ((i = 1; i <= ${NSYN:-0}; i++)); do
+  SVAULT=$(cast call "$FACTORY" 'syndicates(uint256)(uint256,address,address,string,uint256,bool,string)' "$i" \
+    --rpc-url "$RPC" 2>/dev/null | sed -n 2p | awk '{print $1}')
+  SGOV=$(call1 "$FACTORY" 'governorOf(address)(address)' "$SVAULT")
+  check "governor #$i.exposureLedger"   "$(call "$SGOV" 'exposureLedger()(address)')"    "$LEDGER"
+  check "governor #$i.bondEscrow"       "$(call "$SGOV" 'bondEscrow()(address)')"        "$ESCROW"
+  check "governor #$i.tierRegistry"     "$(call "$SGOV" 'tierRegistry()(address)')"      "$TIERS"
+done
 
 echo; echo "── Plan D: the three roles, all on THIS game ──"
 check "ledger.coverageFreezer"        "$(call "$LEDGER" 'coverageFreezer()(address)')"   "$GAME"

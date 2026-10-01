@@ -26,6 +26,7 @@ import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {TokenCourt} from "../../src/TokenCourt.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 /// @notice How far a run got. A Mainnet ceremony is TWO runs: the first mints the
 ///         `WoodPoolFeed` and stops here, the second (after a keeper has primed it) completes.
@@ -164,6 +165,8 @@ contract DeployAll is
         }
 
         (s.exposureLedger, s.proposerBondEscrow) = deploy(_planBBook(s, i));
+        // A vault created between run 1 and run 2 holds a governor with no ledger and no escrow.
+        _pushWiringAll(factory);
         s.challengeGame = deploy(_planDBook(s, i));
         _deployCourt(s);
         _wireCourt(s);
@@ -174,6 +177,28 @@ contract DeployAll is
         // deployer, so this is a no-op rather than a skipped step.
         _handoffAll(s, i.ownerMultisig);
         cp = Checkpoint.Complete;
+    }
+
+    /// @notice Push the factory's wiring into every governor it already deployed.
+    /// @dev Skips a governor already wired, so a resumed run sends nothing. NOT try/caught:
+    ///      `pushWiring` reverts `ParamsFrozenDuringProposal` while a governor has an open
+    ///      proposal, and that must stop the ceremony rather than leave the governor unwired.
+    function _pushWiringAll(SyndicateFactory factory) internal {
+        uint256 n = factory.syndicateCount();
+        for (uint256 id = 1; id <= n; ++id) {
+            ISyndicateGovernor gov = _governorOfSyndicate(factory, id);
+            if (!_governorIsWired(factory, gov)) factory.pushWiring(address(gov));
+        }
+    }
+
+    function _governorOfSyndicate(SyndicateFactory factory, uint256 id) internal view returns (ISyndicateGovernor) {
+        (, address vault,,,,,) = factory.syndicates(id);
+        return ISyndicateGovernor(factory.governorOf(vault));
+    }
+
+    function _governorIsWired(SyndicateFactory factory, ISyndicateGovernor gov) internal view returns (bool) {
+        return gov.exposureLedger() == factory.exposureLedger() && gov.bondEscrow() == factory.bondEscrow()
+            && gov.tierRegistry() == factory.tierRegistry();
     }
 
     /// @dev Each phase re-derives its own address, and only the eight core fields are checked
@@ -479,6 +504,14 @@ contract DeployAll is
         require(TokenCourt(s.tokenCourt).challengeGame() == s.challengeGame, "wiring: court.challengeGame");
         require(TokenCourt(s.tokenCourt).stakedWood() == s.core.swoodProxy, "wiring: court.stakedWood");
         require(ChallengeGame(s.challengeGame).court() == s.tokenCourt, "wiring: game.court");
+        // Every live governor carries the factory's wiring, including one created before run 2.
+        for (uint256 id = 1; id <= factory.syndicateCount(); ++id) {
+            ISyndicateGovernor gov = _governorOfSyndicate(factory, id);
+            string memory tag = string.concat("governor #", vm.toString(id));
+            _checkAddr(string.concat(tag, ".exposureLedger"), gov.exposureLedger(), factory.exposureLedger());
+            _checkAddr(string.concat(tag, ".bondEscrow"), gov.bondEscrow(), factory.bondEscrow());
+            _checkAddr(string.concat(tag, ".tierRegistry"), gov.tierRegistry(), factory.tierRegistry());
+        }
 
         // Plan B pre-flight 10 in its new home. The ledger's owner is the slashing and
         // freeze authority; on Mainnet it must end up at a CONTRACT (the Safe), and a
