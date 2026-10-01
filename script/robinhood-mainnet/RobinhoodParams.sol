@@ -12,13 +12,13 @@ library RobinhoodParams {
 
     // Canonical ERC-8004 IdentityRegistry on 4663: gates `createSyndicate` and `registerAgent`.
     address internal constant AGENT_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
+    // Mainnet factory's registry until run 2's last step: non-zero and codeless, so every `createSyndicate` reverts.
+    address internal constant AGENT_REGISTRY_CLOSED = 0x000000000000000000000000000000000000dEaD;
 
     // Factory / governor. 200 bps is the guardian-budget floor, stamped once per vault at initialize.
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
     // Invite-only window: 1M WOOD (~$5.9k) per unsponsored fund, so sponsorship is the way in.
     uint256 internal constant INVITE_ONLY_CREATION_FEE = 1_000_000e18;
-    // Unpayable: creation is closed between run 1 and run 2, so no vault predates the coverage layer.
-    uint256 internal constant CREATION_CLOSED_FEE = type(uint256).max;
     // Governor-impl IMMUTABLE, so this deploy is the only chance to set it. Held at the
     // per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod` itself;
     // the operating value is the factory's 24h default, which owners may now lower.

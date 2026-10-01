@@ -213,7 +213,7 @@ else
 fi
 check "ledger.protocolConfig.maxStrategyDuration" "$(call "$CONFIG" 'maxStrategyDuration()(uint256)')" "2592000"
 # Every live governor carries the factory's wiring. A vault created between run 1 and
-# run 2 would be minted unwired; run 1 closes creation until run 2, this re-reads it.
+# run 2 would be minted unwired; the closed registry sentinel prevents it, this re-reads it.
 NSYN=$(call "$FACTORY" 'syndicateCount()(uint256)')
 [ -n "$NSYN" ] || bad "factory.syndicateCount" "unreadable (governor wiring NOT checked)"
 for ((i = 1; i <= ${NSYN:-0}; i++)); do

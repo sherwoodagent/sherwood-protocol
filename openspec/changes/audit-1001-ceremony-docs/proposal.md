@@ -14,9 +14,10 @@ and specs that the code does not match.
 
 ## What Changes
 
-- `DeployAll` run 1 closes syndicate creation (unpayable fee) and run 2 reopens it at the
-  invite-only fee once the coverage layer is wired, so no vault can predate it. `_validateAll` pins
-  the fee per stage; `verify-robinhood.sh` checks every live governor's wiring read-only.
+- On Mainnet the factory is initialised with a closed agent-registry sentinel (non-zero, codeless),
+  so no syndicate can be created during run 1 or the gap; run 2's last step before the handoff
+  points it at the ERC-8004 registry. `_validateAll` pins the registry per stage;
+  `verify-robinhood.sh` checks every live governor's wiring read-only.
 - `ETH_USD_MAX_AGE` becomes 26h; the feed phase refuses a bound at or below the 24h heartbeat.
 - Documentation only, no contract logic: lock retention for never-executed proposals (V1-08),
   sibling-challenge referral (V1-09), liquidity-holder check and feed recovery (V1-10), the
@@ -26,7 +27,7 @@ and specs that the code does not match.
 
 ### Modified Capabilities
 
-- `deployment-docs`: creation closed between the two Mainnet runs; the ETH/USD bound exceeds the heartbeat.
+- `deployment-docs`: creation closed until the end of Mainnet run 2; the ETH/USD bound exceeds the heartbeat.
 - `management-fee`: the base is the whole fund while a proposal is Executed.
 
 ## Impact

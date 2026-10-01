@@ -2,21 +2,26 @@
 
 ## ADDED Requirements
 
-### Requirement: Syndicate creation is closed between Mainnet run 1 and run 2
-A governor minted before the Plan B phase has wired the factory carries no exposure ledger and no bond escrow, and nothing in the ceremony can reliably wire it afterwards: `pushWiring` reverts while the governor has an open proposal, and a gap-vault owner can keep one open indefinitely. Run 1 SHALL therefore set the creation fee to `type(uint256).max` (`RobinhoodParams.CREATION_CLOSED_FEE`), in WOOD, payable to `OWNER_MULTISIG`, before the stage gate, so `createSyndicate` reverts for every non-sponsored creator. Run 2 SHALL restore `INVITE_ONLY_CREATION_FEE` only after the Plan B phase has wired the factory's ledger and escrow, and only while the fee still equals the closed value, so a resumed run never overwrites a fee the Safe has since set. The `AwaitingWoodFeed` validation SHALL require the closed fee and the `Complete` validation the invite-only fee. Sponsorship (`setCreationSponsored`) bypasses the fee, so the runbook SHALL tell the deployer not to grant it during the gap. `script/verify-robinhood.sh` SHALL still check, read-only, that every live governor's ledger, escrow and tier registry equal the factory's.
+### Requirement: Syndicate creation is closed until the end of Mainnet run 2
+A governor minted before the Plan B phase has wired the factory carries no exposure ledger and no bond escrow, and nothing in the ceremony can reliably wire it afterwards: `pushWiring` reverts while the governor has an open proposal, and a gap-vault owner can keep one open indefinitely. On Mainnet posture the factory SHALL therefore be initialised with a closed agent-registry sentinel, `RobinhoodParams.AGENT_REGISTRY_CLOSED`: a non-zero, codeless address (zero would turn identity gating off). `createSyndicate` calls `ownerOf` on it and reverts for every caller, sponsored or not, from the factory's own initialisation transaction onward — through all of run 1 and the gap. As the last step of run 2 before the handoff, while the deployer still owns the factory and only while the registry still equals the sentinel, the ceremony SHALL require `syndicateCount() == 0` and call `setAgentRegistry(RobinhoodParams.AGENT_REGISTRY)`. The pre-flight SHALL refuse a sentinel that holds code. The `AwaitingWoodFeed` validation SHALL require the sentinel and `syndicateCount() == 0`; the `Complete` validation the real registry. Fork posture is unchanged: one run, the real registry from initialisation. `script/verify-robinhood.sh` SHALL still check, read-only, that every live governor's ledger, escrow and tier registry equal the factory's.
 
-#### Scenario: No vault can be created in the gap
-- **GIVEN** run 1 has completed at `AwaitingWoodFeed`
-- **WHEN** an outsider holding WOOD, a prepared owner stake and an agent identity calls `createSyndicate`
+#### Scenario: No vault can be created from the factory's initialisation
+- **GIVEN** `deployCore` has just initialised the Mainnet factory
+- **WHEN** an outsider with a prepared owner stake and an agent identity calls `createSyndicate`
 - **THEN** the call reverts and `syndicateCount()` stays zero
+
+#### Scenario: Sponsorship does not open the gap
+- **GIVEN** run 1 has completed at `AwaitingWoodFeed` and the deployer has sponsored a creator
+- **WHEN** that creator calls `createSyndicate`
+- **THEN** the call reverts
 
 #### Scenario: Run 2 opens creation and every vault is wired at creation
 - **WHEN** run 2 completes
-- **THEN** the creation fee is the invite-only fee, a new syndicate's governor has the factory's `exposureLedger` and `bondEscrow` from creation, and a full-capital proposal with no approvals reverts `InsufficientApproveCoverage` at execute
+- **THEN** the factory's registry is the ERC-8004 registry, creation costs the invite-only fee, a new syndicate's governor has the factory's `exposureLedger` and `bondEscrow` from creation, and a full-capital proposal with no approvals reverts `InsufficientApproveCoverage` at execute
 
-#### Scenario: Validation refuses an open fee between the runs
-- **WHEN** `_validateAll` runs at `AwaitingWoodFeed` and the creation fee is anything but the closed value
-- **THEN** it reverts `factory.creationFee`
+#### Scenario: Validation refuses an open registry or a syndicate between the runs
+- **WHEN** `_validateAll` runs at `AwaitingWoodFeed` and the registry is not the sentinel, or a syndicate exists
+- **THEN** it reverts naming the registry or the syndicate count
 
 ### Requirement: The ETH/USD staleness bound exceeds the feed heartbeat
 `RobinhoodParams.ETH_USD_MAX_AGE` SHALL be strictly greater than the 4663 ETH/USD feed's 24h heartbeat (`ETH_USD_HEARTBEAT`); the shipped value is 26 hours, the same 2h allowance as `ASSET_FEED_MAX_DELAY`. At exactly the heartbeat a round published one second late makes `WoodPoolFeed` revert, which halts propose, approve, execute and `ChallengeGame.file` protocol-wide. The WOOD feed phase's pre-flight SHALL refuse a bound at or below the heartbeat before anything is minted.

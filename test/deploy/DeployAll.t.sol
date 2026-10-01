@@ -46,6 +46,10 @@ contract DeployAllHarness is DeployAll {
         _preflight(i);
     }
 
+    function exposed_coreConfig(Inputs memory i) external pure returns (Config memory) {
+        return _coreConfig(i);
+    }
+
     function exposed_validateAll(Stack memory s, Inputs memory i, Checkpoint cp) external view {
         _validateAll(s, i, cp);
     }
@@ -424,14 +428,14 @@ contract DeployAllTest is DeployAllFixture {
         _assertOneStepOwners(first, deployer);
         Inputs memory i = _inputs(Posture.Mainnet);
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
-        // Creation is closed between the runs (unpayable fee); run 2 opens it at the window fee.
+        // Invite-only from run 1: creation already costs the window fee, paid to the Safe.
         SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
-        assertEq(factory.creationFee(), RobinhoodParams.CREATION_CLOSED_FEE, "creation closed after run 1");
+        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "creation fee set in run 1");
         assertEq(address(factory.creationFeeToken()), i.wood, "fee paid in WOOD");
         assertEq(factory.creationFeeRecipient(), address(safe), "fee goes to the Safe");
         assertTrue(factory.ownerOnlyProposals(), "owner-only proposals set in run 1");
-        // Pinned literally, not via RobinhoodParams, so zeroing or mistyping the constant fails here.
-        assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
+        // Creation is closed through run 1 and the gap: a non-zero codeless registry sentinel.
+        assertEq(address(factory.agentRegistry()), 0x000000000000000000000000000000000000dEaD, "closed sentinel");
 
         _primeWoodFeed(first.woodUsdFeed);
 
@@ -446,7 +450,8 @@ contract DeployAllTest is DeployAllFixture {
         _assertTwoStepPending(s, address(safe));
         script.exposed_validateAll(s, i, Checkpoint.Complete);
         assertTrue(script.stageOf(s, address(safe)) == Stage.Done, "stageOf == Done");
-        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "run 2 opens creation");
+        // Pinned literally, not via RobinhoodParams, so zeroing or mistyping the constant fails here.
+        assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
     }
 
     /// @notice Validation refuses a run-1 factory whose owner-only-proposals flag was lifted.
@@ -461,13 +466,13 @@ contract DeployAllTest is DeployAllFixture {
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
     }
 
-    /// @notice Validation refuses a run-1 creation fee that is not the closed fee, in WOOD, to the Safe.
+    /// @notice Validation refuses a run-1 creation fee that is not 1M WOOD paid to the Safe.
     function test_mainnet_validateAllRefusesADriftedCreationFee() public {
         vm.chainId(MAINNET_CHAIN_ID);
         (Stack memory first,) = _runCeremony(Posture.Mainnet);
         Inputs memory i = _inputs(Posture.Mainnet);
         SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
-        uint256 fee = RobinhoodParams.CREATION_CLOSED_FEE;
+        uint256 fee = RobinhoodParams.INVITE_ONLY_CREATION_FEE;
 
         vm.prank(deployer);
         factory.setCreationFee(i.wood, fee - 1, address(safe));

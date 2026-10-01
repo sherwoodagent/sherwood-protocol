@@ -49,11 +49,12 @@ Nothing is read from the environment. Every number comes from
      --gas-estimate-multiplier 200
    ```
    It stops at `Checkpoint.AwaitingWoodFeed`: `WoodPoolFeed` is minted, nothing
-   of Plan B is, and **no ownership has moved**. **Creation is closed** until run 2:
-   the creation fee is `type(uint256).max`, which nobody can pay, because a vault
-   minted now would get a governor with no exposure ledger and no bond escrow.
-   **Do not grant creation sponsorship in this gap**: a sponsored creator skips
-   the fee.
+   of Plan B is, and **no ownership has moved**. **No syndicate can be created**:
+   the factory is initialised with a closed agent-registry sentinel
+   (`AGENT_REGISTRY_CLOSED`, non-zero and codeless), so every `createSyndicate`
+   reverts, sponsored or not, from the factory's own initialisation until run 2's
+   last step. A vault minted earlier would get a governor with no exposure ledger
+   and no bond escrow.
 3. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
    `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
    key owns every contract for this whole interval; that is the cost of the
@@ -64,11 +65,14 @@ Nothing is read from the environment. Every number comes from
    approve, execute and `ChallengeGame.file` until it recovers. Recovery is the
    Safe deploying and keeping alive a replacement aggregator, then
    `ExposureLedger.setWoodFeed(replacement, maxDelay)`.
-4. **Second run.** The same command. The stage gate passes, Plan B deploys and
-   wires the ledger and escrow into the factory, and the run then opens creation at
-   the invite-only fee (1M WOOD to the Safe). Plan D and TokenCourt deploy, the
-   handoff runs, and `deployAll` returns `Checkpoint.Complete`. Addresses are
-   written to `chains/4663.json` last.
+4. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
+   TokenCourt deploy, and as its last step before the handoff the run opens
+   creation by pointing the factory at the real ERC-8004 registry (refusing if any
+   syndicate exists). Creation then costs the invite-only fee (1M WOOD to the Safe).
+   The handoff runs and `deployAll` returns `Checkpoint.Complete`. Addresses are
+   written to `chains/4663.json` last. If a `WoodPoolFeed` with a different
+   `ethUsdMaxAge` was already deployed on the target chain, the run refuses to
+   adopt it: deploy a new feed under a new salt and prime it.
 5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
    `ExposureLedger`, `ChallengeGame` and `TokenCourt` (the one-step contracts —
    beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already

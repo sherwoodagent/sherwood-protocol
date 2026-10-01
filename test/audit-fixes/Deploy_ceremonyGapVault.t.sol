@@ -2,10 +2,10 @@
 pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 import {DeployAllFixture} from "../deploy/DeployAll.t.sol";
 import {Checkpoint} from "../../script/robinhood-mainnet/DeployAll.s.sol";
+import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {Posture, Inputs, Stack} from "../../script/robinhood-mainnet/DeployTypes.sol";
 import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
 
@@ -35,8 +35,9 @@ contract GapInertStrategy {
 }
 
 /// @title Deploy_ceremonyGapVault — audit 2026-10-01 V1-05 regression
-/// @notice Creation is closed between Mainnet run 1 and run 2 (unpayable fee), so no vault can
-///         predate the coverage layer; run 2 opens it, and every vault is wired at creation.
+/// @notice The Mainnet factory is initialised with a closed agent-registry sentinel, so no vault
+///         can be created during run 1 or the gap; run 2's last step opens creation and every vault
+///         is wired at creation.
 contract DeployCeremonyGapVaultTest is DeployAllFixture {
     uint256 internal constant DEPOSIT = 10_000e6; // $10k USDG
     uint256 internal constant STAKE = 10_000e18; // RobinhoodParams.MIN_OWNER_STAKE
@@ -86,17 +87,14 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
         gov = SyndicateGovernor(factory.governorOf(v));
     }
 
-    /// @dev Asserts an outsider holding the invite-only fee cannot create in the gap.
-    function _assertCreationClosed(Stack memory first, address who) internal {
-        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
-        uint256 agentId = _prepareCreator(first, who, RobinhoodParams.INVITE_ONLY_CREATION_FEE);
-        uint256 bal = wood.balanceOf(who);
+    /// @dev Asserts `who` (identity, prepared stake, the fee in hand) cannot create: the closed
+    ///      sentinel registry has no code, so the identity check reverts with empty data.
+    function _assertCreationClosed(Stack memory st, address who) internal {
+        SyndicateFactory factory = SyndicateFactory(st.core.factoryProxy);
+        assertEq(address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY_CLOSED, "closed sentinel");
+        uint256 agentId = _prepareCreator(st, who, RobinhoodParams.INVITE_ONLY_CREATION_FEE);
         vm.prank(who);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                IERC20Errors.ERC20InsufficientBalance.selector, who, bal, RobinhoodParams.CREATION_CLOSED_FEE
-            )
-        );
+        vm.expectRevert(bytes(""));
         factory.createSyndicate(agentId, _config("gapfund"));
         assertEq(factory.syndicateCount(), 0, "no vault predates the coverage layer");
     }
@@ -167,24 +165,40 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
 
     // ───────────────────────────── tests ─────────────────────────────
 
-    /// @notice After run 1 an outsider with WOOD, a prepared owner stake and an agent identity
-    ///         cannot create a syndicate: the fee is unpayable until run 2.
-    function test_gap_creationClosedAfterRun1() public {
-        Stack memory first = _runOne();
-        assertEq(SyndicateFactory(first.core.factoryProxy).creationFee(), RobinhoodParams.CREATION_CLOSED_FEE, "closed");
-        _assertCreationClosed(first, makeAddr("gapOwner"));
+    /// @notice Right after `deployCore` — the factory's own initialisation, before anything else
+    ///         in run 1 — an outsider with a prepared stake and an agent identity cannot create.
+    function test_closedFromFactoryInit() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        DeploySherwood.Config memory cfg = script.exposed_coreConfig(_inputs(Posture.Mainnet));
+        vm.prank(deployer);
+        DeploySherwood.Deployed memory core = script.deployCore(cfg);
+        Stack memory st;
+        st.core = core;
+        _assertCreationClosed(st, makeAddr("frontrunner"));
     }
 
-    /// @notice After run 2 the fee is the invite-only fee, creation works, the governor is wired
-    ///         at creation, and a zero-approval full-capital proposal reverts at execute.
+    /// @notice Still closed after run 1 completes, including for a creator the deployer SPONSORED.
+    function test_gap_closedAfterRun1_evenWhenSponsored() public {
+        Stack memory first = _runOne();
+        _assertCreationClosed(first, makeAddr("gapOwner"));
+
+        address sponsored = makeAddr("sponsored");
+        vm.prank(deployer);
+        SyndicateFactory(first.core.factoryProxy).setCreationSponsored(sponsored, true);
+        _assertCreationClosed(first, sponsored);
+    }
+
+    /// @notice After run 2 the registry is the real one, creation works at the invite-only fee,
+    ///         the governor is wired at creation, and a zero-approval full-capital proposal reverts.
     function test_afterRun2_creationOpen_governorWired_executeNeedsCoverage() public {
         Stack memory s = _runTwo(_runOne());
         SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
-        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "run 2 opens creation");
-        assertEq(factory.creationFeeRecipient(), address(safe), "fee to the Safe");
+        assertEq(address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY, "run 2 opens creation");
+        assertEq(factory.creationFee(), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "invite-only fee");
 
         address owner_ = makeAddr("postOwner");
         (SyndicateVault vault, SyndicateGovernor gov, uint256 agentId) = _create(s, owner_, "postfund");
+        assertEq(wood.balanceOf(address(safe)), RobinhoodParams.INVITE_ONLY_CREATION_FEE, "fee paid to the Safe");
         assertTrue(factory.exposureLedger() != address(0), "factory issues the ledger");
         assertEq(gov.exposureLedger(), factory.exposureLedger(), "ledger wired at creation");
         assertEq(gov.bondEscrow(), factory.bondEscrow(), "escrow wired at creation");
@@ -205,17 +219,29 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
         assertEq(usdg.balanceOf(address(vault)), DEPOSIT, "vault intact");
     }
 
-    /// @notice Validation at `AwaitingWoodFeed` refuses any fee but the closed one.
-    function test_validateAll_awaitingFeed_refusesAnOpenFee() public {
+    /// @notice Validation at `AwaitingWoodFeed` refuses a non-sentinel registry and any syndicate;
+    ///         run 2 itself refuses to open creation over an existing syndicate.
+    function test_validateAll_awaitingFeed_refusesOpenRegistryOrSyndicates() public {
         Stack memory first = _runOne();
         Inputs memory i = _inputs(Posture.Mainnet);
+        SyndicateFactory factory = SyndicateFactory(first.core.factoryProxy);
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
 
         vm.prank(deployer);
-        SyndicateFactory(first.core.factoryProxy)
-            .setCreationFee(i.wood, RobinhoodParams.INVITE_ONLY_CREATION_FEE, address(safe));
-        vm.expectRevert(bytes("factory.creationFee"));
+        factory.setAgentRegistry(RobinhoodParams.AGENT_REGISTRY);
+        vm.expectRevert(bytes("factory.agentRegistry mismatch"));
         script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+
+        _create(first, makeAddr("slipped"), "slipped");
+        vm.prank(deployer);
+        factory.setAgentRegistry(RobinhoodParams.AGENT_REGISTRY_CLOSED);
+        vm.expectRevert(bytes("factory.syndicateCount != 0 before creation opened"));
+        script.exposed_validateAll(first, i, Checkpoint.AwaitingWoodFeed);
+
+        _primeWoodFeed(first.woodUsdFeed);
+        vm.prank(deployer);
+        vm.expectRevert(bytes("a syndicate exists before creation was opened"));
+        script.deployAll(i);
     }
 
     /// @notice Negative pin of the PR #368 review stall: a gap owner who would create a vault,
@@ -226,5 +252,16 @@ contract DeployCeremonyGapVaultTest is DeployAllFixture {
         _assertCreationClosed(first, makeAddr("staller"));
         Stack memory s = _runTwo(first);
         script.exposed_validateAll(s, _inputs(Posture.Mainnet), Checkpoint.Complete);
+    }
+
+    /// @notice A fork completes in one run with the real registry, and a re-run sends nothing new.
+    function test_fork_realRegistryFromTheStart_rerunIsQuiet() public {
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
+        SyndicateFactory factory = SyndicateFactory(s.core.factoryProxy);
+        assertEq(address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY, "fork: real registry");
+        (, Checkpoint cp) = _runCeremony(Posture.Fork);
+        assertTrue(cp == Checkpoint.Complete, "re-run completes");
+        assertEq(address(factory.agentRegistry()), RobinhoodParams.AGENT_REGISTRY, "unchanged");
     }
 }

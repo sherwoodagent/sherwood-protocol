@@ -2,9 +2,9 @@
 
 ## 1. Ceremony (V1-05)
 
-- [x] 1.1 `DeployAll` run 1 sets the creation fee to `CREATION_CLOSED_FEE`; run 2 restores the invite-only fee after Plan B.
-- [x] 1.2 `_validateAll` pins the fee per stage; `verify-robinhood.sh` checks per-governor wiring read-only.
-- [x] 1.3 Runbook: creation closed in the gap, no sponsorship in the gap.
+- [x] 1.1 Mainnet factory initialised with `AGENT_REGISTRY_CLOSED`; run 2's last step sets the real registry.
+- [x] 1.2 `_validateAll` pins the registry and `syndicateCount` per stage; `verify-robinhood.sh` checks per-governor wiring read-only.
+- [x] 1.3 Runbook: creation closed from factory initialisation until run 2's last step; adopt-path feed note.
 - [x] 1.4 Regression test `test/audit-fixes/Deploy_ceremonyGapVault.t.sol`.
 
 ## 2. ETH/USD bound (V1-06)
