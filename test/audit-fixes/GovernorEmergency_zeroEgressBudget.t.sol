@@ -90,22 +90,24 @@ contract ZeroEgress_Lender {
     IERC20 public immutable collateral;
     address public borrower;
     uint256 public debt;
+    uint256 public collateralAmount;
 
     constructor(IERC20 d, IERC20 c) {
         debtToken = d;
         collateral = c;
     }
 
-    function open(address b, uint256 amount) external {
+    function open(address b, uint256 amount, uint256 collat) external {
         borrower = b;
         debt = amount;
+        collateralAmount = collat;
     }
 
     function repay() external {
         require(msg.sender == borrower, "borrower");
         debtToken.transferFrom(msg.sender, address(this), debt);
         debt = 0;
-        collateral.transfer(borrower, collateral.balanceOf(address(this)));
+        collateral.transfer(borrower, collateralAmount);
     }
 }
 
@@ -526,7 +528,7 @@ contract GovernorEmergency_zeroEgressBudgetTest is Test {
         ZeroEgress_RepayStrategy s = new ZeroEgress_RepayStrategy(address(vault), owner, usdc, weth);
         ZeroEgress_Lender lender = new ZeroEgress_Lender(usdc, weth);
         s.setLender(lender);
-        lender.open(address(s), debt);
+        lender.open(address(s), debt, collat);
         weth.mint(address(lender), collat);
         strategyFactory.registerStrategy(address(s));
         uint256 pid = _executedAndMatured(address(s), TVL, _call(address(s), abi.encodeWithSignature("settle()")), 0);
@@ -554,6 +556,35 @@ contract GovernorEmergency_zeroEgressBudgetTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertEq(weth.balanceOf(address(vault)), collat, "collateral back in the vault");
         assertEq(usdc.balanceOf(address(vault)), TVL, "vault float untouched");
+        assertEq(lender.debt(), 0, "debt repaid");
+    }
+
+    /// @notice A repay the vault fronts settles when the freed collateral (in the asset) returns in the same batch; an insolvent one reverts.
+    function test_vaultFrontedRepay_returnedWithinBatch_settles() public {
+        uint256 debt = 10_000e6;
+        ZeroEgress_RepayStrategy s = new ZeroEgress_RepayStrategy(address(vault), owner, usdc, usdc);
+        ZeroEgress_Lender lender = new ZeroEgress_Lender(usdc, usdc);
+        s.setLender(lender);
+        lender.open(address(s), debt, debt - 1); // insolvent: collateral worth one unit less than the debt
+        usdc.mint(address(lender), 12_000e6);
+        strategyFactory.registerStrategy(address(s));
+        uint256 pid = _executedAndMatured(address(s), TVL, _call(address(s), abi.encodeWithSignature("settle()")), 0);
+
+        BatchExecutorLib.Call[] memory fronted = new BatchExecutorLib.Call[](2);
+        fronted[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(s), debt)), value: 0
+        });
+        fronted[1] = BatchExecutorLib.Call({target: address(s), data: abi.encodeWithSignature("unwind()"), value: 0});
+        _openEmergency(pid, fronted);
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        _expectNoNetEgress(pid, 1);
+
+        lender.open(address(s), debt, 12_000e6); // solvent: collateral exceeds the fronted repay
+        _openEmergency(pid, fronted);
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertEq(lender.debt(), 0, "debt repaid");
     }
 }

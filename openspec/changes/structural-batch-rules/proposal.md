@@ -12,7 +12,7 @@ The vault's batch guard grew into an enumeration: fifteen ERC-20-shaped selector
 - The three shipped templates bind their venues through `isCounterpartyAllowed` (Morpho singleton; Portfolio swap adapter and price feeds; CL swap adapter). `PortfolioStrategy` keeps the per-token `isPriceSourceForToken` pairing.
 - Deploy scripts seed venues and feeds as counterparties only; no script calls `setAdapterAllowed`.
 - Governor: tiering and coverage unchanged; `strategy` stays informational beyond registration.
-- **BREAKING** — `settleProposal` and `unstick` run the settle batch with a net-outflow budget of zero: a settle batch brings assets home or moves nothing, so `effectiveMaxCapital` bounds the whole lifecycle's egress rather than each leg. `finalizeEmergencySettle` keeps `effectiveMaxCapital` (guardian-reviewed, owner-bonded owner unwinds may need to fund a repay).
+- **BREAKING** — `settleProposal` and `unstick` run the settle batch with a net-outflow budget of zero: a settle batch brings assets home or moves nothing, so `effectiveMaxCapital` bounds the whole lifecycle's egress rather than each leg. `finalizeEmergencySettle` also runs with a zero net-outflow budget (audit 2026-10-01 V1-02): float may be fronted inside the batch only if it returns before the batch ends.
 - `DeployStrategyFactory` wires `TierRegistry.setStrategyFactory` mandatorily (no `ALLOW_UNWIRED_TIER_REGISTRY` path) and runs before the multisig accepts TierRegistry ownership; the Plan B TierRegistry-redeploy runbook lists `setStrategyFactory`.
 
 ## Capabilities

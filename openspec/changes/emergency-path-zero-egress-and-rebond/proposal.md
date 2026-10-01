@@ -12,9 +12,10 @@
 
 ## What Changes
 
-- `finalizeEmergencySettle` passes a net egress budget of `0`. The batch may pass on what the strategy
-  returns in the same batch (net outflow is measured across the batch) but cannot move vault float. Funds an
-  unwind needs, such as a repay, are sent to the strategy from outside the vault. The guardian-veto
+- `finalizeEmergencySettle` passes a net egress budget of `0`, measured across the whole batch. Vault float
+  may leave inside the batch only if at least as much returns before it ends (a solvent repay the vault fronts
+  and the redeemed collateral returns passes), and what the strategy returns may be passed on. Only an
+  insolvent unwind needs funds sent to the strategy from outside the vault. The guardian-veto
   electorate is unchanged; it remains the control on redirecting returned capital.
 - `rotateOwner` applies its two open-proposal gates only when `newOwner != currentOwner`. The same owner can
   re-post a bond through the existing prepared-stake and consent flow while a proposal is open. Rotation to
@@ -35,8 +36,8 @@ None.
 - `src/GovernorEmergency.sol` (one argument), `src/SyndicateFactory.sol` (gates scoped to a different owner).
 - No storage change, no new surface, no deploy-script change. Existing governors pick up the budget through
   the beacon upgrade; the factory change ships with the factory upgrade.
-- Open changes `structural-batch-rules` (emergency budget = `effectiveMaxCapital`) and
-  `per-call-capital-declarations` (unconditional `rotateOwner` gates) carry the old text for the same two
-  requirements; reconcile them or archive them before this change, or a later sync regresses it.
+- The open changes `structural-batch-rules` and `per-call-capital-declarations` carried the old text for the
+  same two requirements; their deltas are aligned here (zero net egress; same-owner rotation exempt), so the
+  sync order does not matter.
 - Same-owner rotation still calls `SyndicateVault.rotateOwnership`, which drains the agent set; the owner
   re-registers before proposing again.
