@@ -151,9 +151,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @dev    A half-width wider than the tick domain itself cannot describe a
     ///         band any voter meant to approve, and letting one through would
     ///         make `_derivedRange` silently clamp to full-range — a materially
-    ///         different position from the one reviewed. Rejected at init so the
-    ///         clamp in `_derivedRange` only ever handles the edge case of a
-    ///         legitimate band running off the domain near an extreme tick.
+    ///         different position from the one reviewed. Below it the clamp still
+    ///         binds whenever `halfWidthTicks + |TWAP tick| > MAX_TICK` — on 4663 pools
+    ///         (~±200k from zero) that is any half-width above ~690k.
     int24 public constant MAX_HALF_WIDTH_TICKS = MAX_TICK;
 
     // ── Errors ──
@@ -175,7 +175,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         Also raised when `pool` itself holds no code: the key the factory
     ///         is asked about is read off the pool with typed calls, and an
     ///         address that cannot be asked what pair it trades was never a pool
-    ///         the factory created.
+    ///         the factory created. Also raised when `positionManager.factory()`
+    ///         is not `uniswapFactory`: the mint would land in another venue's pool.
     /// @dev    Deliberately does NOT read `pool.factory()`. That answer comes
     ///         from the party being checked; see check (1) in `_initialize` for
     ///         why asking the factory is the only direction that establishes
@@ -184,7 +185,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice A proposer-supplied counterparty is not allowlisted in the
     ///         `TierRegistry` the vault's own governor gates batch approvals
     ///         against. Covers `swapAdapter`, `positionManager`, `morpho`,
-    ///         `marketParams.collateralToken`, `uniswapFactory` and the pool's
+    ///         `marketParams.oracle`, `marketParams.collateralToken`, `uniswapFactory` and the pool's
     ///         volatile leg (`otherToken`) — every address this contract
     ///         approves or calls with vault funds, plus the factory whose word
     ///         the pool's provenance rests on.
@@ -436,6 +437,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // proposer-authored factory vouching for a proposer-authored pool is
             // the same self-attestation one hop further out.
             _requireAllowedCounterparty(registry, p.uniswapFactory);
+            _requireAllowedCounterparty(registry, p.marketParams.oracle);
             if (p.marketParams.collateralToken != vaultAsset) {
                 _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
             }
@@ -449,6 +451,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         {
             bytes memory call_ = abi.encodeCall(IUniswapV3Factory.getPool, (t0, t1, pool_.fee()));
             if (_readAddress(p.uniswapFactory, call_) != p.pool) revert PoolNotFromFactory();
+            // The position manager mints into its own factory's pool: it must be the one measured.
+            call_ = abi.encodeCall(INonfungiblePositionManager.factory, ());
+            if (_readAddress(p.positionManager, call_) != p.uniswapFactory) revert PoolNotFromFactory();
         }
         if (t0 == vaultAsset) {
             assetIsToken0 = true;
@@ -616,6 +621,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedCounterparty(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));
+        _requireAllowedCounterparty(registry, _marketParams.oracle);
         // The volatile leg re-checks on the same terms as the rest: `rerange()`
         // is permissionless and re-issues `forceApprove(otherToken, …)` to both
         // the adapter and the position manager on every call, so a leg demoted
@@ -968,6 +974,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         int24 twap = _requireSpotNearTwap();
         // (2) Price has reached the approved trigger fraction of the range.
         _requireTriggerReached(twap);
+        // The range depends only on the TWAP, so a same-transaction repeat (clamped or not) is a no-op.
+        (int24 newLower, int24 newUpper) = _derivedRange(twap);
+        if (newLower == tickLower && newUpper == tickUpper) revert RerangeTriggerNotReached();
 
         int24 oldLower = tickLower;
         int24 oldUpper = tickUpper;
@@ -975,8 +984,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         (uint128 liquidityBefore,) = _positionLiquidity(oldTokenId);
         _closePosition(oldTokenId);
-
-        (int24 newLower, int24 newUpper) = _derivedRange(twap);
 
         // Everything freed by the close is redeployed — both legs, which is why
         // the re-mint rebalances from measured balances rather than assuming it
@@ -1013,6 +1020,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // rerange), `travelled` because it is an absolute difference.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 threshold = (uint256(uint24(halfRange)) * _rerange.triggerBps) / BPS_DENOMINATOR;
+        // At least one spacing: a re-snapped range sits up to spacing/2 off the TWAP, so a smaller
+        // threshold lets the same-transaction rerange repeat until `maxReranges` (audit V2-03).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (threshold < uint256(uint24(tickSpacing))) threshold = uint256(uint24(tickSpacing));
         // forge-lint: disable-next-line(unsafe-typecast)
         if (uint256(uint24(travelled)) < threshold) revert RerangeTriggerNotReached();
     }
