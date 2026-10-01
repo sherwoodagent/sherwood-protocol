@@ -697,8 +697,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
         if (r.halfWidthTicks > MAX_HALF_WIDTH_TICKS) revert InvalidRerangePolicy();
         if (r.triggerBps == 0 || r.triggerBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
-        // A threshold that floors to zero ticks would let anyone spend the rerange budget on demand.
-        if (uint256(int256(r.halfWidthTicks)) * r.triggerBps < BPS_DENOMINATOR) revert InvalidRerangePolicy();
         if (r.maxReranges > MAX_RERANGE_LIMIT) revert InvalidRerangePolicy();
         if (r.slippageBps == 0 || r.slippageBps > MAX_SLIPPAGE_BPS) revert InvalidRerangePolicy();
         if (r.swapFractionBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
@@ -1021,6 +1019,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // rerange), `travelled` because it is an absolute difference.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 threshold = (uint256(uint24(halfRange)) * _rerange.triggerBps) / BPS_DENOMINATOR;
+        // At least one spacing: a re-snapped range sits up to spacing/2 off the TWAP, so a smaller
+        // threshold lets the same-transaction rerange repeat until `maxReranges` (audit V2-03).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (threshold < uint256(uint24(tickSpacing))) threshold = uint256(uint24(tickSpacing));
         // forge-lint: disable-next-line(unsafe-typecast)
         if (uint256(uint24(travelled)) < threshold) revert RerangeTriggerNotReached();
     }

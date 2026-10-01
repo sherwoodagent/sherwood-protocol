@@ -151,8 +151,10 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
 
         // A wide band around spot, snapped to spacing — this test is pinning the
         // integration, not a trading thesis.
-        int24 lower = ((spot - 5000) / spacing) * spacing;
-        int24 upper = ((spot + 5000) / spacing) * spacing;
+        // Two spacings below centre: the rerange trigger floors at one spacing (audit V2-03), so
+        // the TWAP must sit off the band's midpoint for the rerange below to have travel to act on.
+        int24 lower = ((spot - 5000) / spacing) * spacing - 2 * spacing;
+        int24 upper = ((spot + 5000) / spacing) * spacing - 2 * spacing;
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: address(pool),
@@ -171,8 +173,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
             maxTwapDeviationBps: 1_000,
             mintSlippageBps: 1_000,
             rerange: ConcentratedLiquidityStrategy.RerangePolicy({
-                // halfWidth x triggerBps >= 10_000; the first rerange's threshold is still 0 on the +/-5000 band.
-                halfWidthTicks: 10_000,
+                halfWidthTicks: 5000,
                 triggerBps: 1,
                 minInterval: 0,
                 maxReranges: 2,

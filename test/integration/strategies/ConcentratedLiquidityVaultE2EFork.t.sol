@@ -290,8 +290,7 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         // `_requireValidRerangePolicy` rejects it (the pool-share cap is
         // preserved at bind time rather than re-checked at rerange).
         r.halfWidthTicks = RERANGE_HALF_WIDTH;
-        // halfWidth x triggerBps >= 10_000 (a one-tick threshold); still 0 on the narrow initial band.
-        r.triggerBps = 3;
+        r.triggerBps = 1;
         r.minInterval = 0;
         r.maxReranges = 2;
         r.slippageBps = 1_000;
@@ -797,7 +796,11 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         // reverts "Price slippage check" once `o > h/19`. On the +/-360 band the
         // other tests use that is 19 ticks, which is why this pair runs on the
         // wide band instead.
-        _pushTicks(100);
+        // The trigger floors at one spacing (60 here, audit V2-03) of TWAP travel from the band's
+        // midpoint, and a TWAP does not move in-block: push 200, then let half a window elapse so
+        // the TWAP travels ~100 while spot stays ~100 ahead of it.
+        _pushTicks(200);
+        vm.warp(vm.getBlockTimestamp() + TWAP_WINDOW / 2);
         uint256 gap = _tickGap();
         console2.log("gap after push (ticks):", gap);
         assertGt(gap, 0, "no divergence at all - the guard was never exercised");
