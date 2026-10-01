@@ -35,5 +35,8 @@ None.
 - `src/GovernorEmergency.sol` (one argument), `src/SyndicateFactory.sol` (gates scoped to a different owner).
 - No storage change, no new surface, no deploy-script change. Existing governors pick up the budget through
   the beacon upgrade; the factory change ships with the factory upgrade.
+- Open changes `structural-batch-rules` (emergency budget = `effectiveMaxCapital`) and
+  `per-call-capital-declarations` (unconditional `rotateOwner` gates) carry the old text for the same two
+  requirements; reconcile them or archive them before this change, or a later sync regresses it.
 - Same-owner rotation still calls `SyndicateVault.rotateOwnership`, which drains the agent set; the owner
   re-registers before proposing again.
