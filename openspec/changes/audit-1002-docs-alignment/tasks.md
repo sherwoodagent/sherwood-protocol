@@ -7,7 +7,7 @@
 
 ## 2. Slashing and coverage
 
-- [x] 2.1 Lock-based slash rate: guardian-slashing delta, `ChallengeGame.rule` natspec, `test/ChallengeEndToEnd.t.sol` comment.
+- [x] 2.1 Lock-based slash rate: guardian-slashing delta, `ChallengeGame` natspec (`rule` on `v1-deploy`; no counterpart on `post-audit-v2`), `test/ChallengeEndToEnd.t.sol` comment.
 - [x] 2.2 Cap-only WOOD pricing, approval recording, coverage measurement: guardian-coverage, dimensional-conventions and deployment-docs deltas; `ExposureLedger` header and `setWoodUsdPrice` natspec; runbook and parameter-review monitoring lines.
 - [x] 2.3 `docs/coverage.md`: lock retention after a cancel (15–73 days); price outages during the challenge window.
 

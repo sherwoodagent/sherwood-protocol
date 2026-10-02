@@ -1,3 +1,5 @@
+> **`v1-deploy` history.** This change was written against the v1 game (`disputeTimeoutAtFiling`, `MAX_DISPUTE_TIMEOUT`, `rule`, `autoSlashDelay`, `_refundAll`, `TokenCourt`). On `post-audit-v2` the freeze end is `filedAt + voteWindowAtFiling` (`ChallengeGame.file` → `freezeCoverage`) and the spec delta says so; the v1 mechanics below are history.
+
 ## Context
 
 See proposal.md — Why. Constraints that shape the approach:

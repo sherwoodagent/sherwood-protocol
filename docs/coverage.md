@@ -72,8 +72,8 @@ challengeWindow`: 15–73 days at shipped parameters (24 h execution window,
 1 h–30 d strategy, 28 d epoch, 14 d challenge window). The proposer can cause
 this at will: `cancelProposal` is open after guardians have approved, through
 the review (while block quorum is not reached) and while Approved
-(`SyndicateGovernor.sol:575-597`), and the proposer can reclaim its own bond at
-once (`reclaimProposerBond`, `:698`). The
+(`SyndicateGovernor.cancelProposal`), and the proposer can reclaim its own bond at
+once (`SyndicateGovernor.reclaimProposerBond`). The
 cancel does not lengthen the lock — an executed proposal holds the same
 bucket — but nothing frees it early. The execute-time quorum reads the
 ledger's own `_approversOf` list, never the registry.
@@ -105,7 +105,7 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   earlier on release or retirement. A stale or manipulated WOOD feed can neither
   starve nor inflate a guardian's budget. The approve vote is not price-free:
   the slot floor values the need with `coverageUsd` and the lock with
-  `woodPriceX8()`, unwrapped (`ExposureLedger.sol:759, 775`), so an approve
+  `woodPriceX8()`, unwrapped (`ExposureLedger.recordApproval`), so an approve
   reverts while the WOOD price or the vault-asset feed is unavailable. A block
   vote reads no price.
 - **`kNumerator = 1` contains a conviction.** At the default, `Σ locks ≤ stake`,
@@ -123,10 +123,10 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **Slash = the lock, under the stake envelope.** `slashBpsFor` returns each
   approver's lock over their slash basis, in bps, rounded up (saturating at
   10_000 when the lock meets or exceeds the basis). `StakedWood` then clamps
-  that rate into `[minSlashBps, maxSlashBps]` and burns `min(lock, basis)`. The
-  basis is `min(stake at the anchor, live stake)`: `openedAt` on the review path
-  (the at-open checkpoint from pashov #11, clamped to live so a concurrent slash
-  is not double-counted) and `executedAt` on the verdict path. Denominating on
+  that rate into `[minSlashBps, maxSlashBps]` and burns the clamped rate of the basis (at least
+  `minSlashBps` of it). The basis is `min(max(stake, liability) checkpoint at the
+  anchor, live stake)`: `openedAt` on the review path (clamped to live so a
+  concurrent slash is not double-counted) and `executedAt` on the verdict path. Denominating on
   the anchored basis rather than raw live stake is what stops a post-drain
   top-up from diluting the burn — double the stake after the fact and the burn
   is still the lock. On a blocked review the block's deterministic severity
@@ -175,7 +175,8 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
-  `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;
+  `min(needUsd, Σ min(lock_i, slash basis_i at executedAt) × woodPriceX8())`, the basis being
+  `StakedWood.slashableStakeAt` (`ExposureLedger._liabilityUsd`, `_slashBasis`);
   `unsharedLiabilityUsd` returns the same figure, since with no cohort cap there
   is no distinct shared basis. `ChallengeGame.file` sizes the challenger bond
   off it, so a cohort cannot lock surplus WOOD to price challengers out. The cap
@@ -245,11 +246,11 @@ proceeds are burned.
 
 ## Price outages and the challenge window
 
-`ChallengeGame.file` sizes the challenger bond from `unsharedLiabilityUsd` and
-`woodPriceX8()`, and reverts `WoodPriceUnset` when either cannot be read
-(`ChallengeGame.sol:695-703`). The filing deadline,
-`executedAt + strategyDuration + challengeWindow` (`:638`), keeps running during
-the outage. An outage that covers the end of the window lets the approvers keep
+`ChallengeGame.file` sizes the challenger bond from `unsharedLiabilityUsd` (read
+inside `try/catch`) and `woodPriceX8()`, and reverts `WoodPriceUnset` when either
+cannot be read. The filing deadline,
+`max(executedAt + strategyDuration + challengeWindow, challengeableUntil)`, also in
+`file`, keeps running during the outage. An outage that covers the end of the window lets the approvers keep
 their locks and the proposer reclaim its bond. Filing stops when the WOOD feed
 is unwired or older than `WOOD_FEED_MAX_DELAY`, the V3 pool's `liquidity()` is
 below `MIN_V3_LIQUIDITY` or the V2 pair's WETH reserve is below
@@ -257,7 +258,9 @@ below `MIN_V3_LIQUIDITY` or the V2 pair's WETH reserve is below
 vault-asset feed is older than its max delay, or the cap is zero. Approve votes,
 and proposing or executing any proposal with non-zero required coverage, halt on
 the same outage; `proposerBondWood` returns zero before reading the price for a
-zero-coverage proposal (`ExposureLedger.sol:682-684`).
+zero-coverage proposal (`ExposureLedger.proposerBondWood`). Block votes,
+`voteOnChallenge`, `resolve` and settlement read no price, so a challenge already
+filed is decided and executed through the outage.
 
 - **The challenger's counter.** Both depth floors are read-time checks, so a
   challenger with the capital can add liquidity, file and remove it in one
@@ -266,13 +269,12 @@ zero-coverage proposal (`ExposureLedger.sol:682-684`).
   `MAX_SNAPSHOT_SPAN` (7 days) costs one more TWAP window. A stale Chainlink
   ETH/USD or vault-asset feed cannot be fixed by anyone but the Safe.
 - **The Safe's levers.** `ExposureLedger.setWoodFeed` and `setAssetFeed` seat a
-  replacement feed at once; the ledger adds no warm-up (`ExposureLedger.sol:492,
-  632`). A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
+  replacement feed at once; the ledger adds no warm-up. A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
   snapshots before it can price; any other Chainlink-shaped feed prices at once.
-  Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.sol:560`,
-  `ChallengeGame.sol:1600`) moves the deadline of every executed proposal,
+  Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.setChallengeWindow`,
+  `ChallengeGame.setChallengeWindow`; `file` reads the live window) moves the deadline of every executed proposal,
   including one whose window has already lapsed, until the permissionless
-  `retireApproval` (`ExposureLedger.sol:876`) clears that proposal's locks. Both
+  `ExposureLedger.retireApproval` clears that proposal's locks. Both
   levers are protocol-wide.
 
 ## Proposer bond

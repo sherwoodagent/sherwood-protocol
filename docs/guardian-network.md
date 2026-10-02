@@ -52,26 +52,33 @@ is documented in the
 ## Becoming a guardian
 
 Registration is permissionless: `StakedWood.stakeAsGuardian(amount, agentId)`
-(`src/StakedWood.sol:572`). No registry gate, no cap — only a stake floor. Active
+(`StakedWood.stakeAsGuardian`). No registry gate, no cap — only a stake floor. Active
 means `stakedAmount > 0` and no pending unstake request.
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `minGuardianStake` | 10 000 WOOD | 1 WOOD | — | `StakedWood.sol:734` |
-| `coolDownPeriod` (unstake delay) | 7 d | 1 d | 30 d, and ≥ `registry.reviewPeriod` | `StakedWood.sol:747` |
-| `minOwnerStake` (vault-owner bond at creation) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:768` |
-| `minSlashBps` — the **deterrence floor**: the least a convicted approver loses, as a fraction of their whole bond, whatever WOOD they declared. Launch value is a governance decision; `DeployPlanB` refuses zero. | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.sol:778` |
-| `maxSlashBps` — must be 100%: a guardian may lock their entire stake behind one proposal, and a ceiling below that would cap the burn beneath the lock. `DeployPlanB` pre-flight asserts it. | 100% | ≥ `minSlashBps` | 100% | `StakedWood.sol:787` |
-| `ageFloorBps` (new-stake weight in `getPastVotes`) | 25% | > 0 | 100% | `StakedWood.sol:794` |
-| `maturationPeriod` (ramp to full weight in `getPastVotes`) | 30 d | 7 d | 90 d | `StakedWood.sol:801` |
+| `minGuardianStake` | 10 000 WOOD | 1 WOOD | — | `StakedWood.setMinGuardianStake` |
+| `coolDownPeriod` (unstake delay) | 7 d | 1 d | 30 d, and ≥ `registry.reviewPeriod` | `StakedWood.setCooldownPeriod` |
+| `minOwnerStake` (vault-owner bond at creation) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.setMinOwnerStake` |
+| `minSlashBps` — the **deterrence floor**: the least a convicted approver loses, as a fraction of their whole bond, whatever WOOD they declared. Launch value is a governance decision; `DeployPlanB` refuses zero. | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.setMinSlashBps` |
+| `maxSlashBps` — must be 100%: a guardian may lock their entire stake behind one proposal, and a ceiling below that would cap the burn beneath the lock. `DeployPlanB` pre-flight asserts it. | 100% | ≥ `minSlashBps` | 100% | `StakedWood.setMaxSlashBps` |
+| `ageFloorBps` (new-stake weight in `getPastVotes`; no on-chain reader) | 25% | > 0 | 100% | `StakedWood.setAgeFloorBps` |
+| `maturationPeriod` (ramp to full weight in `getPastVotes`; no on-chain reader) | 30 d | 7 d | 90 d | `StakedWood.setMaturationPeriod` |
 
-**Review and emergency votes weigh raw stake.** A guardian review vote and an
-emergency block vote both weigh `getPastStake`: the voter's raw checkpointed
-stake at the proposal's snapshot `snapshotAt`, with no age discount
-(`GuardianRegistry.sol:590, 1053`). Stake checkpointed at any timestamp before
-the block that opened the proposal votes at full weight. Age weighting (`getPastVotes`: fresh stake at
-`ageFloorBps`, rising linearly to full weight over `maturationPeriod`) is used
-on chain only by `TokenCourt.vote` (`TokenCourt.sol:358`).
+**Every guardian vote weighs raw stake.** No vote path applies an age discount:
+
+| Vote | Ballot weight | Quorum base |
+|---|---|---|
+| Guardian review (`GuardianRegistry.voteOnProposal`) | `getPastStake(voter, snapshotAt)` | `getPastTotalVotes(snapshotAt)` at `openReview` |
+| Emergency block (`GuardianRegistry.voteBlockEmergencySettle`) | `getPastStake(voter, snapshotAt)` (stored as `er.openedAt`) | `getPastTotalVotes(snapshotAt)` at `openEmergency` |
+| Challenge (`ChallengeGame.voteOnChallenge`) | `min(getPastStake(voter, filedAt − 1), getPastStake(voter, snapshotAt))` | `getPastTotalVotes(filedAt − 1)`, accused capped, at `file` |
+
+`snapshotAt` is the proposal's snapshot, one second before the block in which it
+entered Pending, so stake checkpointed before that block votes at full weight.
+The age-weighted getter `getPastVotes` (fresh stake at `ageFloorBps`, rising
+linearly to full weight over `maturationPeriod`) is read by no contract on this
+branch; it exists for off-chain Snapshot reads. The `getPastVotes` calls in
+`SyndicateGovernor` read vault shares for the LP veto, not sWOOD.
 
 **Cooldown binds review evasion:** `coolDownPeriod ≥ reviewPeriod` is enforced on
 both sides, so a guardian can never unstake faster than a review they might be
@@ -94,19 +101,19 @@ Mechanics worth knowing:
 
 - Both sides of the block quorum are measured at the proposal's **snapshot**,
   `snapshotAt`: one second before the block in which the proposal entered
-  Pending (`registerReview`, `GuardianRegistry.sol:393`). That block is the
+  Pending (`GuardianRegistry.registerReview`). That block is the
   `propose` block, or for a collaborative proposal the block of the last
   co-proposer approval (`ownerOnlyProposals`, on at launch, refuses
   collaborative proposals). `openReview` stores `getPastTotalVotes(snapshotAt)`
-  as the denominator (`:838`) and each vote weighs
-  `getPastStake(voter, snapshotAt)` (`:590`). Stake checkpointed at a timestamp
+  as the denominator (`openReview`) and each vote weighs
+  `getPastStake(voter, snapshotAt)` (`voteOnProposal`). Stake checkpointed at a timestamp
   earlier than that block counts; stake added in that block or later neither
   votes nor moves the bar. Stake that counts is in the denominator whether or
   not it votes. `blockQuorumBps` and the slash envelope
   are snapshotted at `openReview`.
 - A thin cohort still decides its own reviews. There is no stake floor at open.
   Only a **zero** denominator fails open: `_isBlocked` returns false when
-  `totalStakeAtOpen == 0` (`GuardianRegistry.sol:423-427`), because
+  `totalStakeAtOpen == 0` (`GuardianRegistry._isBlocked`), because
   `0 * 10_000 >= q * 0` would otherwise resolve Blocked with nobody participating
   and slash every approver. Any positive at-open stake, however small, can reach
   the block quorum.
@@ -118,16 +125,15 @@ Mechanics worth knowing:
 - A **blocked** review slashes every approver, and what is at stake is the
   **lock**, not the bond. The rate handed to `StakedWood` is the guardian's lock
   over their live stake; the block's severity — a deterministic quadratic ramp of
-  block-side decisiveness, saturating at a 66.67% supermajority (`_severityBps`,
-  `GuardianRegistry.sol:1195`) — multiplies that lock-derived rate, and the result
+  block-side decisiveness, saturating at a 66.67% supermajority (`GuardianRegistry._severityBps`) — multiplies that lock-derived rate, and the result
   is clamped into `[minSlashBps, maxSlashBps]`. A guardian who backed a bad
   proposal with a small lock while holding a large bond loses the lock, and never
   less than `minSlashBps` of the bond.
 - Slashed WOOD is **burned** (`0x…dEaD`) — the slash pays nobody. A funded
   slash-appeal reserve can refund at most 20% per 7-day epoch
-  (`MAX_REFUND_PER_EPOCH_BPS`, `GuardianRegistry.sol:56`).
+  (`GuardianRegistry.MAX_REFUND_PER_EPOCH_BPS`).
 - Registry pause has a dead-man switch: anyone can unpause after 7 days
-  (`DEADMAN_UNPAUSE_DELAY`, `GuardianRegistry.sol:57`).
+  (`GuardianRegistry.DEADMAN_UNPAUSE_DELAY`).
 
 ## The exposure ledger — economic security sizing
 
@@ -153,10 +159,10 @@ it. Full detail: [coverage.md](coverage.md).
   converted to USD for coverage; a guardian whose lock is now worth less than
   when they declared it (unstake, WOOD price fall) counts at the shrunken live
   value. It reverts
-  `InsufficientApproveCoverage` **only** when the approver set is empty (`ExposureLedger.sol:1185`)
-  or the raised aggregate is exactly zero (`:1202`). A nonzero-but-partial book is
+  `InsufficientApproveCoverage` **only** when the approver set is empty
+  or the raised aggregate is exactly zero (`ExposureLedger.requireApproveQuorum`). A nonzero-but-partial book is
   the shortfall case: it **scales** capital via
-  `_deriveAndStoreEffectiveCapital` (`SyndicateGovernor.sol:1563`) —
+  `SyndicateGovernor._deriveAndStoreEffectiveCapital` —
   `effectiveMaxCapital = floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)` —
   and the same ratio scales every per-call cap. The gate applies at every
   tier. An empty or
@@ -189,7 +195,7 @@ shrink or grow it.
   or inflate a guardian's capacity. The approve vote itself does need prices:
   `recordApproval` values the need with `coverageUsd` and the lock with
   `woodPriceX8()` for the slot floor, both unwrapped
-  (`ExposureLedger.sol:759, 775`), so an approve vote reverts while the WOOD
+  (`ExposureLedger.recordApproval`), so an approve vote reverts while the WOOD
   price or the vault-asset feed is unavailable. A block vote reads no price.
   Budget recycles when a bucket ages past `bucketEnd + challengeWindow`, or
   earlier on release or retirement.
@@ -234,7 +240,7 @@ shrink or grow it.
   governance decision, not a code default; `DeployPlanB` refuses zero and requires
   `maxSlashBps = 100%` so a full-stake lock can burn in full.
 - **Fee attribution is the lock.** `GuardianRegistry.getApproverCoverage` reads
-  `coverageUsdOf` — `min(lock, live stake) × woodPriceX8()`, **uncapped**: a
+  `coverageUsdOf` — `min(lock, slash basis at executedAt) × woodPriceX8()`, **uncapped**: a
   guardian who locked more took more risk and earns proportionally more, even when
   the cohort over-subscribed. There is no settlement step before payout; the lock a
   guardian holds at payout is their attribution. `priced == false` means retry, not
@@ -246,14 +252,14 @@ shrink or grow it.
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.sol:611` |
-| `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.sol:560` |
+| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.setKNumerator` |
+| `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.setChallengeWindow` |
 | `epochLength` | 28 d (immutable) | — | — | ctor |
-| `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:146` |
-| `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.sol:622` |
-| `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.sol:617` |
-| `woodHaircutBps` | 100% (no haircut — deploy script refuses this; safe value set at deploy) | 50% | 100% | `ExposureLedger.sol:525` |
-| `woodUsdPriceX8` | owner-set cap (0 = hard stop `NoWoodPrice`) | — | — | `ExposureLedger.sol:475` |
+| `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.MAX_COVERAGE_HORIZON` |
+| `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.setProposerBondBps` |
+| `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.setCoveredTvlCapUsd` |
+| `woodHaircutBps` | 100% (no haircut — deploy script refuses this; safe value set at deploy) | 50% | 100% | `ExposureLedger.setWoodHaircutBps` |
+| `woodUsdPriceX8` | owner-set cap (0 = hard stop `NoWoodPrice`) | — | — | `ExposureLedger.setWoodUsdPrice` |
 
 ## Adapter certification — TierRegistry
 
@@ -274,14 +280,14 @@ Two independent axes:
    callee to be a strategy registered with the `StrategyFactory` (registration
    is permissionless) and every call on the asset to be `transfer`,
    `transferFrom` from the vault, or the approve family, to any recipient
-   (`SyndicateVault.sol:457-475`, `AssetCallRules.sol`).
+   (`SyndicateVault._guardBatchCalls`, `AssetCallRules.spenderOf`).
 
 Certification is a single owner call: `certify` pins the reviewed codehash and
 takes effect in the same transaction. Revocation is instant: owner `demote`,
 challenge-driven `demoteByChallenge`, or a codehash mismatch, which every read
 re-verifies. A demotion affects only that `(target, selector)`: it deletes the
 certification and denies the class tier to that address, and leaves the
-counterparty allowlist untouched (`TierRegistry.sol:209-217`).
+counterparty allowlist untouched (`TierRegistry._demote`).
 
 Known blind spot (documented in-contract): EXTCODEHASH attestation catches
 same-address bytecode swaps, but not proxy implementation swaps or storage rewiring.
@@ -290,8 +296,9 @@ Governance discipline: never certify proxied or storage-mutable adapters at tier
 ## Post-execution accountability — ChallengeGame
 
 Anyone can challenge an executed proposal during the challenge window by posting a
-bond. A filing freezes the accused cohort's coverage and opens a guardian vote; the
-vote decides it.
+bond. The window closes at `max(executedAt + strategyDuration + challengeWindow,
+challengeableUntil)` (`ChallengeGame.file`). A filing freezes the accused cohort's
+coverage and opens a guardian vote; the vote decides it.
 
 ```
 file (bond = 1.5% of liability)
@@ -303,21 +310,23 @@ file (bond = 1.5% of liability)
       │      plus the prosecutor fee out of the proposer's bond
       └─ the window closes short of that
            → FAILED: forfeitBurnBps (20%) of the bond burns, the rest returns.
-             An acquittal that itself reached the quorum spends the
-             proposal's challenge window; anything less is silence and
-             re-arms it, once.
+             An acquittal that itself reached the quorum does not
+             re-arm the window; anything less is silence and re-arms
+             it, once.
 ```
 
-`resolve` is permissionless and exercises no discretion. It settles the instant
-`convictWeight × 10 000 ≥ quorumBpsAtFiling × totalStakeAtFiling` **and**
-`convictWeight > acquitWeight` — there is no un-vote, so a quorum the convict side
-carries is already final — and otherwise waits for `filedAt + voteWindowAtFiling`
-and fails. The majority clause matters on its own: 30% convict against 70% acquit
-convicts nobody. Settling a reached quorum has no deadline
+`resolve` is permissionless and exercises no discretion. Before the window closes it
+settles only when `convictWeight × 10 000 ≥ quorumBpsAtFiling × totalStakeAtFiling`
+**and** `2 × convictWeight > votableAtFiling` — the convict side outweighs every
+acquit ballot still castable; otherwise it reverts `DelayNotElapsed`. At or after
+`filedAt + voteWindowAtFiling` it settles on the quorum plus
+`convictWeight > acquitWeight` and fails otherwise (`ChallengeGame.resolve`). The
+majority clause matters on its own: 30% convict against 70% acquit convicts nobody. Settling a reached quorum has no deadline
 of its own: `resolve` is permissionless and the challenger, whose bond returns only
-on settlement, is the party paid to call it, while the ledger freeze covers only
-`filedAt + voteWindow` — so a settlement left until after that may find the
-approvers' locks already retired. No transfer anywhere in the game reaches
+on settlement, is the party paid to call it, and until the last live challenge terminates, the freeze keeps the approvers' locks
+unreleasable and unretirable and blocks their unstake claims (`ChallengeGame._releaseFreeze`;
+`ExposureLedger.releaseApproval` / `retireApproval` revert `CoverageFrozen`);
+`filedAt + voteWindow` only sets the bucket the frozen lock counts in. No transfer anywhere in the game reaches
 an approver or the proposer: the challenger's burns go to `0x…dEaD`, the slash
 burns inside sWOOD, and the prosecutor fee comes out of the convicted proposer's
 own escrowed bond.
@@ -334,16 +343,20 @@ own escrowed bond.
   path (disabled while `ownerOnlyProposals` is on). This is the same electorate the
   guardian review uses. Stake added after that carries no ballot, so a guardian who
   joined later cannot vote on its challenge;
-  that stake still counts in the denominator below, which can only make a
-  conviction harder. The filing stamp is one second back because an sWOOD checkpoint
+  that stake still counts in the denominator and in `votableAtFiling`, so it
+  raises the bar the eligible electorate must clear and the early-settle bar. The filing stamp is one second back because an sWOOD checkpoint
   is keyed on the second a stake changes and a same-second push overwrites — reading
   the filing instant itself would let stake planted in that very block count in the
   numerator while the denominator missed it.
 - **Denominator:** pinned once, at filing, to `getPastTotalVotes(filedAt − 1)` — the
-  TOTAL staked WOOD, accused included. Subtracting the accused made a conviction
-  cheaper the wider the cohort that had approved, so a proposal 90% of the stake
-  approved could be convicted by a few percent of it. The accused lose their ballot,
-  not their weight.
+  TOTAL staked WOOD, accused included (each accused counted at no more than its
+  stake at the approve snapshot and at execution). Subtracting the accused made a
+  conviction cheaper the wider the cohort that had approved, so a proposal 90% of
+  the stake approved could be convicted by a few percent of it. The accused lose
+  their ballot, not their weight. The same base also holds stake that has no ballot
+  on this challenge: stake added after `snapshotAt`, and the stake of the
+  challenger, the proposer and the co-proposers, and of any guardian that requests
+  unstake after the filing (`voteOnChallenge` requires `isActiveGuardian`).
 - **Who cannot vote:** the challenger (`ChallengerCannotVote`), the challenged
   proposal's pinned proposer and each of its co-proposers (`ProposerCannotVote`), and
   the accused approvers (`AccusedCannotVote`). Co-proposers are named on-chain and
@@ -357,8 +370,9 @@ own escrowed bond.
 - **Quorum:** `challengeQuorumBps` of that pinned total, and the convict side must
   also outweigh the acquit side. Abstention still adds nothing to either tally, so a
   challenge carries on an active convicting majority reaching the bar, or not at all.
-  A filing no conviction could clear is refused at `file` (`NoVotableStake`) rather
-  than opened on a verdict that was never reachable — see below.
+  `file` refuses a filing (`NoVotableStake`) only when the stake outside the
+  accused cohort is below the quorum share of the base — see below. That check
+  does not prove the quorum is reachable.
 
 D6 parameters. These are launch defaults and await an economics run:
 
@@ -366,7 +380,7 @@ D6 parameters. These are launch defaults and await an economics run:
 |---|---|---|---|
 | `voteWindow` (`setVoteWindow`) | 7 d | `MIN_VOTE_WINDOW` = 2 d – `MAX_VOTE_WINDOW` = 60 d (the ledger's `MAX_COVERAGE_HORIZON`) | yes |
 | `challengeQuorumBps` (`setChallengeQuorumBps`) | 3 000 bps (30%) of the TOTAL staked WOOD | owner-set in [1 000, 10 000] | yes |
-| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, accused included | `file` reverts `NoVotableStake` when the total less the accused cohort is under `challengeQuorumBps` of the total — no conviction could clear the quorum | yes |
+| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, each accused counted at min(stake at `executedAt − 1`, stake at `snapshotAt`, stake at `filedAt − 1`) | `file` reverts `NoVotableStake` when the total less the accused cohort is under `challengeQuorumBps` of the total; stake that cannot vote is not subtracted, so a filing that passes can still be unwinnable | yes |
 | convict majority | `convictWeight > acquitWeight`, required on top of the quorum | — | — |
 | `forfeitBurnBps` — no conviction (`setForfeitBurnBps`) | 20% of the challenger bond burns, the remainder returns | 0 – 50% | yes |
 | `settleBurnBps` — conviction (`setSettleBurnBps`) | 5% burns; the challenger takes `bond − settleBurn` | 0 – 50% | yes |
@@ -380,23 +394,36 @@ Filing parameters:
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `challengeWindow` | 14 d | > 0 | ≤ ledger's window | `ChallengeGame.sol:828` |
-| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.sol:837` |
+| `challengeWindow` | 14 d, counted from `executedAt + strategyDuration` | > 0 | ≤ ledger's window | `ChallengeGame.setChallengeWindow` |
+| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.setChallengerBondBps` |
+
+`file` prices the bond through `unsharedLiabilityUsd` inside `try/catch` and reverts
+`WoodPriceUnset` on any failure of it: no WOOD price, or a stale or unconfigured
+vault-asset feed. There is no fallback bond, and the filing deadline keeps running
+during the outage ([coverage.md](coverage.md)).
 
 ### What the vote guarantees
 
-- **A challenge no conviction could clear is never opened.** The stake outside the
-  accused cohort is the ceiling on either tally, so once that cohort holds more than
-  `1 − quorum` of the total — 70% at the 3 000 bps default — every filing against the
-  proposal is guaranteed to fail as silence. `file` reverts `NoVotableStake` rather
-  than taking a bond that could only burn, freezing a window of coverage and spending
-  the proposal's one re-arm for a verdict that was never reachable. A cohort that
-  large already controls the stake; what this refuses is selling it an unwinnable
-  accusation.
-- **An acquittal ends the matter only at the quorum.** An acquit side that clears the
-  same bar a conviction must has decided, so the challenge fails *and* the proposal's
-  challenge window is spent. Below that bar nothing was adjudicated: the failure
-  counts as silence and re-arms the window, so one dust ballot cannot foreclose it.
+- **A filing the accused cohort alone makes unwinnable is refused; others are not.**
+  Once the accused hold more than `1 − quorum` of the base — 70% at the 3 000 bps
+  default — `file` reverts `NoVotableStake` rather than taking a bond that could only
+  burn. The guard subtracts only the accused. Stake added after `snapshotAt` and the
+  stake of the challenger, proposer, co-proposers and guardians that request unstake
+  after the filing stay in both the base and
+  `votableAtFiling` but cannot vote, so a filing can pass the guard and still be
+  unwinnable: a non-approving address that stakes more than
+  `honest × 10 000 / quorumBps − (honest + accused)` after `snapshotAt` puts a
+  unanimous honest conviction below the quorum, and so does a proposer holding that
+  much from before `snapshotAt`. The filer then pays `forfeitBurnBps` of its bond.
+  A challenger should compute the eligible stake (held at `snapshotAt`, not barred)
+  against `quorumBps × totalStakeAtFiling` before filing.
+- **Only a sub-quorum failure re-arms.** A quorum acquittal does not re-arm the
+  window; the proposal stays challengeable until its existing deadline, and the one
+  re-arm remains available to a later silent failure. Below that bar the failure
+  counts as silence and re-arms the window (`ChallengeGame._fail`), so one dust
+  ballot cannot foreclose it. A re-arm raises the deadline to
+  `max(existing, now + challengeWindow)`, so a silent failure early in the window
+  spends the re-arm flag without extending anything (`_rearmChallengeWindow`).
   This holds for a substantial minority too — 25% acquit against 20% convict at a
   30% quorum still reads as silence — because the bar is the quorum, not the balance
   of the two sides.
@@ -412,8 +439,9 @@ Filing parameters:
 
 Anti-griefing details:
 
-- All rates **and the clock** are **pinned at filing** — no owner change can re-rate
-  or re-time a live challenge. `filingsPaused` gates `file` alone and is never read
+- The challenger's terms, the quorum and its base, and the vote window are pinned at
+  filing; approvers' slash rates are read at settlement (`_settle` → `slashBpsFor`)
+  and clamped by sWOOD's live `minSlashBps` / `maxSlashBps`. `filingsPaused` gates `file` alone and is never read
   in `resolve`, so the owner can stop new challenges but never strand a live one.
 - One live challenge per challenger per proposal. The slot is per *challenger*
   precisely so an accused cohort cannot buy immunity by self-filing to occupy the
@@ -431,27 +459,27 @@ Anti-griefing details:
 
 ## Emergency paths
 
-- `unstick` (`GovernorEmergency.sol:64`) — vault owner replays the already-voted
+- `unstick` (`GovernorEmergency.unstick`) — vault owner replays the already-voted
   settlement calls after `strategyDuration`. No review: the calldata was already
   reviewed. Caps are the coverage-scaled `effectiveMaxCapital` and settlement
   caps, not the declare-time envelope. It reverts unless the strategy reports it
   has unwound, and it applies `MAX_STAMP_DRAWDOWN_BPS`, a 90% drawdown
   allowance, i.e. a floor at 10% of the execute-time price per share, instead
-  of the proposal's own `maxDrawdownBps` (`:72-76`,
-  `SyndicateGovernor.sol:563`). It closes a settle that fell below the
+  of the proposal's own `maxDrawdownBps` (`GovernorEmergency.unstick`,
+  `SyndicateGovernor._requireSettlePriceAboveFloorHook`). It closes a settle that fell below the
   proposal's floor; it cannot close one whose stored leg reverts, because it
   replays the same calls.
-- `emergencySettleWithCalls` (`GovernorEmergency.sol:83`) — vault owner submits
+- `emergencySettleWithCalls` (`GovernorEmergency.emergencySettleWithCalls`) — vault owner submits
   **new** calls after `strategyDuration`; requires the owner's sWOOD bond
   (`requiredOwnerBond` = `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)` at
-  `StakedWood.sol:1155`, `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD at `:213`, and the
+  `StakedWood.requiredOwnerBond`, `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD, and the
   posted bond must be strictly positive) and opens a fresh guardian review
   (block-only voting, `reviewPeriod` long). A block slashes the **owner's
-  bond**, not guardians. `finalizeEmergencySettle` (`:116`) executes the stored
+  bond**, not guardians. `finalizeEmergencySettle` executes the stored
   calls, at any time the owner chooses after `reviewEnd`, with per-call caps
   disabled — the escape hatch for a settlement leg stuck on a cap — and a net
-  egress budget of zero, measured across the whole batch (`:129`;
-  `SyndicateVault.sol:428-430`): vault float may leave inside the batch only if
+  egress budget of zero, measured across the whole batch (`GovernorEmergency.finalizeEmergencySettle` passes `maxNetOutflow = 0`;
+  `SyndicateVault.executeGovernorBatch`): vault float may leave inside the batch only if
   at least as much comes back before it ends (a solvent repay the vault fronts
   and the redeemed collateral returns passes). Only an insolvent unwind needs
   funds sent to the strategy from outside the vault.
@@ -477,13 +505,13 @@ round lets the vault owner:
   asset.transfer(owner, x)]` pays the owner up to everything the clone returns
   inside the batch; one unit more reverts `MaxNetOutflowExceeded`.
 - **Move non-asset tokens out of the share price.** `rescueTo(token)`
-  (`BaseStrategy.sol:162`) pushes the clone's whole balance of any token to the
+  (`BaseStrategy.rescueTo`) pushes the clone's whole balance of any token to the
   vault, in any lifecycle state. A non-asset token in the vault is not counted
   in the share price, and no governor batch can call it (a batch may target only
   the asset and registered strategies). Once finalize marks the proposal Settled,
   `redemptionsLocked()` is false and the owner's `rescueERC20` can move it, but
   only to a clone the `StrategyFactory` made whose `vault()` is this vault
-  (`SyndicateVault.sol:1134-1147`); never to the owner or any other address. A
+  (`SyndicateVault.rescueERC20`); never to the owner or any other address. A
   token that no such clone can sell stays in the vault, uncounted.
 - **Close a proposal with capital still on the strategy.**
   `finalizeEmergencySettle` checks neither that the strategy has unwound nor the
@@ -491,29 +519,29 @@ round lets the vault owner:
   the proposal becomes Settled while the clone still holds the position and
   reports `executed() == true`. `totalAssets()` counts only idle asset, so
   redemptions and deposits reopen at a share price without the position until a
-  later proposal's batch calls the clone's `settle()` (`BaseStrategy.sol:153`).
+  later proposal's batch calls the clone's `settle()` (`BaseStrategy.settle`).
 - **Leave an orphaned clone that can still trade.** After such a close the
   clone stays Executed, and two calls keep working with no proposal open:
   - Portfolio: the clone's proposer, while still an agent of the vault (not
     necessarily the owner), can call `rebalanceDelta` on the basket sitting on
-    the clone (`PortfolioStrategy.sol:255`; `BaseStrategy.sol:87-91`). Each swap
+    the clone (`PortfolioStrategy.rebalanceDelta`; `BaseStrategy.onlyProposer`). Each swap
     runs through the clone's own swap adapter and price feeds, which must still
     be allowlisted, and is bounded by `maxSlippageBps`. An owner can add tokens
     to that basket with `rescueERC20` into the clone; the bound is the same.
   - Concentrated liquidity: `rerange()` is permissionless and needs only the
-    Executed state (`ConcentratedLiquidityStrategy.sol:963-984`), so anyone can
+    Executed state (`ConcentratedLiquidityStrategy.rerange`), so anyone can
     re-range the orphaned position, up to `maxReranges` times and subject to its
     trigger and `minInterval`.
   Both are bounded residuals, not ways to take the tokens.
 - **Cancel a round for free while block weight is below quorum.**
   `cancelEmergencySettle` is accepted until `reviewEnd` unless block quorum is
-  already reached (`GuardianRegistry.sol:755-761`). Nothing is slashed, and the
-  owner may open a new round one `reviewPeriod` after the cancel (`:697, 767`).
+  already reached (`GuardianRegistry.cancelEmergency`). Nothing is slashed, and the
+  owner may open a new round one `reviewPeriod` after the cancel (`cancelEmergency` sets the cooldown; `openEmergency` refuses until it passes).
   Emergency block votes have no late-vote lockout, so a cancel and the vote that
   would reach quorum race until the window closes. The bond burns only if the
   full `blockQuorumBps` lands inside one window.
-- **Pause the vault.** `pause()` (`SyndicateVault.sol:314`) stops
-  `executeGovernorBatch` (`:396-400`), so keeper `settleProposal`, `unstick` and
+- **Pause the vault.** `SyndicateVault.pause` stops
+  `executeGovernorBatch` (`whenNotPaused`), so keeper `settleProposal`, `unstick` and
   `finalizeEmergencySettle` all revert while paused, but `emergencySettleWithCalls`
   still opens a round (it touches only the registry). Only the vault owner can
   unpause; the Safe and guardians cannot. After the review the owner unpauses and
@@ -526,14 +554,16 @@ round lets the vault owner:
   `settleSlippageBps` is fixed at init (at least 50 bp) and cannot be changed.
 
 **The electorate is the proposal's snapshot.** `openEmergency` reads the
-denominator as `getPastTotalVotes(snapshotAt)` and each block vote weighs the
-voter's raw `getPastStake(voter, snapshotAt)`, where `snapshotAt` is the
-review snapshot taken when the proposal entered Pending, however much later the
-round opens (`GuardianRegistry.sol:702-715, 1053`). A guardian who staked in or
+denominator as `getPastTotalVotes(snapshotAt)` and stores that same instant as
+`er.openedAt`; each block vote weighs the voter's raw `getPastStake(voter,
+er.openedAt)` (`voteBlockEmergencySettle`). `snapshotAt` is the review snapshot
+taken when the proposal entered Pending, however much later the round opens; only
+a review registered before that field existed falls back to the open-time
+instant. A guardian who staked in or
 after that block cannot vote on any emergency round of the proposal. Stake that
 counted then counts in the denominator whether or not it votes, including stake
 whose owner has since left. The quorum bps is snapshotted when the round opens
-(`:719`).
+(`openEmergency`).
 
 **Reviewer rule.** Simulate the batch on a fork and block it unless all of the
 following hold:
@@ -586,10 +616,10 @@ zero-amount slot and `emergencySettleWithCalls` now reverts
 The way back is a factory-gated ceremony, and it works because
 `transferOwnerStakeSlot`'s `PriorStakeNotCleared` guard passes at zero:
 
-1. `prepareOwnerStake(amount)` (`StakedWood.sol:944`) with
+1. `prepareOwnerStake(amount)` (`StakedWood.prepareOwnerStake`) with
    `amount >= requiredOwnerBond(vault)`
-2. `SyndicateFactory.rotateOwner` (`SyndicateFactory.sol:718`) to bind the
-   funded slot via `transferOwnerStakeSlot` (`StakedWood.sol:1120`)
+2. `SyndicateFactory.rotateOwner` (`SyndicateFactory.rotateOwner`) to bind the
+   funded slot via `transferOwnerStakeSlot` (`StakedWood.transferOwnerStakeSlot`)
 
 Until that runs, the affected vault keeps `unstick` — which carries no bond gate
 — so a settlement replay of already-reviewed calldata is unaffected. Only the

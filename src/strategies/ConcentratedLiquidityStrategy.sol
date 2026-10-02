@@ -121,7 +121,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice Hard ceiling on any configured slippage floor.
     uint256 public constant MAX_SLIPPAGE_BPS = 1_000;
 
-    /// @notice Floor on the settle slippage, which is fixed at init (audit FP-06).
+    /// @notice Floor on the settle slippage, which is fixed at init.
     uint256 public constant MIN_SETTLE_SLIPPAGE_BPS = 50;
 
     /// @notice Morpho oracle scale: `price()` is loan units per collateral unit x 1e36.
@@ -607,7 +607,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
     }
 
-    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone (FP-02).
+    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone.
     function _requireAllowedMarket(address registry, Id id) private view {
         if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isMorphoMarketAllowed, (Id.unwrap(id))))) {
             revert MorphoMarketNotAllowed(id, registry);
@@ -1026,7 +1026,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 threshold = (uint256(uint24(halfRange)) * _rerange.triggerBps) / BPS_DENOMINATOR;
         // At least one spacing: a re-snapped range sits up to spacing/2 off the TWAP, so a smaller
-        // threshold lets the same-transaction rerange repeat until `maxReranges` (audit V2-03).
+        // threshold lets the same-transaction rerange repeat until `maxReranges`.
         // forge-lint: disable-next-line(unsafe-typecast)
         if (threshold < uint256(uint24(tickSpacing))) threshold = uint256(uint24(tickSpacing));
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -1196,7 +1196,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         (uint256 slippageBps, uint256 deadline) = abi.decode(data, (uint256, uint256));
         if (slippageBps != 0) {
             // Ceiling first, so an out-of-range value keeps answering `InvalidBound`.
-            // The reviewed value is fixed: lowering it can brick settle (FP-06).
+            // The reviewed value is fixed: lowering it can brick settle.
             if (slippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
             if (slippageBps != settleSlippageBps) revert ImmutableParam();
         }

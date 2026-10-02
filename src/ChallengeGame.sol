@@ -702,9 +702,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         bytes32 rk = _reviewKey(governor, proposalId);
         _releaseFreeze(rk, governor, proposalId);
-        // An acquittal adjudicates, and spends the window, only at the same
-        // quorum a conviction needs. Below the bar the cohort did not decide, so
-        // the failure is silence and the proposal stays challengeable.
+        // Below the conviction quorum the acquittal is silence and re-arms once;
+        // a quorum acquittal skips the re-arm and leaves the existing deadline.
         if (c.acquitWeight * BPS_DENOMINATOR < c.quorumBpsAtFiling * c.totalStakeAtFiling) {
             _rearmChallengeWindow(rk, governor, proposalId);
         }

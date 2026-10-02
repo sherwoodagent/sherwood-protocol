@@ -11,7 +11,8 @@ what the code does.
 Documents only. No executable source changes; natspec comments only in `src/` and one test comment.
 
 - Guardian review and emergency block votes weigh raw `getPastStake` at the proposal's snapshot (one second before it entered Pending);
-  only `TokenCourt.vote` uses the age-weighted `getPastVotes`.
+  on `post-audit-v2` challenge ballots are raw too, and no contract reads the age-weighted `getPastVotes`
+  (on `v1-deploy`, where this change was written, `TokenCourt.vote` read it).
 - Per-vault voting period floor is 1 hour on the mainnet implementation (factory default 24 hours);
   veto threshold bounds are 20–80%; votingPeriod maximum is 3 days; strategy duration maximum 30 days.
 - The slash is the approver's lock, floored at `minSlashBps` of the basis; a blocked review scales it
@@ -33,7 +34,7 @@ Documents only. No executable source changes; natspec comments only in `src/` an
 
 ### Modified Capabilities
 
-- `guardian-staking`: vote-read consumers (raw for reviews, aged for the court).
+- `guardian-staking`: vote-read consumers (raw for every vote; the age-weighted getter has no on-chain reader on `post-audit-v2`).
 - `guardian-agent`: the block-reachability check uses raw snapshot stake.
 - `deployment-docs`: guardian simulation preconditions; WOOD price outage semantics and monitoring.
 - `syndicate-governor`: governance parameter bounds.

@@ -457,7 +457,7 @@ decision — never a side effect of re-certification.
 because they either don't run `_demote`, or don't persist at all:
 
 - The ChallengeGame calls `demoteByChallenge` **best-effort**, inside a
-  `try/catch` ([`src/ChallengeGame.sol:1141`](../src/ChallengeGame.sol#L1141)).
+  `try/catch` in `_settle` ([`src/ChallengeGame.sol:650`](../src/ChallengeGame.sol#L650)).
   If that call reverts — e.g. `authorizedDemoter` was rotated away
   mid-challenge — no `_demote` runs, so nothing is cleared; the only signal is
   `AdapterDemotionFailed`. This case is structurally uncoverable on-chain: the
