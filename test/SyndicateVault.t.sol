@@ -440,20 +440,17 @@ contract SyndicateVaultTest is Test {
 
     // ==================== RESCUE ERC20 ====================
 
-    /// @dev Sanity check that `rescueERC20` covers stranded non-asset tokens
-    ///      that would previously have been pulled out via `executeBatch`.
-    function test_rescue_covers_strandedTokens() public {
-        // Send WETH (non-asset) directly to the vault
+    /// @notice A stranded non-asset token cannot be rescued to an arbitrary address (FP-04).
+    function test_rescue_strandedToken_toArbitraryAddress_reverts() public {
         weth.mint(address(vault), 1e18);
-        assertEq(weth.balanceOf(address(vault)), 1e18);
-
         address recipient = makeAddr("stranded-weth-recipient");
 
         vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.RescueRecipientNotStrategy.selector, recipient));
         vault.rescueERC20(address(weth), recipient, 1e18);
 
-        assertEq(weth.balanceOf(recipient), 1e18);
-        assertEq(weth.balanceOf(address(vault)), 0);
+        assertEq(weth.balanceOf(recipient), 0);
+        assertEq(weth.balanceOf(address(vault)), 1e18);
     }
 
     function test_rescueERC20_cannotRescueAsset_reverts() public {
