@@ -34,9 +34,14 @@ branch; file and function are cited so each can be checked.
   - `pricing/WoodPoolFeed.sol`
 - **Out of scope:**
   - `src/strategies/ConcentratedLiquidityStrategy.sol` and `src/strategies/MorphoSupplyStrategy.sol`:
-    not enabled at launch. The Safe un-approves both templates with
-    `StrategyFactory.setTemplateApproval(template, false)` after the ceremony, and they are not
-    re-approved until audited separately.
+    out of the audit scope. Both templates stay approved after the ceremony and are offered "use at
+    your own risk": a fund owner who proposes one accepts that it is unaudited, and that fund's
+    depositors bear the risk. The audited core provides containment around them: a strategy clone
+    holds only the capital its proposal moved, per-call caps and the asset rules bound what a batch
+    can do, guardian review can refuse any proposal, and the clone can only pay its own vault. When a
+    fund asks for a Morpho or CL strategy, the Safe reviews the market's five parameters and then
+    allowlists its id (`TierRegistry.setMorphoMarketAllowed`); this is an on-request step, not a
+    launch step.
   - `src/vendor/**`: third-party code, checked against its upstream by
     `script/check-vendor-provenance.sh`.
   - `src/vesting/**`: standalone, not deployed by the ceremony.
@@ -197,7 +202,7 @@ be as short as 300 s (`MIN_TWAP_WINDOW`); both are proposer-chosen. The 10% pool
 Liquidity added in the same block passes the 10% cap; it is a measurement at one instant. `rerange` is
 permissionless within its trigger, `minInterval` (which may be 0) and `maxReranges` (≤ 20). LP mint
 and withdraw pass `amount0Min = amount1Min = 0` (`_mintPosition`, `_closePosition`). At settle the LP
-withdrawal (zero mins) runs before the TWAP check, which runs only if an `otherToken` balance remains. The strategy is out of the audit scope and disabled at launch: the Safe un-approves its template (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony.
+withdrawal (zero mins) runs before the TWAP check, which runs only if an `otherToken` balance remains. The strategy is out of the audit scope; available at launch, use at your own risk.
 
 **5.7 Strategy registration proves shape only.** `StrategyFactory.registerStrategy` is permissionless
 and checks that `vault()`, `proposer()` and `executed()` answer. A batch may call the vault asset or
@@ -256,7 +261,7 @@ ledger prices within `PEG_TOLERANCE_BPS` (1%) of $1, at init and execute
 (`PortfolioStrategy._requireUsdPegged`). Morpho markets are admitted by market id
 (`TierRegistry.isMorphoMarketAllowed`, checked by `MorphoSupplyStrategy` and the CL strategy). A
 non-asset token in a vault can only be sent to a strategy clone of that vault
-(`SyndicateVault.rescueERC20`); one that no clone can sell stays in the vault, outside the share price. The Morpho supply and CL strategies, the only consumers of the market-id allowlist, are out of the audit scope and disabled at launch: the Safe un-approves their templates after the ceremony.
+(`SyndicateVault.rescueERC20`); one that no clone can sell stays in the vault, outside the share price. The Morpho supply and CL strategies, the only consumers of the market-id allowlist, are out of the audit scope; available at launch, use at your own risk.
 
 **5.13 Share transfers are not gated.** `SyndicateVault._update` applies no depositor check, so a
 whitelisted holder can transfer shares to any address while `depositsRestricted` is on.
@@ -295,7 +300,7 @@ and the settler chooses the block. Portfolio sells each token at the Chainlink v
 `maxSlippageBps` (0.5–10%), with feeds up to 26 h old, treating one asset unit as $1
 (`PortfolioStrategy._sellFloor`, `_feedPrice`). CL settle floors on pool spot within
 `maxTwapDeviationBps` ticks (≤ about 10.5%) of a TWAP that may be 300 s long (`_swapToAsset`). Each
-settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The CL strategy is out of the audit scope and disabled at launch: the Safe un-approves its template after the ceremony.
+settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The CL strategy is out of the audit scope; available at launch, use at your own risk.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
 reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at
@@ -304,7 +309,7 @@ relief before settle, so interest
 can push it into Morpho liquidation; if proceeds do not cover the debt, settle reverts until someone
 transfers the asset to the clone (`_repayAndWithdraw`, `_deleverage`). The market-id allowlist is the
 only check. Before allowing an id the Safe must review collateral token, oracle, lltv, irm and
-liquidity. Both strategies in this item are out of the audit scope and disabled at launch: the Safe un-approves their templates (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony, so no market id needs to be allowed at launch.
+liquidity. Both strategies in this item are out of the audit scope; available at launch, use at your own risk. A market id is allowed on request, when a fund wants one of them.
 
 **5.20 Portfolio after execute.** The ±1% peg is checked only at init and execute, never at
 `rebalanceDelta` or settle. A depeg loosens the floors, or makes them unreachable and settle revert.
@@ -313,7 +318,7 @@ parameters, each swap floored at feed − `maxSlippageBps`.
 
 **5.21 CL TWAP grief.** On a low-cardinality pool, anyone can make execute, rerange or settle revert
 `TwapUnavailable` with a few small swaps in separate blocks (`_tryTwapTick`). The permissionless remedy
-is `increaseObservationCardinalityNext` on the pool. The strategy is out of the audit scope and disabled at launch: the Safe un-approves its template (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony.
+is `increaseObservationCardinalityNext` on the pool. The strategy is out of the audit scope; available at launch, use at your own risk.
 
 ## 6. Documents
 
