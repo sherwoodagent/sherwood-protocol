@@ -85,9 +85,10 @@ interface IChallengeGameWindowMinimal {
  *         collapse that had no sound moment to run).
  *
  *         `slashableBondUsd(g)` is `ownStake(g) * priceHaircut`; a guardian's
- *         own bond is the only slashable capital. USD enters at exactly two
- *         places: the execute-time quorum (`requireApproveQuorum`) and the
- *         liability/fee views. Capacity, locks and slash rates are pure WOOD.
+ *         own bond is the only slashable capital. USD enters at the approve-time
+ *         slot floor (`recordApproval`), the execute-time quorum
+ *         (`requireApproveQuorum`), the proposer bond and the liability/fee
+ *         views. Capacity, locks and slash rates are pure WOOD.
  *
  *         Exposure is EPOCH-BUCKETED: an approval consumes one bucket, and open
  *         exposure is the sum of all buckets young enough that their challenge
@@ -112,8 +113,8 @@ interface IChallengeGameWindowMinimal {
  *         WHAT IT COSTS: there is no branch that keeps pricing when all market
  *         data is gone, so `NoWoodPrice` is reachable in production. Halting
  *         semantics are chosen per consumer — see `IExposureLedger.NoWoodPrice`.
- *         In one line: votes still work, nothing new can be proposed, nothing
- *         can execute.
+ *         In one line: block votes still land, approve votes revert, nothing new
+ *         can be proposed, nothing can execute, no challenge can be filed.
  *
  * @dev    TRUST MODEL: THE OWNER IS UNRESTRICTED HERE, BY DESIGN.
  *         `setWoodUsdPrice` and `setWoodHaircutBps` impose no rate limit and no
@@ -469,7 +470,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///         ZERO IS STILL ALLOWED, and is a HARD STOP rather than a $0
     ///         valuation: `_woodPrice` reverts `NoWoodPrice` on a zero cap, so
-    ///         proposing and executing halt while votes continue to land.
+    ///         proposing, approving and executing halt while block votes land.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
         uint256 current = woodUsdPriceX8;
         emit WoodUsdPriceSet(current, newPriceX8);

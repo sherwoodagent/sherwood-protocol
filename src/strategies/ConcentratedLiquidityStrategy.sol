@@ -747,7 +747,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     }
 
     /// @dev Reverts unless spot sits within `maxTwapDeviationBps` of the TWAP,
-    ///      and when the TWAP itself cannot be read (`_twapTick`).
+    ///      and when the TWAP itself cannot be read (`_twapTick`). The bound is
+    ///      compared in TICKS: N means a price move of 1.0001^N − 1 (1,000 ≈ 10.5%).
     function _requireSpotNearTwap() private view returns (int24 twap) {
         twap = _twapTick();
         (, int24 spot,,,,,) = pool.slot0();

@@ -62,12 +62,16 @@ means `stakedAmount > 0` and no pending unstake request.
 | `minOwnerStake` (vault-owner bond at creation) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:790` |
 | `minSlashBps` — the **deterrence floor**: the least a convicted approver loses, as a fraction of their whole bond, whatever WOOD they declared. Launch value is a governance decision; `DeployPlanB` refuses zero. | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.sol:800` |
 | `maxSlashBps` — must be 100%: a guardian may lock their entire stake behind one proposal, and a ceiling below that would cap the burn beneath the lock. `DeployPlanB` pre-flight asserts it. | 100% | ≥ `minSlashBps` | 100% | `StakedWood.sol:809` |
-| `ageFloorBps` (new-stake vote weight) | 25% | > 0 | 100% | `StakedWood.sol:816` |
-| `maturationPeriod` (ramp to full weight) | 30 d | 7 d | 90 d | `StakedWood.sol:823` |
+| `ageFloorBps` (new-stake weight in `getPastVotes`) | 25% | > 0 | 100% | `StakedWood.sol:794` |
+| `maturationPeriod` (ramp to full weight in `getPastVotes`) | 30 d | 7 d | 90 d | `StakedWood.sol:801` |
 
-**Age-weighted voting:** fresh stake votes at `ageFloorBps` (25%) and ramps linearly
-to full weight over `maturationPeriod` (30 d). Topping up re-anchors the stake
-timestamp to a weighted average — no cheap weight resets.
+**Review and emergency votes weigh raw stake.** A guardian review vote and an
+emergency block vote both weigh `getPastStake`: the voter's raw checkpointed
+stake at the proposal's propose-time snapshot, with no age discount
+(`GuardianRegistry.sol:590, 1053`). Stake placed one block before `propose`
+votes at full weight. Age weighting (`getPastVotes`: fresh stake at
+`ageFloorBps`, rising linearly to full weight over `maturationPeriod`) is used
+on chain only by `TokenCourt.vote` (`TokenCourt.sol:358`).
 
 **Cooldown binds review evasion:** `coolDownPeriod ≥ reviewPeriod` is enforced on
 both sides, so a guardian can never unstake faster than a review they might be
@@ -88,11 +92,16 @@ Timeline per proposal: `registerReview` (governor pushes the window at propose) 
 
 Mechanics worth knowing:
 
-- Total stake and the block quorum are **snapshotted at `openReview`** — joining or
-  leaving mid-review does not move the bar.
+- Both sides of the block quorum are measured at the **propose-time snapshot**,
+  `snapshotAt = propose − 1 s` (`GuardianRegistry.sol:393`): `openReview` stores
+  `getPastTotalVotes(snapshotAt)` as the denominator (`:838`) and each vote
+  weighs `getPastStake(voter, snapshotAt)` (`:590`). Stake added after `propose`
+  neither votes nor moves the bar; stake held at `propose` counts in the
+  denominator whether or not it votes. `blockQuorumBps` and the slash envelope
+  are snapshotted at `openReview`.
 - A thin cohort still decides its own reviews. There is no stake floor at open.
   Only a **zero** denominator fails open: `_isBlocked` returns false when
-  `totalStakeAtOpen == 0` (`GuardianRegistry.sol:507-523`), because
+  `totalStakeAtOpen == 0` (`GuardianRegistry.sol:423-427`), because
   `0 * 10_000 >= q * 0` would otherwise resolve Blocked with nobody participating
   and slash every approver. Any positive at-open stake, however small, can reach
   the block quorum.
@@ -172,7 +181,11 @@ shrink or grow it.
 - **Capacity is WOOD, with no price.** Free budget is
   `kNumerator × slashableStake − Σ live locks`, where `openExposure(guardian)`
   walks the epoch buckets in WOOD. A WOOD-feed outage or manipulation cannot starve
-  or inflate a guardian's capacity, and an approve vote never depends on a price.
+  or inflate a guardian's capacity. The approve vote itself does need prices:
+  `recordApproval` values the need with `coverageUsd` and the lock with
+  `woodPriceX8()` for the slot floor, both unwrapped
+  (`ExposureLedger.sol:757, 773`), so an approve vote reverts while the WOOD
+  price or the vault-asset feed is unavailable. A block vote reads no price.
   Budget recycles when a bucket ages past `bucketEnd + challengeWindow`, or
   earlier on release or retirement.
 - **Frozen and pinned locks keep counting (SHE-213).** A challenge freezes a lock
@@ -245,10 +258,15 @@ Two independent axes:
    Tier 0 = closed-loop, tier 1 = oracle-bounded, tier 2 = arbitrary calldata
    (the default for anything uncertified). Each certification pins an
    `extractableBoundBps` and the adapter's **codehash**.
-2. **Allowlist axis** (bounds where funds may go): the vault's `_guardBatchCalls`
-   requires every batch callee and every value-moving recipient to be
-   `isAdapterAllowed` — which checks both the flag *and* that the live codehash
-   still equals the one snapshotted at grant time. Code changes self-revoke lazily.
+2. **Counterparty axis** (bounds which venues a strategy may bind):
+   `isCounterpartyAllowed` checks both the flag *and* that the live codehash
+   still equals the one snapshotted at grant time; strategy templates read it
+   when they bind a venue. Code changes self-revoke lazily. The vault's batch
+   guard does not read this axis: `_guardBatchCalls` requires every non-asset
+   callee to be a strategy registered with the `StrategyFactory` (registration
+   is permissionless) and every call on the asset to be `transfer`,
+   `transferFrom` from the vault, or the approve family, to any recipient
+   (`SyndicateVault.sol:456-474`, `AssetCallRules.sol`).
 
 | Parameter | Default | Min | Max |
 |---|---|---|---|
@@ -351,29 +369,93 @@ the verdict. No panel, no appeal.
 
 ## Emergency paths
 
-- `unstick` (`GovernorEmergency.sol:76`) — vault owner replays the already-voted
+- `unstick` (`GovernorEmergency.sol:64`) — vault owner replays the already-voted
   settlement calls after `strategyDuration`. No review: the calldata was already
   reviewed. Caps are the coverage-scaled `effectiveMaxCapital` and settlement
-  caps, not the declare-time envelope.
-- `emergencySettleWithCalls` (`GovernorEmergency.sol:107`) — vault owner submits
-  **new** calls; requires the owner's sWOOD bond (`requiredOwnerBond` =
-  `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)` at `StakedWood.sol:1156`,
-  `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD at `:213`, and the posted bond must be
-  strictly positive) and opens a fresh guardian review (block-only voting). A
-  block slashes the **owner's bond**, not guardians. Finalize executes with
-  per-call caps disabled — the escape hatch for a settlement leg stuck on a cap —
-  and a net egress budget of zero, measured across the whole batch: vault float
-  may leave inside the batch only if at least as much comes back before it ends
-  (a solvent repay the vault fronts and the redeemed collateral returns passes),
-  and what the strategy returns may be passed on (the guardian veto is the
-  control for that). Only an insolvent unwind needs funds sent to the strategy
-  from outside the vault.
+  caps, not the declare-time envelope. Like `settleProposal`, it reverts unless
+  the strategy reports it has unwound and the settle price clears the floor
+  (`:72-76`).
+- `emergencySettleWithCalls` (`GovernorEmergency.sol:83`) — vault owner submits
+  **new** calls after `strategyDuration`; requires the owner's sWOOD bond
+  (`requiredOwnerBond` = `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)` at
+  `StakedWood.sol:1156`, `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD at `:213`, and the
+  posted bond must be strictly positive) and opens a fresh guardian review
+  (block-only voting, `reviewPeriod` long). A block slashes the **owner's
+  bond**, not guardians. `finalizeEmergencySettle` (`:116`) executes the stored
+  calls with per-call caps disabled — the escape hatch for a settlement leg
+  stuck on a cap — and a net egress budget of zero, measured across the whole
+  batch (`:129`; `SyndicateVault.sol:427-429`): vault float may leave inside
+  the batch only if at least as much comes back before it ends (a solvent repay
+  the vault fronts and the redeemed collateral returns passes). Only an
+  insolvent unwind needs funds sent to the strategy from outside the vault.
 - After a blocked round burns the bond, the same owner re-bonds with
   `prepareOwnerStake` → `approveOwnerStakeBinding(vault)` →
   `rotateOwner(vault, owner)`, which is allowed while the stuck proposal is still
   open (rotation to any other address still waits until nothing is open), then
   opens a new round. Each blocked round costs a bond. The rotation drains the
   vault's agent set, so the owner calls `registerAgent` again before proposing.
+- If the Safe raises `minOwnerStake` above a vault's posted bond while its
+  proposal is open, `emergencySettleWithCalls` reverts `OwnerBondInsufficient`
+  and the owner can neither top up nor re-bond (the bond is not zero) until the
+  Safe lowers the floor again. Propose and execute are unaffected.
+
+### What an unblocked emergency round lets the owner do
+
+A round that does not reach block quorum executes exactly the calls the owner
+submitted. The guardian block vote is the only control on them. An unblocked
+round lets the vault owner:
+
+- **Pass on what the strategy returns.** The zero budget protects only the
+  vault's asset balance as it stood before the batch. `[clone.rescueTo(asset),
+  asset.transfer(owner, x)]` pays the owner up to everything the clone returns
+  inside the batch; one unit more reverts `MaxNetOutflowExceeded`. `rescueTo`
+  (`BaseStrategy.sol:162`) pushes the clone's whole balance of any token to the
+  vault, in any lifecycle state. A non-asset token that reaches the vault is not
+  counted in the share price, and no governor batch can call it (a batch may
+  target only the asset and registered strategies).
+- **Close a proposal with capital still on the strategy.**
+  `finalizeEmergencySettle` checks neither that the strategy has unwound nor the
+  settle-price floor. An empty call list, or calls that do nothing, finalise:
+  the proposal becomes Settled while the clone still holds the position and
+  reports `executed() == true`. `totalAssets()` counts only idle asset, so
+  redemptions and deposits reopen at a share price without the position until a
+  later proposal's batch calls the clone's `settle()` (`BaseStrategy.sol:153`).
+- **Cancel a round for free while block weight is below quorum.**
+  `cancelEmergencySettle` is accepted until `reviewEnd` unless block quorum is
+  already reached (`GuardianRegistry.sol:755-761`). Nothing is slashed, and the
+  owner may open a new round one `reviewPeriod` after the cancel (`:697, 767`).
+  Emergency block votes have no late-vote lockout, so a cancel and the vote that
+  would reach quorum race until the window closes. The bond burns only if the
+  full `blockQuorumBps` lands inside one window.
+- **Pause the vault.** `pause()` (`SyndicateVault.sol:313`) stops
+  `executeGovernorBatch` (`:395-399`), so keeper `settleProposal`, `unstick` and
+  `finalizeEmergencySettle` all revert while paused, but `emergencySettleWithCalls`
+  still opens a round (it touches only the registry). Only the vault owner can
+  unpause; the Safe and guardians cannot. The owner unpauses and finalises after
+  the review; if the position can still settle, anyone's `settleProposal` between
+  those two transactions closes the proposal first. While the vault is paused
+  the management fee keeps accruing on the whole fund.
+
+**The electorate is the propose-time snapshot.** `openEmergency` reads the
+denominator as `getPastTotalVotes(snapshotAt)` and each block vote weighs the
+voter's raw `getPastStake(voter, snapshotAt)`, where `snapshotAt` is the
+proposal's `propose − 1 s`, however much later the round opens
+(`GuardianRegistry.sol:702-715, 1053`). A guardian who staked after `propose`
+cannot vote on any emergency round of that proposal. Stake held at `propose`
+counts in the denominator whether or not it votes, including stake whose owner
+has since left. The quorum bps is snapshotted when the round opens (`:719`).
+
+**Reviewer rule.** Block an emergency batch if any of these holds:
+
+1. the call list is empty;
+2. a call transfers or approves the vault asset to any address other than the
+   vault or a strategy clone of this vault (`IStrategy(to).vault() == vault`);
+3. a call invokes `rescueTo` for a token other than the vault asset while the
+   position can still clear through the strategy's own `settle()`.
+
+A position that can still clear does not need its tokens pushed to the vault:
+leave them on the clone, and a later proposal's batch calling the clone's
+`settle()` returns them to LPs.
 
 ### Migrating a vault created under the zero-bond sentinel
 

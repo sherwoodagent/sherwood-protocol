@@ -354,5 +354,6 @@ cap)`, never served as a price, and it SHALL sit ABOVE market.
 - Re-measure before the run: the band moves with spot, and a cap set from a
   month-old measurement can be outside it by the time the ceremony happens.
 - Review monthly thereafter. A drifted-high cap simply stops binding; a cap that
-  drifts BELOW market binds permanently and pins every bond, which
-  `woodPriceDetail().capBinding` is the way to notice.
+  drifts BELOW market binds permanently and pins every bond; the ledger has no
+  view that reports it, so compare the WOOD feed's answer with
+  `woodUsdPriceX8()`.

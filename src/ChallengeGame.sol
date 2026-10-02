@@ -1018,9 +1018,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     /// @inheritdoc IChallengeGame
     /// @dev The court supplies only the verdict enum. `Guilty` reuses `_settle`
-    ///      verbatim, so the slash is at sWOOD's `maxSlashBps` with no severity
-    ///      ramp. `NotGuilty` reuses `_fail`'s PAYOUT but NOT its re-challenge
-    ///      re-arm: here an adjudicator genuinely looked at the merits and
+    ///      verbatim, so each approver loses its lock (`slashBpsFor`), floored at
+    ///      sWOOD's `minSlashBps`, with no severity ramp. `NotGuilty` reuses
+    ///      `_fail`'s PAYOUT but NOT its re-challenge re-arm: here an adjudicator genuinely looked at the merits and
     ///      cleared the accused. `Inconclusive` reuses `_refundAll`. There is
     ///      deliberately no severity parameter - a court that could dial the
     ///      slash would be negotiating with the accused, not ruling on them.

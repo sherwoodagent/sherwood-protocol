@@ -119,18 +119,19 @@ interface IStakedWood {
     function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
 
     /// @notice Guardian's age-weighted own vote weight at a past timestamp.
+    ///         On-chain consumer: `TokenCourt.vote` only. Guardian review and
+    ///         emergency block votes weigh raw `getPastStake` instead.
     /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own stake;
     ///         this applies `_ageFactorBps` on top, so the two are different
-    ///         measures of the same WOOD. Correct for weighing a vote, wrong for a
-    ///         subtraction against the total — use `getPastStake` there. Aging
+    ///         measures of the same WOOD. Wrong for a subtraction against the
+    ///         total — use `getPastStake` there. Aging
     ///         only ever shrinks weight, so per-account weight is bounded above by
     ///         raw stake, biasing `TokenCourt._participationFloor` too HIGH when
     ///         the accused are freshly staked.
     /// @dev    ANCHOR-EXACT: the age factor is evaluated against the `stakedAt`
     ///         anchor AS IT STOOD at `timestamp`, checkpointed alongside the raw
     ///         stake, not the live anchor — so a re-anchor AFTER `timestamp` can
-    ///         neither inflate nor deflate an already-past read, including the
-    ///         frozen ballots review votes snapshot at `openedAt`.
+    ///         neither inflate nor deflate an already-past read.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
