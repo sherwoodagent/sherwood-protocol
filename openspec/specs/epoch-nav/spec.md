@@ -5,9 +5,7 @@
 Defines how the protocol establishes value: WOOD and vault-asset USD pricing in the `ExposureLedger` with explicit staleness and fallback rules, and the wall-clock epoch schedule that buckets guardian exposure. Per-epoch NAV *checkpointing* (design §3.4a, Plan F) is intentionally absent from v1: a protocol-wide ceiling on strategy duration bounds each commitment to a single covered window instead.
 
 Strategy NAV is deliberately NOT in scope. The vault-side `PriceRouter` that once priced a live strategy was retired with Lane A (issue #54), so vault NAV is float-only and defined by the `syndicate-vault` capability, not here. What survives in this capability is guardian-bond and coverage pricing — `ExposureLedger` and `WoodTwapOracle` — which never referenced the router. V2 reintroduces strategy pricing together with the lane it serves.
-
 ## Requirements
-
 ### Requirement: WOOD is priced feed-first with a maintained governance fallback
 
 `ExposureLedger.woodPriceX8()` — the WOOD/USD price (8 decimals) behind every bond valuation — SHALL read the wired Chainlink feed first and fall back to the governance-set `woodUsdPriceX8` rather than reverting. The fallback SHALL be taken in all four degraded shapes:
@@ -135,7 +133,7 @@ The `ExposureLedger` SHALL derive coverage epochs from an immutable schedule: `e
 
 ### Requirement: Bounded duration substitutes for per-epoch NAV checkpointing in v1
 
-The protocol SHALL NOT record per-epoch NAV checkpoints on-chain in v1. Instead, `ProtocolConfig.maxStrategyDuration` SHALL impose a protocol-wide ceiling on `strategyDuration` (clamping every vault's own maximum), so a single guardian commitment spans the whole risk window and the drawdown predicate (predicate 5, `DrawdownBreach`) is enforceable at settlement without renewal, NAV checkpointing or claims-made attribution. The setter SHALL be owner-only and SHALL reject a non-zero value below 1 day; zero means "no protocol ceiling" (preserving pre-parameter deployments) and changes never rebind in-flight proposals, which snapshot parameters at propose time. In the challenge game the drawdown predicate is a label carried in the filing event — no contract derives it from on-chain NAV records.
+The protocol SHALL NOT record per-epoch NAV checkpoints on-chain in v1. Instead, `ProtocolConfig.maxStrategyDuration` SHALL impose a protocol-wide ceiling on `strategyDuration` (clamping every vault's own maximum), so a single guardian commitment spans the whole risk window and the drawdown predicate (predicate 5, `DrawdownBreach`) is enforceable at settlement without renewal, NAV checkpointing or claims-made attribution. The clamp SHALL hold at `propose`: a proposal whose `strategyDuration` exceeds the smaller of the vault's stored `maxStrategyDuration` and the live ceiling of the governor's `protocolConfig` SHALL revert `StrategyDurationTooLong`, whatever maximum the vault stored before the ceiling dropped. The setter SHALL be owner-only and SHALL reject a non-zero value below 1 day; zero means "no protocol ceiling" (preserving pre-parameter deployments) and changes never rebind in-flight proposals, which snapshot parameters at propose time. In the challenge game the drawdown predicate is a label carried in the filing event — no contract derives it from on-chain NAV records.
 
 #### Scenario: Degenerate ceiling rejected
 
@@ -146,6 +144,11 @@ The protocol SHALL NOT record per-epoch NAV checkpoints on-chain in v1. Instead,
 
 - **WHEN** the ceiling changes while a proposal is live
 - **THEN** only proposals created afterwards see the new ceiling
+
+#### Scenario: Lowered ceiling binds existing and new vaults at propose
+
+- **WHEN** the owner lowers the ceiling below a vault's stored `maxStrategyDuration`, on a vault created before or after the change
+- **THEN** a proposal longer than the ceiling reverts `StrategyDurationTooLong`, and one within both bounds proposes
 
 ### Requirement: Hardened Chainlink USD reads (library contract)
 
@@ -166,3 +169,4 @@ No production contract currently consumes this library (the `ExposureLedger` use
 
 - **WHEN** the price feed reports `answeredInRound < roundId` or `startedAt == 0`
 - **THEN** `readUsd` reverts `StaleOracle`
+
