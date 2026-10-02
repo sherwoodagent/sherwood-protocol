@@ -197,12 +197,12 @@ Not one-time steps. Nothing below is enforced on-chain.
   forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
   ```
 
-- **Allowlisting a Morpho market before a strategy uses it.** Not a launch step:
-  `MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy` are out of the audit
-  scope and disabled at launch. After the ceremony the Safe un-approves both
-  templates with `StrategyFactory.setTemplateApproval(template, false)`, and they
-  are not re-approved until audited separately, so no market is granted at launch.
-  When they are re-enabled: before a
+- **Allowlisting a Morpho market before a strategy uses it.** Done on request,
+  when a fund wants a `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy`;
+  not a launch step. Both templates stay approved after the ceremony. The two
+  strategies are not covered by the external audit and are offered use at your
+  own risk. The Safe first reads the market's five parameters with
+  `idToMarketParams` and applies the refusal rules below. Before a
   `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy` clone is
   initialised, the `TierRegistry` owner allowlists that market BY ID:
   `setMorphoMarketAllowed(<marketId>, true)`. The id is Morpho's
