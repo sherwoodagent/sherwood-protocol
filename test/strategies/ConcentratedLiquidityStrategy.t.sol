@@ -584,7 +584,7 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     //
     // The consequence is unrecoverable rather than merely annoying:
     // `_updateParams` reaches only `settleSlippageBps` and `settleDeadline` and
-    // is a one-way ratchet, so neither of these two can be corrected after
+    // fixes the slippage at init, so neither of these two can be corrected after
     // init. Every `rerange()` reverts for the clone's whole life — up to
     // `ABSOLUTE_MAX_STRATEGY_DURATION` frozen in the initial band, earning no
     // fees while the Morpho borrow accrues.
@@ -613,8 +613,8 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidBound.selector, p);
     }
 
-    /// @dev NOT A BLANKET REJECTION. The bar is "non-zero", the same bar
-    ///      `settleSlippageBps` clears — one basis point is admissible. Without
+    /// @dev NOT A BLANKET REJECTION. The bar is "non-zero" — one basis point is
+    ///      admissible (unlike `settleSlippageBps`, floored at 50, FP-06). Without
     ///      this the two tests above would also hold for a guard that refused
     ///      every value, which would brick the template far harder than the
     ///      finding does.
@@ -711,9 +711,20 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevertWithArgs(address(morpho));
     }
 
-    function test_init_deniedCollateralTokenReverts() public {
-        tierRegistry.setDenied(mp.collateralToken, true);
-        _expectInitRevertWithArgs(mp.collateralToken);
+    /// @dev FP-02: the collateral is bound through the market id, not as its own counterparty.
+    function test_init_deniedMarketReverts() public {
+        tierRegistry.setMarketDenied(keccak256(abi.encode(mp)), true);
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_defaultParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.MorphoMarketNotAllowed.selector,
+                keccak256(abi.encode(mp)),
+                address(tierRegistry)
+            )
+        );
+        s.initialize(v, proposer, data);
     }
 
     /// @dev The binding must run BEFORE the counterparty-derived checks, or a

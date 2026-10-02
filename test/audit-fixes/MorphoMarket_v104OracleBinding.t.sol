@@ -15,48 +15,54 @@ import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLi
 import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.sol";
 import {MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
 
-/// @notice Audit 2026-10-01 V1-04 (CL): the Morpho market's oracle must be an allowed counterparty
-///         at init and again at execute.
+/// @notice Audit 2026-10-01 V1-04 (CL), re-pinned by FP-02: the market's oracle is bound through the
+///         allowlisted market id at init and again at execute, not as its own counterparty.
 contract CLStrategy_v104OracleBindingTest is CLFixture {
-    function _expectCounterpartyRevert(address counterparty) internal {
+    function _id(MarketParams memory params) internal pure returns (bytes32) {
+        return keccak256(abi.encode(params));
+    }
+
+    /// @notice A market whose oracle differs from the allowlisted market's is a different id, refused at init.
+    function test_init_otherOracleReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.marketParams.oracle = makeAddr("otherOracle");
+        morpho.createMarket(p.marketParams);
+        tierRegistry.setMarketDenied(_id(p.marketParams), true);
         ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
-        bytes memory data = abi.encode(_defaultParams());
+        bytes memory data = abi.encode(p);
         address v = address(vaultStub);
         vm.expectRevert(
             abi.encodeWithSelector(
-                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, counterparty, address(tierRegistry)
+                ConcentratedLiquidityStrategy.MorphoMarketNotAllowed.selector,
+                _id(p.marketParams),
+                address(tierRegistry)
             )
         );
         s.initialize(v, proposer, data);
     }
 
-    /// @notice A market whose oracle is not allowlisted is refused at init.
-    function test_init_oracleNotAllowedReverts() public {
+    /// @notice Direction changed by FP-02: an oracle denied as a counterparty no longer refuses an allowlisted market.
+    function test_init_oracleCounterpartyGrantNoLongerConsulted() public {
         tierRegistry.setDenied(address(oracle), true);
-        _expectCounterpartyRevert(address(oracle));
-    }
-
-    /// @notice Control: the same market with its oracle allowlisted initialises.
-    function test_init_oracleAllowedSucceeds() public {
         ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
         assertEq(s.marketParams().oracle, address(oracle));
     }
 
-    /// @notice An oracle demoted between init and execute blocks execute.
-    function test_execute_revertsWhenOracleDemotedAfterInit() public {
-        tierRegistry.setDenied(address(oracle), true);
+    /// @notice A market de-listed between init and execute blocks execute.
+    function test_execute_revertsWhenMarketDemotedAfterInit() public {
+        tierRegistry.setMarketDenied(_id(mp), true);
         vm.prank(address(vaultStub));
         vm.expectRevert(
             abi.encodeWithSelector(
-                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(oracle), address(tierRegistry)
+                ConcentratedLiquidityStrategy.MorphoMarketNotAllowed.selector, _id(mp), address(tierRegistry)
             )
         );
         strategy.execute();
     }
 }
 
-/// @notice Audit 2026-10-01 V1-04 (supply): the market's oracle, and its collateral token unless it
-///         is the vault asset, must be allowed counterparties at init and again at execute.
+/// @notice Audit 2026-10-01 V1-04 (supply), re-pinned by FP-02: the market (oracle and collateral
+///         included) must be allowlisted by id at init and again at execute.
 contract MorphoSupplyStrategy_v104OracleBindingTest is Test {
     uint256 constant SUPPLY = 100_000e6;
 
@@ -84,11 +90,14 @@ contract MorphoSupplyStrategy_v104OracleBindingTest is Test {
 
         registry = new BindingTierRegistry();
         registry.setAllowed(address(morpho), true);
-        registry.setAllowed(mp.oracle, true);
-        registry.setAllowed(mp.collateralToken, true);
+        registry.setMarketAllowed(_id(mp), true);
         vaultStub = new BindingVaultStub(address(usdg), address(new BindingGovernorStub(address(registry))));
         usdg.mint(address(vaultStub), SUPPLY);
         template = new MorphoSupplyStrategy();
+    }
+
+    function _id(MarketParams memory params) internal pure returns (bytes32) {
+        return keccak256(abi.encode(params));
     }
 
     function _init(MarketParams memory params) internal returns (MorphoSupplyStrategy s) {
@@ -96,71 +105,64 @@ contract MorphoSupplyStrategy_v104OracleBindingTest is Test {
         s.initialize(address(vaultStub), proposer, abi.encode(address(morpho), params, SUPPLY));
     }
 
-    function _expectCounterpartyRevert(MarketParams memory params, address counterparty) internal {
+    function _expectMarketRevert(MarketParams memory params) internal {
         MorphoSupplyStrategy s = MorphoSupplyStrategy(Clones.clone(address(template)));
         bytes memory data = abi.encode(address(morpho), params, SUPPLY);
         address v = address(vaultStub);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                MorphoSupplyStrategy.CounterpartyNotAllowed.selector, counterparty, address(registry)
-            )
+            abi.encodeWithSelector(MorphoSupplyStrategy.MorphoMarketNotAllowed.selector, _id(params), address(registry))
         );
         s.initialize(v, proposer, data);
     }
 
-    /// @notice A market whose oracle is not allowlisted is refused at init.
-    function test_init_oracleNotAllowedReverts() public {
-        registry.setAllowed(mp.oracle, false);
-        _expectCounterpartyRevert(mp, mp.oracle);
+    function _expectExecuteMarketRevert(MorphoSupplyStrategy s) internal {
+        vm.prank(address(vaultStub));
+        usdg.approve(address(s), SUPPLY);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(
+            abi.encodeWithSelector(MorphoSupplyStrategy.MorphoMarketNotAllowed.selector, _id(mp), address(registry))
+        );
+        s.execute();
     }
 
-    /// @notice A market whose collateral token is not allowlisted is refused at init.
-    function test_init_collateralNotAllowedReverts() public {
-        registry.setAllowed(mp.collateralToken, false);
-        _expectCounterpartyRevert(mp, mp.collateralToken);
+    /// @notice A market with another oracle is another id, refused at init.
+    function test_init_otherOracleReverts() public {
+        MarketParams memory other = mp;
+        other.oracle = makeAddr("otherOracle");
+        morpho.createMarket(other);
+        _expectMarketRevert(other);
     }
 
-    /// @notice Control: oracle and collateral allowlisted, the clone initialises.
-    function test_init_oracleAndCollateralAllowedSucceeds() public {
+    /// @notice A market with another collateral token is another id, refused at init.
+    function test_init_otherCollateralReverts() public {
+        MarketParams memory other = mp;
+        other.collateralToken = makeAddr("otherCollateral");
+        morpho.createMarket(other);
+        _expectMarketRevert(other);
+    }
+
+    /// @notice Control: the allowlisted market initialises with no oracle or collateral grant of its own.
+    function test_init_allowlistedMarketSucceeds() public {
         MorphoSupplyStrategy s = _init(mp);
         assertEq(s.marketParams().oracle, mp.oracle);
     }
 
-    /// @notice Collateral equal to the vault asset needs no grant of its own.
-    function test_init_collateralEqualToAssetNeedsNoGrant() public {
+    /// @notice Direction changed by FP-02: collateral equal to the vault asset is no longer exempt; the market needs its own grant.
+    function test_init_collateralEqualToAssetNeedsMarketGrant() public {
         MarketParams memory same = mp;
         same.collateralToken = address(usdg);
         morpho.createMarket(same);
+        _expectMarketRevert(same);
+        registry.setMarketAllowed(_id(same), true);
         MorphoSupplyStrategy s = _init(same);
         assertEq(s.marketParams().collateralToken, address(usdg));
     }
 
-    /// @notice An oracle demoted between init and execute blocks execute; the vault is untouched.
-    function test_execute_revertsWhenOracleDemotedAfterInit() public {
+    /// @notice A market de-listed between init and execute blocks execute; the vault is untouched.
+    function test_execute_revertsWhenMarketDemotedAfterInit() public {
         MorphoSupplyStrategy s = _init(mp);
-        registry.setAllowed(mp.oracle, false);
-        vm.prank(address(vaultStub));
-        usdg.approve(address(s), SUPPLY);
-        vm.prank(address(vaultStub));
-        vm.expectRevert(
-            abi.encodeWithSelector(MorphoSupplyStrategy.CounterpartyNotAllowed.selector, mp.oracle, address(registry))
-        );
-        s.execute();
+        registry.setMarketAllowed(_id(mp), false);
+        _expectExecuteMarketRevert(s);
         assertEq(usdg.balanceOf(address(vaultStub)), SUPPLY, "nothing left the vault");
-    }
-
-    /// @notice A collateral token demoted between init and execute blocks execute.
-    function test_execute_revertsWhenCollateralDemotedAfterInit() public {
-        MorphoSupplyStrategy s = _init(mp);
-        registry.setAllowed(mp.collateralToken, false);
-        vm.prank(address(vaultStub));
-        usdg.approve(address(s), SUPPLY);
-        vm.prank(address(vaultStub));
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                MorphoSupplyStrategy.CounterpartyNotAllowed.selector, mp.collateralToken, address(registry)
-            )
-        );
-        s.execute();
     }
 }

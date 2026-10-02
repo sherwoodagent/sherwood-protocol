@@ -36,6 +36,10 @@ contract ZeroEgress_TierRegistryStub is ITierRegistry {
         return true;
     }
 
+    function isMorphoMarketAllowed(bytes32) external pure returns (bool) {
+        return true;
+    }
+
     function strategyFactory() external view returns (address) {
         return factoryAddr;
     }

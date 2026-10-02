@@ -22,6 +22,7 @@ import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 
@@ -185,6 +186,11 @@ contract PortfolioStrategy_deadFeedRebondTest is Test {
         vault.registerAgent(creatorAgentId, creator);
         vm.stopPrank();
         gov = SyndicateGovernor(factory.governorOf(v));
+        // FP-01: Portfolio reads the $1 check off governor.exposureLedger(); only the getter is
+        // mocked, so the governor's own propose gates stay unwired.
+        MockAssetLedger usdLedger = new MockAssetLedger();
+        usdLedger.setPrice(address(usdc), 1e8);
+        vm.mockCall(address(gov), abi.encodeWithSignature("exposureLedger()"), abi.encode(address(usdLedger)));
         queue = IVaultWithdrawalQueue(vault.withdrawalQueue());
 
         usdc.mint(lp1, 60_000e6);

@@ -535,6 +535,9 @@ not just one deployment's configuration. Only certify a template where:
    address* is disqualified — see `MorphoSupplyStrategy`, which does exactly
    that and stays address-certifiable only.
 2. Price sources are bound to the tokens they price, not merely allowlisted.
+   For a Morpho market the binding is the market id: `setMorphoMarketAllowed`
+   attests loan token, collateral, oracle, irm and lltv together, and the
+   oracle and collateral addresses are not allowlisted on their own.
 3. It is cloned with `Clones.clone` / `cloneDeterministic` only. Any
    clone-with-immutable-args variant gives each clone distinct bytecode, which
    dissolves the class **silently** — proposals keep working, they just fall

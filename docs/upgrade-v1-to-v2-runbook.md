@@ -161,6 +161,10 @@ the same Safe batch, BEFORE any governor or the new game is pointed at `TR2`:
 4. Replay the counterparty allowlist: `TR2.setCounterpartyAllowed(counterparty, true)`
    (re-snapshots codehashes).
 5. Replay price sources: `TR2.setPriceSourceForToken(token, priceSource, true)`.
+   Replay the Morpho market allowlist: `TR2.setMorphoMarketAllowed(id, true)` for every
+   `id` with `TR1.isMorphoMarketAllowed(id) == true` (from `MorphoMarketAllowedSet` events).
+   Morpho and CL strategies re-check their market id against the governor's current
+   registry on execute (and CL on `rerange`), so a missing id makes those calls revert.
 6. Re-deny every pair the old registry had demoted: for each `(target, selector)` with
    `TR1.isClassTierDenied(target, selector) == true` (or a `TierDemoted` event), call
    `TR2.demote(target, selector)` AFTER its class certification (`demote` reverts
@@ -179,7 +183,8 @@ Then step 7: `factory.setTierRegistry(TR2)` and `pushWiring` each governor in it
 cooldown. Until the last governor is re-pointed, the new game demotes only in TR2; on
 any conviction the Safe must mirror the demotion on TR1 with `TR1.demote(...)` /
 `TR1.demoteClass(...)`. Before re-pointing, diff `tierOf(target, selector)` on TR1 and
-TR2 for every pair the protocol has used.
+TR2 for every pair the protocol has used, and `isMorphoMarketAllowed(id)` for every
+Morpho market id a live strategy holds.
 
 ## 6. Do not
 

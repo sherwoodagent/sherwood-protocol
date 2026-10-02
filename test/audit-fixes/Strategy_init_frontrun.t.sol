@@ -12,6 +12,7 @@ import {
     MockVaultGovernorStub,
     MockPermissiveTierRegistry
 } from "../mocks/MockGovernorAlwaysActive.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 
 /// @title Strategy_init_frontrun — MS-C3 regression
 /// @notice Verifies that every concrete strategy template is *uninitializable*
@@ -113,7 +114,12 @@ contract StrategyInitFrontrunTest is Test {
         // vault -> governor() -> tierRegistry() -> permissive answers.
         MockGovernorAlwaysActive governorStub = new MockGovernorAlwaysActive();
         governorStub.setTierRegistry(address(new MockPermissiveTierRegistry()));
-        address wiredVault = address(new MockVaultGovernorStub(address(governorStub)));
+        MockAssetLedger ledger = new MockAssetLedger();
+        ledger.setPrice(stubToken, 1e8);
+        governorStub.setExposureLedger(address(ledger));
+        MockVaultGovernorStub vaultStub = new MockVaultGovernorStub(address(governorStub));
+        vaultStub.setAsset(stubToken);
+        address wiredVault = address(vaultStub);
 
         PortfolioStrategy(clone).initialize(wiredVault, proposer, initData);
         assertEq(PortfolioStrategy(clone).vault(), wiredVault);

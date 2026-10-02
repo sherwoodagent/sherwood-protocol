@@ -274,7 +274,7 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         vm.warp(vm.getBlockTimestamp() + 30 days);
 
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(uint256(400), uint256(0)));
+        strategy.updateParams(abi.encode(uint256(500), uint256(0)));
         vm.warp(vm.getBlockTimestamp() + 2 hours);
         pool.setTicks(850, 850);
         vm.prank(keeper);

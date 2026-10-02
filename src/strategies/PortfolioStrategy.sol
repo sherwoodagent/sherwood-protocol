@@ -6,6 +6,7 @@ import {IStrategy} from "../interfaces/IStrategy.sol";
 import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
@@ -25,6 +26,8 @@ interface ITierBindingPath {
     function tierRegistry() external view returns (address);
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
     function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool);
+    function exposureLedger() external view returns (address);
+    function coverageUsd(address asset, uint256 amount) external view returns (uint256);
 }
 
 /**
@@ -57,6 +60,9 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     error PriceSourceNotAllowed(address priceSource, address registry);
     error TierRegistryUnresolved();
     error PriceSourceNotPairedWithToken(address token, bytes32 priceSource, address registry);
+    error AssetNotVaultAsset(address asset, address vaultAsset);
+    error ExposureLedgerUnresolved();
+    error AssetNotUsdPegged(address asset, uint256 usdPerUnit);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -66,6 +72,8 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     uint256 public constant MIN_SLIPPAGE_BPS = 50;
     /// @notice Flat max age of a feed reading on every path: 24h heartbeat + 2h grace.
     uint256 public constant MAX_PUSH_PRICE_AGE = 26 hours;
+    /// @notice Floors treat one asset unit as $1, so the ledger must price it within this band.
+    uint256 public constant PEG_TOLERANCE_BPS = 100;
 
     // ── Storage (per-clone) ──
 
@@ -154,12 +162,16 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
             _feeds.push(feeds_[i]);
         }
         if (weightSum != BPS_DENOMINATOR) revert InvalidWeights();
+        address vaultAsset = IERC4626(vault()).asset();
+        if (asset_ != vaultAsset) revert AssetNotVaultAsset(asset_, vaultAsset);
+        uint8 assetDecimals_ = IERC20Metadata(asset_).decimals();
+        _requireUsdPegged(asset_, assetDecimals_);
 
         asset = asset_;
         swapAdapter = ISwapAdapter(swapAdapter_);
         totalAmount = totalAmount_;
         maxSlippageBps = maxSlippageBps_;
-        _assetDecimals = IERC20Metadata(asset_).decimals();
+        _assetDecimals = assetDecimals_;
     }
 
     // ── Execute: buy basket tokens ──
@@ -167,6 +179,7 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     function _execute() internal override {
         _requireAllowedAdapter(address(swapAdapter));
         _requireAllowedPriceSources();
+        _requireUsdPegged(asset, _assetDecimals);
 
         _pullFromVault(asset, totalAmount);
 
@@ -416,6 +429,21 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         for (uint256 i; i < len; ++i) {
             _requireAllowedPriceSource(_feeds[i]);
         }
+    }
+
+    /// @dev Ledger USD-18 value of one whole asset unit must sit within `PEG_TOLERANCE_BPS` of $1.
+    ///      Fail closed: an unresolved ledger, an unpriced asset or a stale feed reverts. Never on settle.
+    function _requireUsdPegged(address asset_, uint8 assetDecimals_) private view {
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        address ledger = governor_ == address(0)
+            ? address(0)
+            : _readAddress(governor_, abi.encodeCall(ITierBindingPath.exposureLedger, ()));
+        if (ledger == address(0)) revert ExposureLedgerUnresolved();
+        (bool ok, bytes memory ret) =
+            ledger.staticcall(abi.encodeCall(ITierBindingPath.coverageUsd, (asset_, 10 ** assetDecimals_)));
+        uint256 usd = ok && ret.length == 32 ? abi.decode(ret, (uint256)) : 0;
+        uint256 band = (1e18 * PEG_TOLERANCE_BPS) / BPS_DENOMINATOR;
+        if (usd < 1e18 - band || usd > 1e18 + band) revert AssetNotUsdPegged(asset_, usd);
     }
 
     /// @dev `vault() -> governor() -> tierRegistry()`; `address(0)` when any hop is unreadable.
