@@ -147,6 +147,12 @@ guard structurally cannot see: the strategy's own `forceApprove(swapAdapter,
 …)` calls happen one frame deeper than anything in the governor's batch
 calldata, after `strategy.execute()` has already been dispatched.
 
+A Portfolio clone also initialises and executes only on the vault's own asset,
+and only when the exposure ledger prices one whole unit of it within 1% of $1
+(`PEG_TOLERANCE_BPS`); an unresolved ledger, an unpriced asset or a stale feed
+reverts (`PortfolioStrategy.sol:165-168, 182, 436-447`). Settle and
+`rebalanceDelta` do not check it.
+
 Consequences for onboarding:
 
 - **Allowlisting must precede strategy clone+init, not just batch execution.**

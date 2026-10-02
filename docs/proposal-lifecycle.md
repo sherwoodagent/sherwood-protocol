@@ -67,7 +67,7 @@ recorded on entering Pending.
 | 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:204` |
 | 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:235-258` |
 | 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:260` |
-| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:559` |
+| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:560` |
 
 Cross-contract timing invariants (all enforced at the setters):
 
@@ -99,7 +99,7 @@ Cross-contract timing invariants (all enforced at the setters):
 - **Proposer bond** pulled into `ProposerBondEscrow`:
   `bondWood = coverageUsd × proposerBondBps (default 1%) / woodPrice`. Fail-closed —
   unpriceable WOOD blocks proposing any proposal with non-zero required coverage;
-  a zero-coverage proposal needs no bond and no price (`src/ExposureLedger.sol:680-686`).
+  a zero-coverage proposal needs no bond and no price (`src/ExposureLedger.sol:681-687`).
 
   This is **not** the 10k owner stake. The amount **scales** (tier-2 uncertified =
   full notional × ~1% in USD, converted at `woodPriceX8()`). Do not treat a fixed

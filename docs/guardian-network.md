@@ -153,8 +153,8 @@ it. Full detail: [coverage.md](coverage.md).
   converted to USD for coverage; a guardian whose lock is now worth less than
   when they declared it (unstake, WOOD price fall) counts at the shrunken live
   value. It reverts
-  `InsufficientApproveCoverage` **only** when the approver set is empty (`:1437`)
-  or the raised aggregate is exactly zero (`:1469`). A nonzero-but-partial book is
+  `InsufficientApproveCoverage` **only** when the approver set is empty (`ExposureLedger.sol:1185`)
+  or the raised aggregate is exactly zero (`:1202`). A nonzero-but-partial book is
   the shortfall case: it **scales** capital via
   `_deriveAndStoreEffectiveCapital` (`SyndicateGovernor.sol:1563`) —
   `effectiveMaxCapital = floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)` —
@@ -189,7 +189,7 @@ shrink or grow it.
   or inflate a guardian's capacity. The approve vote itself does need prices:
   `recordApproval` values the need with `coverageUsd` and the lock with
   `woodPriceX8()` for the slot floor, both unwrapped
-  (`ExposureLedger.sol:758, 774`), so an approve vote reverts while the WOOD
+  (`ExposureLedger.sol:759, 775`), so an approve vote reverts while the WOOD
   price or the vault-asset feed is unavailable. A block vote reads no price.
   Budget recycles when a bucket ages past `bucketEnd + challengeWindow`, or
   earlier on release or retirement.
@@ -246,14 +246,14 @@ shrink or grow it.
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.sol:610` |
-| `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.sol:559` |
+| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.sol:611` |
+| `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.sol:560` |
 | `epochLength` | 28 d (immutable) | — | — | ctor |
-| `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:145` |
-| `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.sol:621` |
-| `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.sol:616` |
-| `woodHaircutBps` | 100% (no haircut — deploy script refuses this; safe value set at deploy) | 50% | 100% | `ExposureLedger.sol:524` |
-| `woodUsdPriceX8` | owner-set cap (0 = hard stop `NoWoodPrice`) | — | — | `ExposureLedger.sol:474` |
+| `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:146` |
+| `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.sol:622` |
+| `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.sol:617` |
+| `woodHaircutBps` | 100% (no haircut — deploy script refuses this; safe value set at deploy) | 50% | 100% | `ExposureLedger.sol:525` |
+| `woodUsdPriceX8` | owner-set cap (0 = hard stop `NoWoodPrice`) | — | — | `ExposureLedger.sol:475` |
 
 ## Adapter certification — TierRegistry
 
@@ -383,8 +383,9 @@ the verdict. No panel, no appeal.
   settlement calls after `strategyDuration`. No review: the calldata was already
   reviewed. Caps are the coverage-scaled `effectiveMaxCapital` and settlement
   caps, not the declare-time envelope. It reverts unless the strategy reports it
-  has unwound, and it applies the looser `MAX_STAMP_DRAWDOWN_BPS` (90%) price
-  floor instead of the proposal's own `maxDrawdownBps` (`:72-76`,
+  has unwound, and it applies `MAX_STAMP_DRAWDOWN_BPS`, a 90% drawdown
+  allowance, i.e. a floor at 10% of the execute-time price per share, instead
+  of the proposal's own `maxDrawdownBps` (`:72-76`,
   `SyndicateGovernor.sol:559`). It closes a settle that fell below the
   proposal's floor; it cannot close one whose stored leg reverts, because it
   replays the same calls.
@@ -439,13 +440,19 @@ round lets the vault owner:
   reports `executed() == true`. `totalAssets()` counts only idle asset, so
   redemptions and deposits reopen at a share price without the position until a
   later proposal's batch calls the clone's `settle()` (`BaseStrategy.sol:153`).
-- **Trade an orphaned Portfolio basket.** After such a close, an owner who is
-  also the Portfolio clone's proposer can `rescueERC20` basket tokens into that
-  clone, which is still Executed, and call `rebalanceDelta` with no proposal
-  open (`PortfolioStrategy.sol:255`). Each swap runs through the clone's own
-  swap adapter and price feeds, which must still be allowlisted, and is bounded
-  by the clone's `maxSlippageBps`. This is a bounded residual, not a way to take
-  the tokens.
+- **Leave an orphaned clone that can still trade.** After such a close the
+  clone stays Executed, and two calls keep working with no proposal open:
+  - Portfolio: the clone's proposer, while still an agent of the vault (not
+    necessarily the owner), can call `rebalanceDelta` on the basket sitting on
+    the clone (`PortfolioStrategy.sol:255`; `BaseStrategy.sol:87-91`). Each swap
+    runs through the clone's own swap adapter and price feeds, which must still
+    be allowlisted, and is bounded by `maxSlippageBps`. An owner can add tokens
+    to that basket with `rescueERC20` into the clone; the bound is the same.
+  - Concentrated liquidity: `rerange()` is permissionless and needs only the
+    Executed state (`ConcentratedLiquidityStrategy.sol:963-984`), so anyone can
+    re-range the orphaned position, up to `maxReranges` times and subject to its
+    trigger and `minInterval`.
+  Both are bounded residuals, not ways to take the tokens.
 - **Cancel a round for free while block weight is below quorum.**
   `cancelEmergencySettle` is accepted until `reviewEnd` unless block quorum is
   already reached (`GuardianRegistry.sol:755-761`). Nothing is slashed, and the
@@ -489,13 +496,14 @@ following hold:
 2. Every `transfer`, `transferFrom` or approve-family call on the asset sends to,
    or approves, the vault or such a clone.
 3. Every call's `value` is zero.
-4. No call invokes `rescueTo` for a token other than the vault asset, unless the
-   position provably cannot clear through the clone's own `settle()`. A token
-   pushed to the vault is not counted in the share price, and afterwards only
-   the owner can move it, and only to a strategy clone of the vault.
+4. No call invokes `rescueTo` for a token other than the vault asset (see the
+   exception below). A token pushed to the vault is not counted in the share
+   price, and afterwards only the owner can move it, and only to a strategy
+   clone of the vault.
 5. After the batch, `IStrategy(p.strategy).executed()` is false, and the vault's
    asset balance is at least its pre-batch balance plus everything the clones
-   released inside the batch.
+   released inside the batch. "Released" is the sum of the asset's `Transfer`
+   events from the clones permitted by clause 1 to the vault during the batch.
 
 The owner chooses the instant `finalizeEmergencySettle` runs after `reviewEnd`,
 with per-call caps disabled, so judge the batch at the worst market state the
@@ -504,7 +512,10 @@ strategy's own slippage bounds allow, not at the state you simulated.
 One exception to clause 5: a strategy whose settle leg is dead for good can
 never report `executed() == false`. In that case only, accept a batch that
 leaves the non-asset tokens on the clone (not in the vault), returns every unit
-of the asset the clone holds, and does nothing else.
+of the asset the clone holds, and does nothing else. Accepting it closes the
+proposal with capital still on the strategy (see "Close a proposal with capital
+still on the strategy" above): deposits and redemptions reopen at a share price
+that excludes the position until a later proposal settles the clone.
 
 ### Migrating a vault created under the zero-bond sentinel
 

@@ -105,7 +105,7 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   earlier on release or retirement. A stale or manipulated WOOD feed can neither
   starve nor inflate a guardian's budget. The approve vote is not price-free:
   the slot floor values the need with `coverageUsd` and the lock with
-  `woodPriceX8()`, unwrapped (`ExposureLedger.sol:758, 774`), so an approve
+  `woodPriceX8()`, unwrapped (`ExposureLedger.sol:759, 775`), so an approve
   reverts while the WOOD price or the vault-asset feed is unavailable. A block
   vote reads no price.
 - **`kNumerator = 1` contains a conviction.** At the default, `Σ locks ≤ stake`,
@@ -257,7 +257,7 @@ below `MIN_V3_LIQUIDITY` or the V2 pair's WETH reserve is below
 vault-asset feed is older than its max delay, or the cap is zero. Approve votes,
 and proposing or executing any proposal with non-zero required coverage, halt on
 the same outage; `proposerBondWood` returns zero before reading the price for a
-zero-coverage proposal (`ExposureLedger.sol:681-683`).
+zero-coverage proposal (`ExposureLedger.sol:682-684`).
 
 - **The challenger's counter.** Both depth floors are read-time checks, so a
   challenger with the capital can add liquidity, file and remove it in one
@@ -266,13 +266,13 @@ zero-coverage proposal (`ExposureLedger.sol:681-683`).
   `MAX_SNAPSHOT_SPAN` (7 days) costs one more TWAP window. A stale Chainlink
   ETH/USD or vault-asset feed cannot be fixed by anyone but the Safe.
 - **The Safe's levers.** `ExposureLedger.setWoodFeed` and `setAssetFeed` seat a
-  replacement feed at once; the ledger adds no warm-up (`ExposureLedger.sol:491,
-  631`). A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
+  replacement feed at once; the ledger adds no warm-up (`ExposureLedger.sol:492,
+  632`). A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
   snapshots before it can price; any other Chainlink-shaped feed prices at once.
-  Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.sol:559`,
+  Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.sol:560`,
   `ChallengeGame.sol:1600`) moves the deadline of every executed proposal,
   including one whose window has already lapsed, until the permissionless
-  `retireApproval` (`ExposureLedger.sol:875`) clears that proposal's locks. Both
+  `retireApproval` (`ExposureLedger.sol:876`) clears that proposal's locks. Both
   levers are protocol-wide.
 
 ## Proposer bond
