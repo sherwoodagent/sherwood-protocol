@@ -184,7 +184,7 @@ that never happens.
 ### Requirement: Signing authority is gated by mode and chain
 
 The agent SHALL expose exactly three postures — `observe` (simulate and report, sign nothing),
-`defend` (additionally sign `openReview`, `resolveReview`, and Block votes), and `autonomous`
+`defend` (additionally sign Block votes, and `openReview` / `resolveReview` when the agent runs alone; an agent run as a voting identity of a fleet leaves those two calls to the fleet's stakeless keeper role, per the guardian-fleet capability), and `autonomous`
 (additionally sign Approve votes) — and SHALL default to `observe`.
 
 `autonomous` SHALL refuse to arm unless the connected chain id is the Robinhood Tenderly vnet fork

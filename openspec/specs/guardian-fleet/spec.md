@@ -164,9 +164,9 @@ reviews are snapshotted, and this SHALL be reported rather than discovered durin
 
 ### Requirement: A voting identity signs only guardian votes
 
-A guardian identity that holds stake SHALL sign only guardian votes — `voteOnProposal`,
+In a fleet deployment, a guardian identity that holds stake SHALL sign only guardian votes — `voteOnProposal`,
 `voteBlockEmergencySettle` and `ChallengeGame.voteOnChallenge` — and its own stake management, and
-SHALL NOT call `openReview` or `resolveReview`. The registry opens an unopened review lazily on its
+SHALL NOT call `openReview` or `resolveReview`. This is how a guardian agent runs inside a fleet; the guardian-agent `defend` mode signs those two calls only when the agent runs alone. Both calls are permissionless on-chain. The registry opens an unopened review lazily on its
 first vote, so a voter's ballot can open a review; that is a side effect of voting, not keeper duty.
 
 The adversary is an operator reasoning about blast radius from an incorrect inventory of what a

@@ -168,7 +168,7 @@ The handoff SHALL transfer, all inside the Mainnet run: one-step — `GovernorBe
 ### Requirement: Fork funding via Tenderly cheats only
 Three cheats are available: `tenderly_setBalance` (native), `tenderly_setErc20Balance`, and `tenderly_setStorageAt` (any slot). Time travel uses `evm_increaseTime` + `evm_mine`, and `evm_snapshot` / `evm_revert` are available for baseline resets.
 
-**`tenderly_setErc20Balance` IS available and is the preferred ERC-20 path.** Verified 2026-08-20 on the `a3fb16` vnet against both WOOD (a plain OZ ERC20) and USDG (a proxy) — the balance lands and `balanceOf` reads it back. This spec previously asserted the method did NOT exist, which was measured on the older `dbe358` vnet; the claim did not survive re-measurement and SHALL NOT be restored without one. It matters beyond convenience: `cli/src/e2e` funds every scenario through that method, so "unavailable" implied the e2e harness could never run against the fork.
+**`tenderly_setErc20Balance` IS available and is the preferred ERC-20 path.** Verified 2026-08-20 against both WOOD (a plain OZ ERC20) and USDG (a proxy) — the balance lands and `balanceOf` reads it back. An earlier measurement on an older vnet said the method did not exist; that claim did not survive re-measurement and SHALL NOT be restored without one. It matters beyond convenience: `cli/src/e2e` funds every scenario through that method, so "unavailable" implied the e2e harness could never run against the fork.
 
 The direct-storage route remains the DOCUMENTED FALLBACK for a vnet or token where the cheat does not work: write the `_balances` mapping slot as `keccak256(abi.encode(holder, balancesSlot))`, with WOOD at slot 0 and USDG at slot 1 (slot 0 holds other proxy state). `cast rpc` params SHALL be passed as separate positional args, not one JSON array (the array form returns `-32602`). For an unlisted token, the balances slot SHALL be discovered by brute-forcing slots 0..40 (write a sentinel to `keccak(holder, S)`, read `balanceOf`), falling back to the OZ v5 ERC-7201 namespaced location.
 
@@ -329,7 +329,7 @@ The Plan B phase SHALL seat `ProtocolConfig.maxStrategyDuration` to `RobinhoodPa
 - **THEN** the phase writes nothing and the assert still passes
 
 ### Requirement: DeployPlanB asserts delegation is off
-`DeployPlanB`'s post-broadcast pre-flights SHALL fail the run if `delegationEnabled` reads true on the target chain, naming the delegator-walkout hole: delegated stake is credited to a ~35-day coverage window while `requestUnstakeDelegation` checks only the delegator, and the unbonding pool is slashable for only `coolDownPeriod`.
+`DeployPlanB`'s post-broadcast pre-flights SHALL fail the run if the sWOOD answers `delegationEnabled()` with a non-zero word, naming the delegator-walkout hole. The probe is a staticcall: the current `StakedWood` has no delegation and no such selector, so the probe reads false and passes; it exists to refuse a future sWOOD that turns delegation on.
 
 #### Scenario: Delegation accidentally on
 - **GIVEN** `delegationEnabled` reads true on the target chain

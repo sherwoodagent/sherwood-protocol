@@ -3,7 +3,6 @@
 ## Purpose
 
 Defines the observable behavior of `SyndicateVault`: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault (upgradeable only through its factory) that custodies a syndicate's assets and prices shares against float-only NAV. Instant deposit and exit exist only while no proposal is open; from Draft creation until a proposal ends, all LP flow goes through the vault's async request queue. Governor strategy batches are bounded by structural call rules, per-call caps, a net-outflow budget, queue-reserve seniority and an idle-liquidity buffer, and every privileged surface is confined to the owner, factory, governor and queue roles.
-
 ## Requirements
 ### Requirement: ERC-4626 share accounting and NAV
 
@@ -272,7 +271,7 @@ Assets reserved for stamped-but-unclaimed redemptions (`reservedQueueAssets`) SH
 - **THEN** `executeGovernorBatch` reverts `QueueReserveBreached`
 
 ### Requirement: Idle-liquidity buffer
-The vault owner SHALL be able to set an idle-liquidity floor `minBufferBps` (basis points, at most 5,000 = 50%, `BufferTooHigh` above; 0 disables), emitting `MinBufferUpdated`. `executeGovernorBatch` SHALL revert `BufferBreached` if the post-batch idle balance is below the queue reserve plus `minBufferBps` of the PRE-batch idle balance — a batch may deploy at most `(1 − minBufferBps) × preBatchBalance − reservedQueueAssets()`. Net-inflow (settlement) batches pass trivially. The buffer is a deployment-time constraint only: withdrawals may spend it between batches.
+The vault owner SHALL be able to set an idle-liquidity floor `minBufferBps` (basis points, at most 5,000 = 50%, `BufferTooHigh` above; 0 disables), emitting `MinBufferUpdated`. `executeGovernorBatch` SHALL revert `BufferBreached` if the post-batch idle balance is below the queue reserve plus `minBufferBps` of the PRE-batch idle balance — a batch may deploy at most `(1 − minBufferBps) × preBatchBalance − reservedQueueAssets()`. A settlement batch passes the buffer check whenever `minBufferBps` is unchanged since execute; `setMinBufferBps` has no open-proposal lock, so an owner raise mid-proposal can make even a net-inflow settle or `unstick` revert `BufferBreached`. The buffer is a deployment-time constraint only: withdrawals may spend it between batches.
 
 #### Scenario: Batch bounded by the buffer
 - **WHEN** `minBufferBps = 1000` and a batch would leave the post-batch balance below the queue reserve plus 10% of the pre-batch balance

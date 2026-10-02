@@ -30,7 +30,7 @@ Initialization SHALL reject a configuration that cannot execute, so a typo'd or 
 3. The requested borrow does not exceed the market's currently lendable liquidity (`BorrowExceedsLiquidity`).
 4. The resulting loan-to-value, with the collateral valued through the wrapper's own conversion, sits at least `MIN_LLTV_BUFFER_BPS` (500 bp) below the market's liquidation LTV (`LtvInsideLiquidationBuffer`, also when the LLTV itself is below 500 bp).
 5. The declared `expectedLiquidity` does not exceed `MAX_POOL_SHARE_BPS` (10%) of the pool's current in-range liquidity (`PositionExceedsPoolShareCap`). `execute()` SHALL re-check the liquidity actually minted against the pool's liquidity read before the mint.
-6. The tick range is non-empty, correctly ordered, within the tick domain, and aligned to the pool's tick spacing (`InvalidTickRange`).
+6. The tick range is non-empty, correctly ordered, and aligned to the pool's tick spacing (`InvalidTickRange`). A range outside the tick domain is not refused at init; it reverts inside the position manager's mint at `execute()`, atomically.
 
 Adversary for (3) and (5): a proposer sizing a position against a venue that cannot absorb it — a borrow larger than the market can fund reverts the whole batch at execute, and a position that is a large share of pool liquidity dilutes its own fee income and makes its own exit the dominant flow, converting a market-making position into a forced seller.
 
