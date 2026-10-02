@@ -23,6 +23,8 @@ interface ISyndicateVault {
     error DepositsLocked();
     error ZeroAddress();
     error CannotRescueAsset();
+    /// @notice `rescueERC20` recipient is not a strategy clone of this vault.
+    error RescueRecipientNotStrategy(address to);
     error NotFactory();
     error GovernorNotSet();
     error ExecutorCodehashMismatch();

@@ -1490,7 +1490,8 @@ contract SyndicateGovernorTest is Test {
         vault.rescueERC20(address(targetToken), owner, 1_000e18);
     }
 
-    function test_rescueERC20_succeedsAfterSettlement() public {
+    /// @notice After settlement the lock lifts, but a non-asset token still cannot go to the owner (FP-04).
+    function test_rescueERC20_afterSettlement_refusesNonStrategyRecipient() public {
         uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
         vm.prank(agent);
         governor.settleProposal(proposalId);
@@ -1498,8 +1499,9 @@ contract SyndicateGovernorTest is Test {
         targetToken.mint(address(vault), 1_000e18);
 
         vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.RescueRecipientNotStrategy.selector, owner));
         vault.rescueERC20(address(targetToken), owner, 1_000e18);
-        assertEq(targetToken.balanceOf(owner), 1_000e18);
+        assertEq(targetToken.balanceOf(address(vault)), 1_000e18);
     }
 
     // ==================== PROTOCOL FEE RECIPIENT CHECK ====================

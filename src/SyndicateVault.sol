@@ -5,6 +5,7 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
@@ -111,7 +112,7 @@ contract SyndicateVault is
 
     // ── Governor / Factory storage ──
 
-    /// @notice Vault owner's management fee on strategy profits (basis points, set at init)
+    /// @notice Annual management fee on the whole fund while a proposal is Executed (basis points, set at init)
     uint256 private _managementFeeBps;
 
     /// @notice Factory that deployed this vault (controls upgrades, provides governor address)
@@ -149,9 +150,9 @@ contract SyndicateVault is
     /// @notice Integral of fund assets over time for the live proposal, in
     ///         asset-seconds. The management fee is this figure annualized:
     ///         `fee = assetSeconds * rate / (BPS_DENOMINATOR * 365 days)`.
-    /// @dev Exact under arbitrary mid-proposal flows because the integral is
-    ///      piecewise-constant: every base-changing event closes off the
-    ///      elapsed interval at the base that applied during it, then restamps.
+    /// @dev The base is the whole fund's `totalAssets()`, stamped once by
+    ///      `startManagementAccrual` at execute and not restamped before settle:
+    ///      nothing mid-proposal changes it, so the integral is base x elapsed.
     uint256 private _mgmtAssetSeconds;
 
     /// @notice Fund assets in force since `_mgmtLastUpdate` — the height of the
@@ -305,8 +306,8 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Freezes LP flow (`deposit` / `mint` / `withdraw` / `redeem`) AND
-    ///         strategy execution (`executeGovernorBatch`). Owner rescue paths
+    /// @notice Freezes LP flow (`deposit` / `mint` / `withdraw` / `redeem`, queued-deposit
+    ///         claims) AND strategy execution (`executeGovernorBatch`). Owner rescue paths
     ///         (`rescueEth` / `rescueERC20` / `rescueERC721`) remain callable so
     ///         the owner can respond to incidents. Rescues are still blocked by
     ///         `redemptionsLocked()` whenever a proposal is active.
@@ -949,8 +950,8 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
-    ///         price. The queue pushes the escrowed assets to the vault
+    /// @notice Queue-only: mint `shares` to `to`. The queue prices them live with
+    ///         `previewDeposit` and pushes the escrowed assets to the vault
     ///         immediately before this call.
     /// @dev No `nonReentrant`: the only state-mutating call here is the mint.
     ///      `_initHighWaterMarkIfUnset` reads `pricePerShare()`, which makes only
@@ -961,8 +962,10 @@ contract SyndicateVault is
     ///      or a queue-only first mint would settle its first performance fee
     ///      against an unset mark. Also the re-seed path for the zero-to-nonzero
     ///      supply transition zeroed in `_update`.
-    function settleDeposit(uint256 shares, address to) external {
+    function settleDeposit(uint256 shares, address to) external whenNotPaused {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
+        // Same gates as an instant deposit; a refused claimant exits through the queue's `cancel`.
+        _requireApprovedDepositor(to);
         _mint(to, shares);
         _initHighWaterMarkIfUnset();
     }
@@ -1120,13 +1123,21 @@ contract SyndicateVault is
         Address.sendValue(to, amount);
     }
 
-    /// @notice Rescue ERC-20 tokens accidentally sent to the vault (not the vault asset).
-    ///         Blocked during active proposals to protect strategy position tokens.
+    /// @notice Move a non-asset ERC-20 held by the vault to a strategy clone of this vault, where a
+    ///         later proposal's batch can settle it. Never the vault asset, never to any other
+    ///         address. Blocked during active proposals to protect strategy position tokens.
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
         if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         address asset = asset();
         if (token == asset) revert CannotRescueAsset();
+        // A factory-made clone bound here, read fail-closed; `registerStrategy` is permissionless (FP-04).
+        address factory_ = _strategyFactory();
+        if (
+            factory_ == address(0)
+                || _readAddress(factory_, abi.encodeCall(IStrategyFactory.cloneTemplate, (to))) == address(0)
+                || _readAddress(to, abi.encodeCall(IStrategy.vault, ())) != address(this)
+        ) revert RescueRecipientNotStrategy(to);
         IERC20(token).safeTransfer(to, amount);
     }
 

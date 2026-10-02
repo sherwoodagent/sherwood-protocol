@@ -317,7 +317,7 @@ be zero, and none has a runtime override, so shipping them unreviewed means
 shipping the fixture.
 
 **`ASSET_FEED_MAX_DELAY` (now `1 days + 2 hours`).** It bounds the AGGREGATOR's own
-`updatedAt` age inside `ExposureLedger.coverageUsd` (`src/ExposureLedger.sol:651-660`),
+`updatedAt` age inside `ExposureLedger.coverageUsd` (`src/ExposureLedger.sol:658-668`),
 which recomputes the age on every read; nothing captures a price at propose and re-checks
 it at execute, so the proposal lifecycle does NOT bound it from below. The heartbeat does:
 4663's Chainlink push feeds publish every 24h, so the previous `1 days` left zero slack and
@@ -354,5 +354,6 @@ cap)`, never served as a price, and it SHALL sit ABOVE market.
 - Re-measure before the run: the band moves with spot, and a cap set from a
   month-old measurement can be outside it by the time the ceremony happens.
 - Review monthly thereafter. A drifted-high cap simply stops binding; a cap that
-  drifts BELOW market binds permanently and pins every bond, which
-  `woodPriceDetail().capBinding` is the way to notice.
+  drifts BELOW market binds permanently and pins every bond; the ledger has no
+  view that reports it, so compare the WOOD feed's answer with
+  `woodUsdPriceX8()`.

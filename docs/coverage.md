@@ -64,10 +64,19 @@ with the revert, so no slot is held without a lock behind it.
 is live). `retireApproval` clears a lock only once its epoch bucket expires
 (`epochGenesis + (epoch + 1)·epochLength + challengeWindow`), whether or not the
 proposal executed. A lock on a cancelled or expired proposal is therefore
-retained (23–74 days at shipped parameters for a 7- to 30-day strategy) and gates the guardian's unstake
-meanwhile; it carries no slash risk, since an unexecuted proposal cannot be
-challenged. The execute-time quorum reads the ledger's own `_approversOf`
-list, never the registry.
+retained and gates the guardian's unstake meanwhile; it carries no slash risk,
+since an unexecuted proposal cannot be challenged. The lock sits in the bucket
+containing `executeBy + strategyDuration`, so from a cancel at the end of the
+review it lasts `executionWindow + strategyDuration + the rest of that epoch +
+challengeWindow`: 15–73 days at shipped parameters (24 h execution window,
+1 h–30 d strategy, 28 d epoch, 14 d challenge window). The proposer can cause
+this at will: `cancelProposal` is open after guardians have approved, through
+the review (while block quorum is not reached) and while Approved
+(`SyndicateGovernor.sol:575-597`), and the proposer can reclaim its own bond at
+once (`reclaimProposerBond`, `:698`). The
+cancel does not lengthen the lock — an executed proposal holds the same
+bucket — but nothing frees it early. The execute-time quorum reads the
+ledger's own `_approversOf` list, never the registry.
 
 ## Declared coverage locks
 
@@ -94,7 +103,11 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   buckets (width `epochLength`, 60-day horizon, 16-bucket scan bound) in WOOD.
   A bucket recycles budget once `bucketEnd + challengeWindow` has elapsed, or
   earlier on release or retirement. A stale or manipulated WOOD feed can neither
-  starve nor inflate a guardian's budget.
+  starve nor inflate a guardian's budget. The approve vote is not price-free:
+  the slot floor values the need with `coverageUsd` and the lock with
+  `woodPriceX8()`, unwrapped (`ExposureLedger.sol:759, 775`), so an approve
+  reverts while the WOOD price or the vault-asset feed is unavailable. A block
+  vote reads no price.
 - **`kNumerator = 1` contains a conviction.** At the default, `Σ locks ≤ stake`,
   so burning proposal A's lock leaves `stake − lock_A ≥ Σ other locks`: every
   other proposal the guardian backs stays fully covered — provided the
@@ -229,6 +242,38 @@ for coverage; a guardian whose lock is worth less than when they declared it
 must hold in dollars at execution. The loop sums locks — there is no
 pro-rating and no cross-proposal sharing. This is not an indemnity — slash
 proceeds are burned.
+
+## Price outages and the challenge window
+
+`ChallengeGame.file` sizes the challenger bond from `unsharedLiabilityUsd` and
+`woodPriceX8()`, and reverts `WoodPriceUnset` when either cannot be read
+(`ChallengeGame.sol:695-703`). The filing deadline,
+`executedAt + strategyDuration + challengeWindow` (`:638`), keeps running during
+the outage. An outage that covers the end of the window lets the approvers keep
+their locks and the proposer reclaim its bond. Filing stops when the WOOD feed
+is unwired or older than `WOOD_FEED_MAX_DELAY`, the V3 pool's `liquidity()` is
+below `MIN_V3_LIQUIDITY` or the V2 pair's WETH reserve is below
+`MIN_WETH_RESERVE` at read time, ETH/USD is older than `ETH_USD_MAX_AGE`, the
+vault-asset feed is older than its max delay, or the cap is zero. Approve votes,
+and proposing or executing any proposal with non-zero required coverage, halt on
+the same outage; `proposerBondWood` returns zero before reading the price for a
+zero-coverage proposal (`ExposureLedger.sol:682-684`).
+
+- **The challenger's counter.** Both depth floors are read-time checks, so a
+  challenger with the capital can add liquidity, file and remove it in one
+  transaction. `WoodPoolFeed.update()` is permissionless, so a keeper lapse is
+  not an outage a challenger has to wait out, except that a gap longer than
+  `MAX_SNAPSHOT_SPAN` (7 days) costs one more TWAP window. A stale Chainlink
+  ETH/USD or vault-asset feed cannot be fixed by anyone but the Safe.
+- **The Safe's levers.** `ExposureLedger.setWoodFeed` and `setAssetFeed` seat a
+  replacement feed at once; the ledger adds no warm-up (`ExposureLedger.sol:492,
+  632`). A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
+  snapshots before it can price; any other Chainlink-shaped feed prices at once.
+  Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.sol:560`,
+  `ChallengeGame.sol:1600`) moves the deadline of every executed proposal,
+  including one whose window has already lapsed, until the permissionless
+  `retireApproval` (`ExposureLedger.sol:876`) clears that proposal's locks. Both
+  levers are protocol-wide.
 
 ## Proposer bond
 

@@ -126,6 +126,12 @@ guard structurally cannot see: the strategy's own `forceApprove(swapAdapter,
 …)` calls happen one frame deeper than anything in the governor's batch
 calldata, after `strategy.execute()` has already been dispatched.
 
+A Portfolio clone also initialises and executes only on the vault's own asset,
+and only when the exposure ledger prices one whole unit of it within 1% of $1
+(`PEG_TOLERANCE_BPS`); an unresolved ledger, an unpriced asset or a stale feed
+reverts (`PortfolioStrategy.sol:165-168, 182, 436-447`). Settle and
+`rebalanceDelta` do not check it.
+
 Consequences for onboarding:
 
 - **Allowlisting must precede strategy clone+init, not just batch execution.**
@@ -535,6 +541,9 @@ not just one deployment's configuration. Only certify a template where:
    address* is disqualified — see `MorphoSupplyStrategy`, which does exactly
    that and stays address-certifiable only.
 2. Price sources are bound to the tokens they price, not merely allowlisted.
+   For a Morpho market the binding is the market id: `setMorphoMarketAllowed`
+   attests loan token, collateral, oracle, irm and lltv together, and the
+   oracle and collateral addresses are not allowlisted on their own.
 3. It is cloned with `Clones.clone` / `cloneDeterministic` only. Any
    clone-with-immutable-args variant gives each clone distinct bytecode, which
    dissolves the class **silently** — proposals keep working, they just fall

@@ -339,7 +339,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Cancel stamps the deadline too, so cancel+propose cycling cannot keep redemptions locked.
         if (block.timestamp < _cooldownEndsAt) revert CooldownNotElapsed();
         if (!_isRegisteredStrategy(strategy)) revert StrategyNotRegistered(strategy);
-        if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
+        // A lowered protocol ceiling does not rewrite stored maxima, so it binds here too (FP-13).
+        if (strategyDuration > _params.maxStrategyDuration || strategyDuration > _protocolMaxStrategyDuration()) {
+            revert StrategyDurationTooLong();
+        }
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
         if (settlementCalls.length == 0) revert EmptySettlementCalls();
@@ -482,10 +485,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _transition(proposal, ProposalState.Executed);
         proposal.executedAt = block.timestamp;
         // Start the management-fee clock. Must follow `_activeProposal` so the
-        // vault's `totalAssets()` reads live NAV through the now-active lane, and
-        // must precede the execute batch so capital it deploys is picked up by
-        // the batch's own base-changing hooks. Accrual runs from here to settle
-        // and nowhere else.
+        // vault's `totalAssets()` reads live NAV through the now-active lane. The
+        // base is the whole fund, stamped here once, before the execute batch;
+        // nothing restamps it before settle. Accrual runs from here to settle.
         ISyndicateVault(vault).startManagementAccrual();
         // Counter stays incremented through Executed; decremented once on the
         // Executed -> Settled edge in `_finishSettlement`. `_activeProposal`

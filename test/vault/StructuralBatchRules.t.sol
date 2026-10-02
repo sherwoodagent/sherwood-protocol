@@ -23,6 +23,7 @@ import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLi
 import {MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 import {GlobalDollarMock} from "../mocks/GlobalDollarMock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
@@ -162,6 +163,11 @@ contract StructuralBatchRulesTest is Test {
             )
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+        // FP-01: Portfolio reads the $1 check off governor.exposureLedger(); only the getter is
+        // mocked, so the governor's own propose gates stay unwired.
+        MockAssetLedger usdLedger = new MockAssetLedger();
+        usdLedger.setPrice(address(usdc), 1e8);
+        vm.mockCall(address(governor), abi.encodeWithSignature("exposureLedger()"), abi.encode(address(usdLedger)));
 
         // The test contract is the syndicate factory.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
@@ -266,8 +272,7 @@ contract StructuralBatchRulesTest is Test {
         template = new MorphoSupplyStrategy();
         strategyFactory.setTemplateApproval(address(template), true);
         tierRegistry.setCounterpartyAllowed(address(morpho), true);
-        tierRegistry.setCounterpartyAllowed(mp.oracle, true);
-        tierRegistry.setCounterpartyAllowed(mp.collateralToken, true);
+        tierRegistry.setMorphoMarketAllowed(keccak256(abi.encode(mp)), true);
     }
 
     function _morphoClone(address template, address proposer, uint256 amount) internal returns (address clone) {
@@ -352,9 +357,8 @@ contract StructuralBatchRulesTest is Test {
         tierRegistry.setCounterpartyAllowed(address(adapter), true);
         tierRegistry.setCounterpartyAllowed(address(posm), true);
         tierRegistry.setCounterpartyAllowed(address(clMorpho), true);
-        tierRegistry.setCounterpartyAllowed(clMp.oracle, true);
+        tierRegistry.setMorphoMarketAllowed(keccak256(abi.encode(clMp)), true);
         tierRegistry.setCounterpartyAllowed(address(uniFactory), true);
-        tierRegistry.setCounterpartyAllowed(address(spUsdc), true);
         tierRegistry.setCounterpartyAllowed(address(nvda), true);
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
