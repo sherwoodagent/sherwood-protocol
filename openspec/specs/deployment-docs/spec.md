@@ -3,7 +3,6 @@
 ## Purpose
 
 Requirements on the Sherwood deployment process: the mainnet-faithful Robinhood fork environment (Tenderly vnet, chain 9994663), the core deploy ceremony and its wiring order, the guardian-econ layered deployments (Plan B ledger, Plan D challenge game) with their pre-flight checks, and chain-specific constraints. Scenarios are the verification steps an operator runs to prove each requirement held.
-
 ## Requirements
 ### Requirement: Chain targeting and fork identity
 Posture SHALL be derived from `block.chainid` alone: 4663 is Mainnet posture; any other chain carrying a committed `chains/{chainid}.json` with a `DEPLOYER` key is Fork posture; a chain with no such book is refused before anything is broadcast. `ROBINHOOD_FORK_CHAIN_ID` is RETIRED — `chains/9994663.json` is committed, so the fork chain id is a fact about the repo, not an operator input. The fork is mainnet-faithful: USDG stablecoin, official Uniswap v3+v4, Chainlink push feeds, real tokenized-stock liquidity, and the live WOOD token (`0xf8bc08092c06db6148114dcf82af881f1085f92b`, 18-dec, 1B supply, ownership renounced).
@@ -501,3 +500,22 @@ This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter n
 #### Scenario: Short averaging window with a slow USD feed
 - **WHEN** the feed's averaging `window` is short while `ethUsdMaxAge` is 24 hours
 - **THEN** the configuration is ACCEPTED — the two are independent by design, and coupling them would force a ~12-hour window and surrender the crash tracking the feed exists to provide
+
+### Requirement: Each Morpho market is allowlisted by id before its proposal
+
+Morpho Blue market creation is permissionless for any oracle, collateral token, irm and lltv, so the market a strategy clone names is only as sound as all five of its parameters together. `ConcentratedLiquidityStrategy._initialize` and `MorphoSupplyStrategy._initialize` SHALL require the market id (`MarketParamsLib.id` over all five fields) to be allowlisted through `isMorphoMarketAllowed`, read fail-closed, and SHALL re-check it at `execute()` (and, for CL, at `rerange()`). Separate counterparty grants for the oracle or the collateral token SHALL NOT admit a market.
+
+This is a PER-PROPOSAL obligation, not a ceremony step: the market is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setMorphoMarketAllowed(<marketId>, true)` for each market a proposal is expected to use, before clone-init, after reading the market's five parameters from Morpho and refusing a market whose `irm` is the zero address or whose oracle does not price its collateral. For the known 4663 USDG market the call is `setMorphoMarketAllowed(0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114, true)`. Settle paths are NOT gated on it, so a demotion cannot strand the funds it is meant to protect.
+
+#### Scenario: Proposal naming a market that is not allowlisted
+- **WHEN** a CL or Morpho-supply clone names a market whose id is not allowlisted, even if its oracle and collateral are allowed counterparties
+- **THEN** clone-init reverts `MorphoMarketNotAllowed(marketId, registry)`
+
+#### Scenario: Allowlisted market needs no part grants
+- **WHEN** a clone names an allowlisted market whose oracle and collateral hold no counterparty grant
+- **THEN** clone-init succeeds
+
+#### Scenario: Market demoted after init
+- **WHEN** the market id is de-listed between clone-init and `execute()`
+- **THEN** `execute()` reverts `MorphoMarketNotAllowed(marketId, registry)` and no vault funds move
+
