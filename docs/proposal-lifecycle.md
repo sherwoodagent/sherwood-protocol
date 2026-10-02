@@ -185,10 +185,11 @@ Cross-contract timing invariants (all enforced at the setters):
 `reclaimProposerBond` (`src/SyndicateGovernor.sol:705`) is permissionless and always
 pays the recorded proposer, but for executed proposals only after **three** gates:
 
-1. `executedAt + ledger.challengeWindow` (default 14 d) has passed,
+1. `executedAt + strategyDuration + ledger.challengeWindow` (default 14 d) has passed,
 2. coverage is not frozen by a live challenge,
-3. the challenge game's own deadline — including the one re-arm a silent failure
-   grants — is strictly past.
+3. the challenge game's own deadline, `executedAt + strategyDuration +
+   game.challengeWindow` or the one re-arm a silent failure grants
+   (`challengeableUntil`), whichever is later, is strictly past.
 
 A conviction in the challenge game forfeits the whole bond: prosecutor fee
 (default 20%, which is also the cap) to the challenger, remainder burned.
