@@ -222,8 +222,7 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         TierRegistry(tierRegistry).setCounterpartyAllowed(POSITION_MANAGER, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(MORPHO, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(UNISWAP_V3_FACTORY, true);
-        TierRegistry(tierRegistry).setCounterpartyAllowed(mp.collateralToken, true);
-        TierRegistry(tierRegistry).setCounterpartyAllowed(mp.oracle, true);
+        TierRegistry(tierRegistry).setMorphoMarketAllowed(keccak256(abi.encode(mp)), true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(WETH, true); // the volatile leg
         vm.stopPrank();
 
