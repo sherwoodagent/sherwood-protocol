@@ -21,6 +21,7 @@ interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool);
 }
 
 /**
@@ -120,6 +121,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice Hard ceiling on any configured slippage floor.
     uint256 public constant MAX_SLIPPAGE_BPS = 1_000;
 
+    /// @notice Floor on the settle slippage, which is fixed at init (audit FP-06).
+    uint256 public constant MIN_SETTLE_SLIPPAGE_BPS = 50;
+
     /// @notice Morpho oracle scale: `price()` is loan units per collateral unit x 1e36.
     uint256 public constant ORACLE_PRICE_SCALE = 1e36;
 
@@ -184,12 +188,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     error PoolNotFromFactory();
     /// @notice A proposer-supplied counterparty is not allowlisted in the
     ///         `TierRegistry` the vault's own governor gates batch approvals
-    ///         against. Covers `swapAdapter`, `positionManager`, `morpho`,
-    ///         `marketParams.oracle`, `marketParams.collateralToken`, `uniswapFactory` and the pool's
+    ///         against. Covers `swapAdapter`, `positionManager`, `morpho`, `uniswapFactory` and the pool's
     ///         volatile leg (`otherToken`) — every address this contract
     ///         approves or calls with vault funds, plus the factory whose word
     ///         the pool's provenance rests on.
     error CounterpartyNotAllowed(address counterparty, address registry);
+    /// @notice The Morpho market id (all five `MarketParams` fields) is not allowlisted in the registry.
+    error MorphoMarketNotAllowed(Id marketId, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no
     ///         registry, so no counterparty can be vouched for. Fails closed at
     ///         binding time rather than deploying capital through unvetted
@@ -437,10 +442,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // proposer-authored factory vouching for a proposer-authored pool is
             // the same self-attestation one hop further out.
             _requireAllowedCounterparty(registry, p.uniswapFactory);
-            _requireAllowedCounterparty(registry, p.marketParams.oracle);
-            if (p.marketParams.collateralToken != vaultAsset) {
-                _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
-            }
         }
 
         if (p.pool.code.length == 0) revert PoolNotFromFactory();
@@ -470,6 +471,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // (2) The market exists and lends the vault asset.
         if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
         Id id = p.marketParams.id();
+        _requireAllowedMarket(registry, id);
         if (IMorpho(p.morpho).market(id).lastUpdate == 0) revert MarketNotCreated();
 
         //     Collateral is the vault asset or an ERC-4626 wrapper OF the vault
@@ -605,6 +607,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
     }
 
+    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone (FP-02).
+    function _requireAllowedMarket(address registry, Id id) private view {
+        if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isMorphoMarketAllowed, (Id.unwrap(id))))) {
+            revert MorphoMarketNotAllowed(id, registry);
+        }
+    }
+
     /// @dev The `vault() -> governor() -> tierRegistry()` walk. `address(0)`
     ///      when unresolved (no `governor()` surface, a governor predating the
     ///      getter, or `tierRegistry() == 0`); every caller treats that as
@@ -621,14 +630,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedCounterparty(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));
-        _requireAllowedCounterparty(registry, _marketParams.oracle);
+        _requireAllowedMarket(registry, marketId);
         // The volatile leg re-checks on the same terms as the rest: `rerange()`
         // is permissionless and re-issues `forceApprove(otherToken, …)` to both
         // the adapter and the position manager on every call, so a leg demoted
         // after init would otherwise keep receiving them.
         _requireAllowedCounterparty(registry, otherToken);
-        address coll = _marketParams.collateralToken;
-        if (coll != asset) _requireAllowedCounterparty(registry, coll);
     }
 
     function _readAllowed(address registry, bytes memory data) private view returns (bool) {
@@ -679,13 +686,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
         if (p.mintSlippageBps == 0 || p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-        // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
-        // "keep current" and is otherwise a one-way ratchet. A clone
-        // initialized at 0 could therefore never be corrected: every later
-        // `slippageBps > 0` trips `ImmutableParam` against a stored 0, and the
-        // sentinel path leaves it at 0. The keep-sentinel closes the
-        // pass-0-to-change-only-the-deadline trap; this closes the init one.
-        if (p.settleSlippageBps == 0 || p.settleSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
+        // Fixed for the clone's life (`_updateParams`), so a value too tight to clear settle is refused here.
+        if (p.settleSlippageBps < MIN_SETTLE_SLIPPAGE_BPS || p.settleSlippageBps > MAX_SLIPPAGE_BPS) {
+            revert InvalidBound();
+        }
         if (p.swapFractionBps > BPS_DENOMINATOR) revert InvalidBound();
     }
 
@@ -1190,11 +1194,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _updateParams(bytes calldata data) internal override {
         (uint256 slippageBps, uint256 deadline) = abi.decode(data, (uint256, uint256));
         if (slippageBps != 0) {
-            // Ceiling first, so an out-of-range value keeps answering
-            // `InvalidBound` rather than being absorbed by the ratchet below.
+            // Ceiling first, so an out-of-range value keeps answering `InvalidBound`.
+            // The reviewed value is fixed: lowering it can brick settle (FP-06).
             if (slippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-            if (slippageBps > settleSlippageBps) revert ImmutableParam();
-            settleSlippageBps = slippageBps;
+            if (slippageBps != settleSlippageBps) revert ImmutableParam();
         }
         settleDeadline = deadline;
     }

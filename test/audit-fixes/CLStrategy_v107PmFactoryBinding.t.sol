@@ -97,10 +97,9 @@ contract CLStrategy_v107PmFactoryBindingTest is CLFixture {
         realRegistry.setCounterpartyAllowed(address(pmB), true);
         realRegistry.setCounterpartyAllowed(factoryB, true);
         realRegistry.setCounterpartyAllowed(address(morpho), true);
-        realRegistry.setCounterpartyAllowed(address(oracle), true);
+        realRegistry.setMorphoMarketAllowed(keccak256(abi.encode(mp)), true);
         realRegistry.setCounterpartyAllowed(address(adapter), true);
         realRegistry.setCounterpartyAllowed(address(nvda), true);
-        realRegistry.setCounterpartyAllowed(address(spUsdg), true);
         status.setTierRegistry(address(realRegistry));
     }
 

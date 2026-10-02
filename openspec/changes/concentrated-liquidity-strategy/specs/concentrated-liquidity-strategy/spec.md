@@ -73,15 +73,23 @@ The TWAP read SHALL fail closed: if the pool cannot serve an observation over th
 
 ### Requirement: Only risk-reducing parameters are tunable after execution
 
-Between execute and settle the proposer SHALL be able to update the settlement slippage floors and the settlement deadline, and nothing else. The pool, lending market, borrow amount, position size, and the whole rerange policy — half-width, trigger fraction, minimum interval, maximum rerange count — SHALL be immutable after initialization. Updates SHALL be rejected outside the Executed state.
+Between execute and settle the proposer SHALL be able to update the settlement deadline, and nothing else. The settlement slippage floor SHALL be at least `MIN_SETTLE_SLIPPAGE_BPS` (50 bp) at initialization and SHALL NOT change after it: an update naming any non-zero slippage other than the stored value SHALL revert `ImmutableParam`, and zero keeps the stored value. Lowering it is not risk-reducing: a floor tighter than the settle swap's own impact (about 54 bp at the pool-share cap) reverts every settle route and leaves the position on the clone (audit 2026-10-02 FP-06, amended in place by `audit-1002-morpho-market-cl-slippage`). The pool, lending market, borrow amount, position size, and the whole rerange policy — half-width, trigger fraction, minimum interval, maximum rerange count — SHALL be immutable after initialization. Updates SHALL be rejected outside the Executed state.
 
 The active tick range SHALL NOT be settable through a parameter update. It changes only through the deterministic rerange path below.
 
 Adversary: a proposer who, having had a position approved by voters and guardians, mutates it after approval into a materially different position the review never covered — including by re-centering the band repeatedly until it sits somewhere the review would not have approved.
 
-#### Scenario: Proposer retunes slippage before settling
-- **WHEN** the proposer updates the settlement slippage floor while the clone is Executed
-- **THEN** the update applies and settlement uses the new floor
+#### Scenario: Proposer tries to retune slippage before settling
+- **WHEN** the proposer submits a settlement slippage floor other than the stored one while the clone is Executed
+- **THEN** the update reverts `ImmutableParam` and settlement uses the reviewed floor
+
+#### Scenario: Proposer retunes the deadline
+- **WHEN** the proposer updates the settlement deadline while the clone is Executed
+- **THEN** the update applies
+
+#### Scenario: Settlement slippage below the floor at init
+- **WHEN** a clone is initialized with a settlement slippage below `MIN_SETTLE_SLIPPAGE_BPS`
+- **THEN** initialization reverts `InvalidBound`
 
 #### Scenario: Proposer attempts to move the range
 - **WHEN** the proposer submits a parameter update changing the tick range, the pool, or any rerange-policy field
@@ -157,7 +165,7 @@ Adversary: an ordering that withdraws collateral first, leaving an outstanding b
 
 #### Scenario: Fees accrued in both tokens
 - **WHEN** the position accrued fees in the non-vault-asset token
-- **THEN** settlement converts them subject to the tunable slippage floor and includes them in the amount returned to the vault
+- **THEN** settlement converts them subject to the settlement slippage floor and includes them in the amount returned to the vault
 
 ### Requirement: Settlement takes the deliverable maximum and leaves a recoverable residue
 

@@ -268,8 +268,7 @@ contract StructuralBatchRulesTest is Test {
         template = new MorphoSupplyStrategy();
         strategyFactory.setTemplateApproval(address(template), true);
         tierRegistry.setCounterpartyAllowed(address(morpho), true);
-        tierRegistry.setCounterpartyAllowed(mp.oracle, true);
-        tierRegistry.setCounterpartyAllowed(mp.collateralToken, true);
+        tierRegistry.setMorphoMarketAllowed(keccak256(abi.encode(mp)), true);
     }
 
     function _morphoClone(address template, address proposer, uint256 amount) internal returns (address clone) {
@@ -354,9 +353,8 @@ contract StructuralBatchRulesTest is Test {
         tierRegistry.setCounterpartyAllowed(address(adapter), true);
         tierRegistry.setCounterpartyAllowed(address(posm), true);
         tierRegistry.setCounterpartyAllowed(address(clMorpho), true);
-        tierRegistry.setCounterpartyAllowed(clMp.oracle, true);
+        tierRegistry.setMorphoMarketAllowed(keccak256(abi.encode(clMp)), true);
         tierRegistry.setCounterpartyAllowed(address(uniFactory), true);
-        tierRegistry.setCounterpartyAllowed(address(spUsdc), true);
         tierRegistry.setCounterpartyAllowed(address(nvda), true);
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({

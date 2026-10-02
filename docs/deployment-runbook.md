@@ -196,16 +196,33 @@ Not one-time steps. Nothing below is enforced on-chain.
 
 - **Allowlisting a Morpho market before a strategy uses it.** Before a
   `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy` clone is
-  initialised, the `TierRegistry` owner calls `setCounterpartyAllowed(<oracle>, true)`
-  for that market's oracle. For the supply strategy, it also calls it for the
-  market's collateral token, unless that token is the vault asset. Otherwise
-  clone-init reverts `CounterpartyNotAllowed`. Execute re-checks both; settle
-  does not. Never allowlist `address(0)`, so a market with
-  `oracle == address(0)` stays refused. The known 4663 USDG market
-  (id `0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114`)
-  needs:
-  - oracle `0xe694c531F65c4BaBc88A52d7178476e095e51574`
-  - collateral `0xde770c84FE66E063336b31737cFE9790f18c4087`
+  initialised, the `TierRegistry` owner allowlists that market BY ID:
+  `setMorphoMarketAllowed(<marketId>, true)`. The id is Morpho's
+  `keccak256(abi.encode(loanToken, collateralToken, oracle, irm, lltv))`, so one
+  grant binds all five parameters. Otherwise clone-init reverts
+  `MorphoMarketNotAllowed`. Execute (and, for CL, `rerange`) re-checks it;
+  settle does not, so de-listing never strands funds. Per-address
+  `setCounterpartyAllowed` grants for the oracle and the collateral token are no
+  longer what admits a Morpho market (the Morpho singleton itself is still a
+  counterparty, seeded by the ceremony).
+
+  Before granting, read the five parameters from Morpho
+  (`cast call <MORPHO_BLUE> "idToMarketParams(bytes32)(address,address,address,address,uint256)" <marketId>`)
+  and recompute the id from them. Refuse the market if its `irm` is the zero
+  address (no interest ever accrues and the supply can be frozen), if its
+  oracle does not price its collateral in its loan token, if its collateral
+  equals its loan token, or if its `lltv` is not the one the market was vetted
+  at. For CL the collateral must also be the vault asset or its ERC-4626
+  wrapper (the strategy enforces this on its own).
+
+  The known 4663 USDG market needs one Safe call:
+  `TierRegistry.setMorphoMarketAllowed(0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114, true)`.
+  Its parameters, recomputed to that id:
+  - loanToken USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`
+  - collateral spUSDG `0xde770c84FE66E063336b31737cFE9790f18c4087`
+  - oracle `0xe694c531F65c4BaBc88A52d7178476e095e51574` (prices spUSDG in USDG)
+  - irm AdaptiveCurve `0x2BD3d5965B26B51814AC95127B2b80dD6CcC0fa1`
+  - lltv `0.915e18`
 
 - **Incident: the ERC-8004 registry breaks.** It is a third-party UUPS proxy
   whose owner is an outside EOA. If `ownerOf` starts reverting, then
