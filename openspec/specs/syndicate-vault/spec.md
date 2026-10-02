@@ -260,55 +260,19 @@ The vault owner SHALL be able to set an idle-liquidity floor `minBufferBps` (bas
 - **THEN** the call reverts `BufferTooHigh`
 
 ### Requirement: Governor batch execution
-`executeGovernorBatch(calls, maxNetOutflow)` SHALL be callable only by the governor resolved live from the factory, only while unpaused, and non-reentrantly. Before executing, the vault SHALL verify the shared executor library's bytecode still matches the codehash stamped at initialization (`ExecutorCodehashMismatch` on drift), then delegatecall the batch, bubbling any failure's revert data. After success it SHALL emit `GovernorBatchExecuted(governor, callCount)` and enforce, in order: net asset outflow of the batch not exceeding `maxNetOutflow` (`MaxNetOutflowExceeded`), idle balance not below the queue reserve (`QueueReserveBreached`), and the idle-liquidity buffer (`BufferBreached`).
+`executeGovernorBatch(calls, callCaps, maxNetOutflow)` SHALL be callable only by the governor resolved live from the factory, only while unpaused, and non-reentrantly. Before executing, the vault SHALL verify the shared executor library's bytecode still matches the expected codehash, stamped at initialization and re-stamped by the factory-only `setExecutorImpl` re-point (`ExecutorCodehashMismatch` on drift), run the structural batch guard (registered-strategy targets; on the asset, the named selector set with `transferFrom` from the vault only), then delegatecall the library's `executeBatch(calls, asset(), callCaps)`, which meters each call's gross outflow against its cap when `callCaps` is non-empty, bubbling any failure's revert data. After success it SHALL reset every allowance the batch granted on `asset()` to zero, emit `GovernorBatchExecuted(governor, callCount)`, and enforce, in order: net asset outflow of the batch not exceeding `maxNetOutflow` (`MaxNetOutflowExceeded`), idle balance not below the queue reserve (`QueueReserveBreached`), and the idle-liquidity buffer (`BufferBreached`).
 
 #### Scenario: Non-governor caller rejected
 - **WHEN** any address other than the factory-resolved governor calls `executeGovernorBatch`
 - **THEN** the call reverts `NotGovernor`
 
 #### Scenario: Swapped executor bytecode rejected
-- **WHEN** the code at the executor implementation address no longer matches the initialization-time codehash
+- **WHEN** the code at the executor implementation address no longer matches the expected codehash
 - **THEN** the batch reverts `ExecutorCodehashMismatch` before any call executes
 
 #### Scenario: Net-outflow ceiling
 - **WHEN** a batch moves more of the vault asset out of custody than `maxNetOutflow`
 - **THEN** the batch reverts `MaxNetOutflowExceeded(netOutflow, cap)`
-
-### Requirement: Value-moving selector guard on batches
-
-When the calling governor exposes a nonzero TierRegistry, every batch call carrying one of the guarded value-moving selectors — legacy `approve`, `increaseAllowance`, `transfer`, `transferFrom`, plus Permit2 `AllowanceTransfer.approve(address,address,uint160,uint48)` (`0x87517c45`), Permit2 `AllowanceTransfer.transferFrom` (`0x36c78516`), and DSToken `move` (`0xbb35783b`) — SHALL have its spender/recipient (arg 1, calldata bytes 4..36, for legacy `approve`/`increaseAllowance`/`transfer`; arg 2, calldata bytes 36..68, for legacy `transferFrom`, Permit2 `transferFrom`'s `to`, Permit2 `approve`'s `spender`, and DSToken `move`'s `dst`) be either the vault itself or an adapter allowlisted in the TierRegistry; otherwise the batch SHALL revert `DisallowedTransferTarget`. Guarded-selector calldata too short to hold the guarded argument SHALL revert `MalformedCall`. The guard SHALL run on every governor batch (execute, settlement, and emergency paths). When the governor has no tier registry wired (getter missing or returning zero), this destination guard SHALL be skipped by design; the transferFrom **source** guard is unconditional and is specified separately.
-
-The self-transfer fast-path (destination decodes to the vault itself) SHALL apply **only** when the call's target is `asset()` — the one token whose balance the outer net-outflow meter in `executeGovernorBatch` independently verifies via a balance diff. For every other token the vault holds (e.g. a strategy position), a destination that decodes to the vault SHALL still be routed through the TierRegistry check like any other destination; a non-standard token could otherwise execute arbitrary logic under a vault-to-vault call shape with zero verification anywhere in the pipeline.
-
-#### Scenario: Balance-invisible exfiltration blocked
-
-- **WHEN** a batch call is `token.approve(attacker, max)` and `attacker` is not the vault or an allowlisted adapter
-- **THEN** the batch reverts `DisallowedTransferTarget` even though the call itself moves no balance
-
-#### Scenario: Registry-less governor degrades open
-
-- **WHEN** the governor's tier registry is unset
-- **THEN** the destination guard does not run and the batch proceeds under the transferFrom source guard, the privileged-target guard, and the outflow/reserve/buffer checks only
-
-#### Scenario: Pull into the vault always passes
-
-- **WHEN** a batch call is `transferFrom(x, vault, amount)`
-- **THEN** the destination guard passes it as an inflow — this requirement governs only the destination check; a non-vault `x` is separately rejected by the transferFrom source guard specified above before the batch can succeed
-
-#### Scenario: Permit2 approve to a non-allowlisted spender is rejected
-
-- **WHEN** a governor batch contains `Permit2.approve(token, attacker, amount, expiration)` and `attacker` is not the vault or an allowlisted adapter
-- **THEN** the batch reverts `DisallowedTransferTarget(permit2, PERMIT2_APPROVE_SELECTOR, attacker)`, closing the two-transaction poison-then-drain route through Permit2 identically to the legacy `approve` guard
-
-#### Scenario: Self-transfer fast-path does not exempt non-asset() tokens
-
-- **WHEN** a governor batch contains `EvilToken.transferFrom(vault, vault, amount)` where `EvilToken` is not `asset()` and is not allowlisted in the TierRegistry
-- **THEN** the batch reverts `DisallowedTransferTarget(EvilToken, TRANSFER_FROM_SELECTOR, vault)` — the destination decoding to the vault no longer skips the registry check for any token other than `asset()`
-
-#### Scenario: Self-transfer fast-path still exempts asset()
-
-- **WHEN** a governor batch contains `asset().transferFrom(vault, vault, amount)` (a self-approve/self-transfer of the vault's own underlying asset)
-- **THEN** the destination guard's fast-path exempts it exactly as before, since `asset()` is the token the outer net-outflow meter independently verifies
 
 ### Requirement: Fee parameters
 The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 bps, 20%) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (2500 bps, 25% — an alias of the protocol performance-fee ceiling `FeeConstants.MAX_PERFORMANCE_FEE_BPS`; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is snapshotted onto a proposal at propose time and clamped to the governor's configured maximum at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient, and to at most the vault's balance (`AmountExceedsBalance`).
@@ -368,82 +332,6 @@ The queue SHALL accept `queueRedeem`, `queueDeposit`, and `stampSettlement` only
 #### Scenario: Third party cannot mint via queue surface
 - **WHEN** any address other than the bound queue calls `settleDeposit` or `settleRedeem` on the vault
 - **THEN** the call reverts `NotQueue`
-
-### Requirement: Privileged-target guard on batches
-
-`_guardBatchCalls` SHALL reject any governor batch containing a call whose `target` is the vault itself or the vault's bound withdrawal queue, reverting `DisallowedBatchTarget(target)`. This target check SHALL be enforced **unconditionally on every call in the batch, before the value-moving-selector switch and independently of whether a TierRegistry is wired** — it SHALL NOT be skipped by the `registry == address(0)` degrade-open path that gates the selector guard. Because `_guardBatchCalls` runs inside `executeGovernorBatch`, the guard SHALL apply on the execute, settlement, and both emergency batch paths alike.
-
-The adversary is a governor batch that carries `msg.sender == vault` into a vault-only entrypoint: because batches execute via `delegatecall`, calling the withdrawal queue's `onlyVault` functions (`queueRedeem`, `queueDeposit`, `stampSettlement`) satisfies its `onlyVault` gate while moving zero vault `asset()` balance in the same transaction — so the net-outflow meter, the queue-reserve check, and the tier-2 coverage price all read it as harmless. Blocking the vault and the queue as batch targets is the complete boundary: no legitimate strategy batch targets either address (they target strategy adapters, the asset token, or external protocols).
-
-#### Scenario: Queue-targeting batch call is rejected
-
-- **WHEN** a governor batch contains a call whose `target` is the bound withdrawal queue (e.g. `queueRedeem(attacker, victimShares, pid)`)
-- **THEN** `executeGovernorBatch` reverts `DisallowedBatchTarget(withdrawalQueue)` before any call executes, even though the call moves no vault `asset()` balance and would otherwise clear the outflow meter and tier-2 coverage
-
-#### Scenario: Vault self-targeting batch call is rejected
-
-- **WHEN** a governor batch contains a call whose `target` is the vault itself (`address(this)`)
-- **THEN** `executeGovernorBatch` reverts `DisallowedBatchTarget(vault)`
-
-#### Scenario: Guard fires even without a wired TierRegistry
-
-- **WHEN** the calling governor exposes no TierRegistry (getter missing or returning `address(0)`) and a batch targets the withdrawal queue
-- **THEN** the batch still reverts `DisallowedBatchTarget` — the target guard runs outside the registry-less degrade-open path that skips the selector guard
-
-#### Scenario: Emergency path is covered
-
-- **WHEN** the vault owner drives `emergencySettleWithCalls` / `finalizeEmergencySettle` (or `unstick`) with owner-supplied calls that target the withdrawal queue, bypassing the LP vote and coverage quorum
-- **THEN** the batch reverts `DisallowedBatchTarget` because `_guardBatchCalls` runs on every `executeGovernorBatch` invocation regardless of entrypoint
-
-#### Scenario: Honest strategy batch is unaffected
-
-- **WHEN** a governor batch targets only strategy adapters, the vault's underlying asset token, or external protocol contracts (never the vault or its queue)
-- **THEN** the target guard passes every call and the batch proceeds under the existing selector, outflow, reserve, and buffer checks
-
-### Requirement: transferFrom source guard on batches
-
-Every governor batch call carrying the `transferFrom(address,address,uint256)` selector, OR one of the alternate-signature "pull tokens via delegated allowance" selectors this guard recognizes — Permit2 `AllowanceTransfer.transferFrom(address,address,uint160,address)` (`0x36c78516`), DSToken `pull(address,uint256)` (`0xf2d5d56b`), and DSToken `move(address,address,uint256)` (`0xbb35783b`) — SHALL have its source address (`from`/`usr`/`src`, calldata bytes 4..36 in every recognized case) equal to the vault itself; otherwise the batch SHALL revert `DisallowedTransferFromSource(target, from)`. Calldata for any of these selectors too short to hold both address arguments (fewer than 68 bytes) SHALL revert `MalformedCall`. Both checks SHALL be enforced **unconditionally on every call in the batch, independently of whether a TierRegistry is wired** — they SHALL NOT be skipped by the degrade-open path that gates the value-moving selector guard. Because the guard runs inside `executeGovernorBatch`, it SHALL apply on the execute, settlement, and both emergency batch paths alike.
-
-A post-merge security review (Pashov 12-agent audit of PR #157, confidence 90, 3-agent independent convergence) found that limiting recognition to the single legacy `transferFrom` selector left the identical "pull via delegated allowance" capability, exposed under a different selector by Permit2 or DSToken, completely unguarded — reproducing the exact confiscation primitive this requirement exists to close, just routed through a different target. The guard is extended selector-by-selector (documented follow-up: a target-based redesign, gating every batch call regardless of selector, was assessed as more durable but was deferred because it would require re-plumbing the tier-pricing/TierRegistry relationship for every non-value-moving adapter call, outside this change's footprint).
-
-The adversary is a governor batch that spends a third party's ERC-20 allowance: batches execute via `delegatecall`, so every sub-call carries `msg.sender == vault`, and `token.transferFrom(victim, vault, victimBalance)` spends `allowance[victim][vault]` — the standing (routinely unlimited) allowance every LP grants in order to deposit. No other meter sees it: the vault's balance rises so net-outflow reads 0, tier coverage prices only vault capital (`maxCapital`) and never third-party wallets, and the privileged-target denylist does not fire because the call target is the token. Confiscation is not a priced capability but a refused one, which is why the check is unconditional — the same posture as the privileged-target guard.
-
-The permitted source is exactly the vault itself, NOT the TierRegistry adapter allowlist. `isAdapterAllowed` encodes destination consent — an address the vault may *send* funds to — and an entry there is no consent to having its own allowances seized. No honest batch pulls from any third party: capital deploys via a guarded `approve` to an adapter that pulls in its own code, and returns are pushes from the adapter.
-
-#### Scenario: LP-allowance confiscation is rejected
-
-- **WHEN** a governor batch contains `token.transferFrom(victim, vault, amount)` where `victim` is any address other than the vault (e.g. an LP holding a `type(uint256).max` deposit allowance to the vault)
-- **THEN** `executeGovernorBatch` reverts `DisallowedTransferFromSource(token, victim)`, even though the destination is the vault and the vault's balance would have risen
-
-#### Scenario: Allowlisted adapter is not a permitted source
-
-- **WHEN** a governor batch contains `token.transferFrom(adapter, vault, amount)` where `adapter` is allowlisted in the TierRegistry
-- **THEN** the batch reverts `DisallowedTransferFromSource(token, adapter)` — destination consent does not confer source consent
-
-#### Scenario: Guard fires even without a wired TierRegistry
-
-- **WHEN** the calling governor exposes no TierRegistry (getter missing or returning `address(0)`) and a batch contains `transferFrom` with a non-vault source
-- **THEN** the batch still reverts `DisallowedTransferFromSource` — the source guard runs outside the registry-less degrade-open path that skips the selector guard
-
-#### Scenario: Vault-sourced transferFrom still flows through the destination guard
-
-- **WHEN** a governor batch contains `token.transferFrom(vault, x, amount)`
-- **THEN** the source guard passes it, and `x` remains subject to the value-moving selector guard (vault or allowlisted adapter, else `DisallowedTransferTarget`) and the batch to the net-outflow meter — exactly as if the call were `transfer(x, amount)`
-
-#### Scenario: Short transferFrom calldata is rejected unconditionally
-
-- **WHEN** a governor batch contains a call whose selector is `transferFrom` but whose calldata cannot hold both address arguments (length below 68 bytes), and no TierRegistry is wired
-- **THEN** the batch reverts `MalformedCall` — the source guard's calldata bound does not degrade open with the registry
-
-#### Scenario: Permit2-routed confiscation is rejected identically to legacy transferFrom
-
-- **WHEN** a governor batch contains `Permit2.transferFrom(victim, attacker, amount, token)` where `victim` is any address other than the vault and `victim` has a standing Permit2 allowance recorded for `token`
-- **THEN** `executeGovernorBatch` reverts `DisallowedTransferFromSource(permit2, victim)`, exactly as it would for the equivalent legacy `token.transferFrom(victim, attacker, amount)` call
-
-#### Scenario: DSToken pull/move from a non-vault source is rejected
-
-- **WHEN** a governor batch contains `DSToken.pull(victim, amount)` or `DSToken.move(victim, attacker, amount)` where `victim` is not the vault
-- **THEN** the batch reverts `DisallowedTransferFromSource(dstoken, victim)`
 
 ### Requirement: Deposits are not charged a fee
 
@@ -540,4 +428,68 @@ The shared batch executor library's `executeBatch(calls, asset, caps)` SHALL, wh
 #### Scenario: Simulation reports per-call outflows
 - **WHEN** a proposer dry-runs a batch through `simulateBatch` in the vault's context with candidate caps
 - **THEN** the result reports each call's gross outflow so caps can be sized to observed behavior, and simulation never enforces authorization (eth_call usage, matching today's `simulateBatch` contract)
+
+### Requirement: Every non-asset batch target is a registered strategy
+
+For every governor-batch call whose `target` is not the vault's underlying `asset()`, the guard SHALL require that the protocol's `StrategyFactory` holds `target` as a registered strategy whose code is unchanged since registration, and SHALL revert `NotARegisteredStrategy(target)` otherwise. The vault SHALL resolve the factory live through `governor → tierRegistry() → strategyFactory()` and read `isRegisteredStrategy(target)` on it; every hop SHALL be fail-closed — a governor or registry that does not answer, an unwired (`address(0)`) factory, or a factory that does not answer the selector with one word SHALL read as "not registered". Admission is not endorsement: the batch's effect on custody is bounded by the outflow meter, the queue reserve and the buffer floor, and its price by the tier snapshotted at propose. The vault SHALL NOT decode recipients, consult any allowlist, or probe a callee's `vault()` inside the guard.
+
+#### Scenario: Unregistered contracts are refused whatever the calldata
+- **WHEN** a batch names Morpho directly, the withdrawal queue, the governor, the vault itself, the tier registry or any contract nobody registered
+- **THEN** `executeGovernorBatch` reverts `NotARegisteredStrategy(target)` before any call executes
+
+#### Scenario: A registered strategy is admitted with any selector
+- **WHEN** a batch approves a registered hand-written strategy and calls it with a selector no registry names, pulling at most `maxNetOutflow` and within each call's cap
+- **THEN** the batch executes
+
+#### Scenario: A code change de-registers
+- **WHEN** a registered strategy's code changes after registration and a batch names it
+- **THEN** the batch reverts `NotARegisteredStrategy(target)`
+
+#### Scenario: Unwired factory refuses every non-asset target
+- **WHEN** the registry's `strategyFactory()` is `address(0)` and a batch names a strategy that was registered elsewhere
+- **THEN** the batch reverts `NotARegisteredStrategy(target)`; asset calls are still admitted under the asset rules
+
+#### Scenario: A factory that does not answer fails closed
+- **WHEN** `isRegisteredStrategy` on the resolved factory reverts or returns other than one word
+- **THEN** the batch reverts `NotARegisteredStrategy(target)`
+
+### Requirement: On the asset, a call is a metered transfer or allowance-shaped, and no allowance survives the batch
+
+For every governor-batch call whose `target` is `asset()`: calldata shorter than 36 bytes SHALL revert `MalformedAssetCall(selector)` before any call executes. `transfer(to, n)` and `transferFrom(vault, to, n)` SHALL be admitted as metered egress; `transferFrom` whose first argument word is not the vault's address SHALL revert `TransferFromNotVault(from)`. The approve family — `approve(address,uint256)`, `increaseAllowance(address,uint256)`, `increaseApproval(address,uint256)`, `decreaseAllowance(address,uint256)` and `decreaseApproval(address,uint256)` — SHALL be admitted as allowance-shaped: the guard SHALL record the first argument word as a spender, and after the batch's delegatecall returns — before the outflow, reserve and buffer checks — the vault SHALL `forceApprove(spender, 0)` on `asset()` for each recorded spender. Every other selector, reads included, SHALL revert `UnrecognizedAssetSelector(selector)` before any call executes: a token's own extensions (Paxos's `transferFromBatch`, for one) can spend allowances held by the vault, so the asset surface is a named set. The governor SHALL apply the same predicate at propose to both batches, so no proposal can reach `Executed` on an asset leg that execute or settle would refuse. The rule SHALL apply on the execute, settlement and emergency batch paths alike.
+
+#### Scenario: transferFrom from an LP is refused
+- **WHEN** a batch contains `asset.transferFrom(lp, x, n)` where `lp` holds a standing deposit allowance to the vault
+- **THEN** the batch reverts `TransferFromNotVault(lp)` before any call executes and the LP's allowance is untouched
+
+#### Scenario: transferFromBatch naming an LP is refused
+- **WHEN** the asset exposes `transferFromBatch(address[],address[],uint256[])` and a batch or a proposal's execute or settlement leg calls it with an LP as `from[0]`
+- **THEN** `executeGovernorBatch` and `propose` revert `UnrecognizedAssetSelector(transferFromBatch.selector)` before any call executes, and the LP's balance and allowance to the vault are untouched
+
+#### Scenario: Reads and unknown grant shapes are refused
+- **WHEN** a batch calls the asset with `balanceOf`, `allowance`, `permit`, `transferAndCall` or any selector outside the admitted set
+- **THEN** the batch reverts `UnrecognizedAssetSelector(selector)` before any call executes
+
+#### Scenario: Short asset calldata is refused
+- **WHEN** a batch contains an asset call of fewer than 36 bytes (empty, `decimals()`, a bare `transferFrom` selector, an `approve` truncated to 35 bytes)
+- **THEN** the batch reverts `MalformedAssetCall(selector)` before any call executes
+
+#### Scenario: A Paxos-shaped asset's increaseApproval is reset
+- **WHEN** the asset grants through `increaseApproval(address,uint256)` and has no `increaseAllowance` (the launch asset's shape) and a batch grants two spenders through it, one of which pulls inside the batch
+- **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, spender)` is zero for both, and in the next block `transferFrom(vault, attacker, n)` by the idle spender reverts for insufficient allowance
+
+#### Scenario: transferFrom from the vault is admitted and metered
+- **WHEN** a batch approves the vault itself and calls `asset.transferFrom(vault, x, n)` with a call cap of at least `n`, and the reserve and buffer checks pass
+- **THEN** the batch executes iff `n <= maxNetOutflow`, else reverts `MaxNetOutflowExceeded`
+
+#### Scenario: transfer is admitted and metered
+- **WHEN** a batch contains `asset.transfer(x, n)` with a call cap of at least `n`, and the reserve and buffer checks pass
+- **THEN** the batch executes iff `n <= maxNetOutflow`, else reverts `MaxNetOutflowExceeded`
+
+#### Scenario: Every recorded spender reads zero allowance after the batch
+- **WHEN** a batch grants two spenders via `approve` or `increaseAllowance`, one of which pulls inside the batch and one of which does not
+- **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, spender)` is zero for both
+
+#### Scenario: Approve-then-drain in a later block is impossible
+- **WHEN** a batch approves `attacker` for `type(uint256).max` and no call pulls
+- **THEN** in the next block `asset.transferFrom(vault, attacker, 1)` by `attacker` reverts for insufficient allowance
 

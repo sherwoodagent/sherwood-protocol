@@ -70,11 +70,13 @@ Addresses flow IN MEMORY between phases (the `Stack` struct); no phase reads ano
 ### Requirement: The Robinhood ceremony seats every owner-gated write before handoff
 `DeployRobinhoodMainnet` is an ABSTRACT phase mixin and `DeployAll` owns `run()`, so every write the canonical run makes between `deployCore` and the multisig handoff SHALL be restated in it. Those writes SHALL be collected in ONE internal method (`_seatOwnerWrites`) rather than scattered inline, so the set can be asserted as a set: each is an `onlyOwner` call on a contract the handoff then transfers, so each has exactly one window in which it is cheap and an eternity afterwards in which it is a multisig chore.
 
-The set is: `setProtocolFeeRecipient`, `setGuardiansFeeRecipient`, and **the TierRegistry launch set** (`_seedTierRegistry`). The two fee recipients are seated ONLY when still zero, so a resumed run never re-points a recipient the Safe has already moved. The launch set was MISSING for the entire life of the script. `deployCore` mints the TierRegistry empty and wires it into the factory; the attestations are separate `onlyOwner` writes. `isCounterpartyAllowed` GATES CLONE-INIT, so an empty registry makes every ConcentratedLiquidity clone revert `CounterpartyNotAllowed` and makes `DeployConcentratedLiquidityStrategy` refuse to run at all.
+The set is: `setProtocolFeeRecipient`, `setGuardiansFeeRecipient`, and **the TierRegistry launch set** (`_seedTierRegistry`). Writes outside it are made by their own phase or inline in `DeployAll.deployAll`: the limited-launch factory writes (`setDepositsRestricted`, `setOwnerOnlyProposals`, `setCreationFee`), the swap-adapter attestation, and the run-2 `setAgentRegistry`. The two fee recipients are seated ONLY when still zero, so a resumed run never re-points a recipient the Safe has already moved. `deployCore` mints the TierRegistry empty and wires it into the factory; the attestations are separate `onlyOwner` writes. `isCounterpartyAllowed` GATES CLONE-INIT for every shipped template, so an empty registry makes every clone revert at init and makes `DeployConcentratedLiquidityStrategy` refuse to run at all.
+
+The launch set is ONE axis: every venue a template binds — the Uniswap v3 factory and position manager, the Morpho Blue singleton, each Chainlink aggregator — is seeded with `setCounterpartyAllowed(x, true)`, and each aggregator whose token is on the chain is additionally paired to its token with `setPriceSourceForToken`. No deploy script SHALL call any adapter or callee allowlist setter; none exists. The addresses this deploy MINTS (the swap adapter) are attested as counterparties by their own phase (`DeployPortfolioStrategy._attestAdapter`) inside the deployer-owned window. The attestation is REQUIRED, not best-effort: a registry the deployer no longer owns refuses the run ("PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - attest the swap adapter before the Safe accepts") rather than printing a runbook line and shipping an adapter no clone can bind.
 
 #### Scenario: Launch set lands before the handoff
 - **WHEN** the Robinhood ceremony completes
-- **THEN** the TierRegistry attests `UNISWAP_V3_FACTORY`, `UNISWAP_V3_POSITION_MANAGER` and `MORPHO_BLUE` as counterparties, and `MORPHO_BLUE` on the adapter axis as well
+- **THEN** the TierRegistry answers `isCounterpartyAllowed == true` for `UNISWAP_V3_FACTORY`, `UNISWAP_V3_POSITION_MANAGER`, `MORPHO_BLUE` and every seeded Chainlink feed, and `isPriceSourceForToken(token, feed)` for every feed whose token is on the chain
 
 The launch set is STRICT. Every symbol in `RobinhoodParams.launchSetSymbols()` requires its `CHAINLINK_<SYM>_USD_FEED` key in the address book, and a missing one REVERTS ("launch set: <KEY> is zero in the address book") rather than narrowing the attested set in silence. The paired `<SYM>` token key drives `setPriceSourceForToken`; on 4663 today USDC, BTC and LINK have a feed but no token entry, so those three are allowlisted as counterparties with NO token pairing and the run says so. Closing that gap is a book change (add the three token addresses) or a list change (drop the three symbols), not a code change.
 
@@ -518,4 +520,15 @@ This is a PER-PROPOSAL obligation, not a ceremony step: the market is chosen per
 #### Scenario: Market demoted after init
 - **WHEN** the market id is de-listed between clone-init and `execute()`
 - **THEN** `execute()` reverts `MorphoMarketNotAllowed(marketId, registry)` and no vault funds move
+
+### Requirement: The StrategyFactory phase wires the registry before handoff
+The StrategyFactory phase SHALL require the ceremony's tier registry (carried on the in-memory `Stack`) to be set and `TierRegistry.owner() == deployer`, SHALL call `setStrategyFactory(<minted factory>)` inside its broadcast, and SHALL assert `strategyFactory()` reads back the minted factory. There SHALL be no deferred or escape-hatch path: an unwired registry makes every `propose` revert `StrategyNotRegistered` and every non-asset batch target refused. Inside the single ceremony this is a PHASE-ORDERING property — the StrategyFactory phase runs before `_handoffAll` — so the refusal below bites only on a RE-RUN against a registry the Safe has already accepted. A registry already naming a FOREIGN StrategyFactory is likewise refused ("TIER_REGISTRY already points at a foreign StrategyFactory") rather than repointed. A TierRegistry redeploy runbook SHALL list `setStrategyFactory(STRATEGY_FACTORY)` alongside the certification set.
+
+#### Scenario: The ceremony leaves the registry wired
+- **WHEN** `DeployStrategyFactory` completes against a registry the deployer still owns
+- **THEN** `tierRegistry.strategyFactory()` equals the minted factory and a `propose` naming a strategy registered on it succeeds
+
+#### Scenario: A re-run against a handed-off registry is refused
+- **WHEN** the phase is re-run after the multisig has accepted TierRegistry ownership
+- **THEN** it reverts naming the wiring, deploying nothing
 
