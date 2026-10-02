@@ -442,9 +442,10 @@ round lets the vault owner:
 - **Trade an orphaned Portfolio basket.** After such a close, an owner who is
   also the Portfolio clone's proposer can `rescueERC20` basket tokens into that
   clone, which is still Executed, and call `rebalanceDelta` with no proposal
-  open (`PortfolioStrategy.sol:255`). Each swap stays bounded by the clone's
-  `maxSlippageBps` on the swap adapter and price feeds approved at propose. This
-  is a bounded residual, not a way to take the tokens.
+  open (`PortfolioStrategy.sol:255`). Each swap runs through the clone's own
+  swap adapter and price feeds, which must still be allowlisted, and is bounded
+  by the clone's `maxSlippageBps`. This is a bounded residual, not a way to take
+  the tokens.
 - **Cancel a round for free while block weight is below quorum.**
   `cancelEmergencySettle` is accepted until `reviewEnd` unless block quorum is
   already reached (`GuardianRegistry.sol:755-761`). Nothing is slashed, and the
