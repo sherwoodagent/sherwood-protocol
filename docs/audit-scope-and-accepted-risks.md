@@ -80,7 +80,7 @@ with per-call caps off and a zero net-outflow budget measured on the vault's pre
 A blocked round slashes the owner bond (`requiredOwnerBond`, at least `MIN_OWNER_STAKE`), and the same
 owner may re-bond and retry (`SyndicateFactory.rotateOwner` to itself is allowed mid-proposal). The
 veto electorate is the proposal's propose-time snapshot (`openEmergency` reads
-`getPastTotalVotes(snapshotAt)`, ballots read `getPastStake(voter, snapshotAt)`): stake that does not
+`getPastTotalVotes(snapshotAt)` and stores it as `er.openedAt`; ballots read `getPastStake(voter, er.openedAt)`): stake that does not
 vote raises the bar, and guardians who have since left still count. Accepted because the path exists
 to unwind a stuck strategy and an on-chain check that the strategy unwound would lock it again.
 Bounded by the guardian review and the bond. Reviewer rule: `docs/guardian-network.md`, "Reviewer
