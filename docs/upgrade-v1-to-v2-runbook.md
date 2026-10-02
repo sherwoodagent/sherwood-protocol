@@ -161,25 +161,26 @@ the same Safe batch, BEFORE any governor or the new game is pointed at `TR2`:
 4. Replay the counterparty allowlist: `TR2.setCounterpartyAllowed(counterparty, true)`
    (re-snapshots codehashes).
 5. Replay price sources: `TR2.setPriceSourceForToken(token, priceSource, true)`.
-   Replay the Morpho market allowlist: `TR2.setMorphoMarketAllowed(id, true)` for every
+6. Replay the Morpho market allowlist: `TR2.setMorphoMarketAllowed(id, true)` for every
    `id` with `TR1.isMorphoMarketAllowed(id) == true` (from `MorphoMarketAllowedSet` events).
-   Morpho and CL strategies re-check their market id against the governor's current
-   registry on execute (and CL on `rerange`), so a missing id makes those calls revert.
-6. Re-deny every pair the old registry had demoted: for each `(target, selector)` with
+   `MorphoSupplyStrategy` and the CL strategy check the market id against the governor's
+   current registry in clone `initialize`, on execute and (CL) on `rerange`, so a missing
+   id makes new clone creation and those calls revert.
+7. Re-deny every pair the old registry had demoted: for each `(target, selector)` with
    `TR1.isClassTierDenied(target, selector) == true` (or a `TierDemoted` event), call
    `TR2.demote(target, selector)` AFTER its class certification (`demote` reverts
    `NotCertified` otherwise). For a class demoted on TR1 (`ClassDemoted`), simply do not
    re-certify it.
-7. `TR2.setAuthorizedDemoter(newGame)`; `newGame.setTierRegistry(TR2)`.
-8. On TR1, cancel every pending certification (`cancelCertification` /
+8. `TR2.setAuthorizedDemoter(newGame)`; `newGame.setTierRegistry(TR2)`.
+9. On TR1, cancel every pending certification (`cancelCertification` /
    `cancelClassCertification`), otherwise anyone can complete it after the delay for
    governors still on TR1.
-9. Plan for the v1 registry's submitter bonds: a bond on a pair still certified on TR1
-   becomes releasable only after a TR1 `demote` / `demoteClass` starts its
-   `bondReleaseDelay` timer (then `claimSubmitterBond` / `claimClassSubmitterBond`).
-   Retiring TR1 without demoting leaves those bonds locked.
+10. Plan for the v1 registry's submitter bonds: a bond on a pair still certified on TR1
+    becomes releasable only after a TR1 `demote` / `demoteClass` starts its
+    `bondReleaseDelay` timer (then `claimSubmitterBond` / `claimClassSubmitterBond`).
+    Retiring TR1 without demoting leaves those bonds locked.
 
-Then step 7: `factory.setTierRegistry(TR2)` and `pushWiring` each governor in its
+Then §3 step 7: `factory.setTierRegistry(TR2)` and `pushWiring` each governor in its
 cooldown. Until the last governor is re-pointed, the new game demotes only in TR2; on
 any conviction the Safe must mirror the demotion on TR1 with `TR1.demote(...)` /
 `TR1.demoteClass(...)`. Before re-pointing, diff `tierOf(target, selector)` on TR1 and
@@ -213,6 +214,7 @@ Read on-chain; every line must hold.
 | `ledger.coverageFreezer()` | new game |
 | `ledger.frozenCoverageCount()` | `0` immediately after step 5 |
 | `tierRegistry.authorizedDemoter()` (TR1, or TR2 if §5) | new game |
+| If §5: `TR2.isMorphoMarketAllowed(id)` for every id allowed on TR1 | `true` |
 | `newGame.stakedWood()` / `exposureLedger()` / `tierRegistry()` | sWOOD / v1 ledger / the live tier registry |
 | `newGame.owner()` | Safe |
 | `newGame.challengeWindow()` | `== ledger.challengeWindow()` |
