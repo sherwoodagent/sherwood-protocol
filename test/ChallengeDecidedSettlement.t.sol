@@ -10,11 +10,12 @@ contract ChallengeDecidedSettlementTest is ChallengeEndToEndBase {
     address internal whale = makeAddr("freshWhale");
     address internal sock = makeAddr("sockFiler");
 
-    /// @dev g1 (30k) approves and is accused; g2/g3 hold 20k each; a fresh 30k
-    ///      whale stakes after execution. Total 100k, votable 70k.
+    /// @dev g1 (30k) approves and is accused; g2/g3 hold 20k each; a 30k whale
+    ///      stakes before propose, so its ballot counts. Total 100k, votable 70k.
     function _proposeExecuteAndStakeWhale() internal returns (uint256 pid) {
-        pid = _proposeApproveExecute();
         _stakeGuardian(whale, 30_000e18, 9);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        pid = _proposeApproveExecute();
         vm.warp(vm.getBlockTimestamp() + 1);
         _fundSock();
     }

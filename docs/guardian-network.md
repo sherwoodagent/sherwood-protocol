@@ -300,8 +300,15 @@ own escrowed bond.
 - **Entrypoint:** `voteOnChallenge(challengeId, convict)`.
   One ballot per guardian per challenge, no changes, and only while the challenge is
   `Filed` and inside its pinned window.
-- **Weight:** the voter's staked WOOD at `filedAt − 1`
-  (`swood.getPastStake`). The stamp is one second back because an sWOOD checkpoint
+- **Weight:** the lower of the voter's staked WOOD at `filedAt − 1` and at the
+  proposal's snapshot (`swood.getPastStake`; the governor's `snapshotTimestamp`,
+  pinned on the challenge as `snapshotAt`), stamped when the proposal entered
+  Pending — at `propose`, or at the last co-proposer approval on the collaborative
+  path (disabled while `ownerOnlyProposals` is on). This is the same electorate the
+  guardian review uses. Stake added after that carries no ballot, so a guardian who
+  joined later cannot vote on its challenge;
+  that stake still counts in the denominator below, which can only make a
+  conviction harder. The filing stamp is one second back because an sWOOD checkpoint
   is keyed on the second a stake changes and a same-second push overwrites — reading
   the filing instant itself would let stake planted in that very block count in the
   numerator while the denominator missed it.
@@ -317,8 +324,9 @@ own escrowed bond.
   lead. The identity checks are floors, not ceilings — a second, unlinked address
   defeats all of them — but they close the plain case where a filer convicts its own
   accusation, or a proposer votes on the challenge that would take its bond. What
-  BOUNDS a sybil is the denominator: it must hold 30% of the TOTAL staked WOOD and
-  outweigh the acquit side.
+  BOUNDS a sybil is that its ballot counts only stake held since the proposal
+  entered Pending: it must have staked by then, and that
+  stake must still reach 30% of the TOTAL staked WOOD and outweigh the acquit side.
 - **Quorum:** `challengeQuorumBps` of that pinned total, and the convict side must
   also outweigh the acquit side. Abstention still adds nothing to either tally, so a
   challenge carries on an active convicting majority reaching the bar, or not at all.

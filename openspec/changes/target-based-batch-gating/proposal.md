@@ -45,3 +45,5 @@ None.
 
 - Issue #166 (this change), issue #115 + PR #157 (rounds 1-4 of the selector allowlist), issue #118 / `openspec/changes/propose-time-target-validation` (the target-gating design precedent this change follows), issue #137 (codehash-bound allowlist, inherited), issue #51 (demotion clears allowlist, inherited).
 - **Issue #18**: recommend closing as **subsumed by this change** once landed (do not close before). Design.md Decision 4 records the exact claim: closed for every non-allowlisted target (the default posture — this is the entire #18 scenario set), residual only on explicitly-allowlisted exotic-asset callees, which the tier-policy spec now forbids as governance discipline. Record that reasoning on #18 when commenting (use `--body-file`; the comment contains backticks).
+
+> **Note (2026-10-01):** this change's tier-policy delta was withdrawn. It modified "Adapter allowlist is a separate axis from tiers", which `structural-batch-rules` removed from the code; the tier-policy spec no longer carries that requirement, and the counterparty allowlist replaces it.

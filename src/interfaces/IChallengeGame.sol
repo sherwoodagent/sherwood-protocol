@@ -106,6 +106,8 @@ interface IChallengeGame {
         /// @dev `totalStakeAtFiling` less the accused cohort's stake: the ceiling
         ///      on `convictWeight + acquitWeight`. Appended for tuple-position stability.
         uint256 votableAtFiling;
+        /// @dev Governor `snapshotTimestamp` at propose; ballots are clamped to stake held then.
+        uint64 snapshotAt;
     }
 
     // ── Errors ──
@@ -266,8 +268,8 @@ interface IChallengeGame {
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
     event FilingsPausedSet(bool oldPaused, bool newPaused);
     event ProsecutorFeeBpsSet(uint256 oldBps, uint256 newBps);
-    /// @dev `weight` is the voter's staked WOOD at `filedAt - 1`, the same basis
-    ///      the challenge's total stake was measured on.
+    /// @dev `weight` is the lower of the voter's staked WOOD at `filedAt - 1` and
+    ///      at the propose-time `snapshotAt`.
     event ChallengeVoteCast(uint256 indexed challengeId, address indexed voter, bool convict, uint256 weight);
     event ChallengeQuorumBpsSet(uint256 oldBps, uint256 newBps);
 

@@ -427,11 +427,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // timestamp would admit stake planted in this very block.
         IStakedWood swood = stakedWood;
         if (address(swood) == address(0)) revert ZeroAddress();
-        uint256 snapshotAt = block.timestamp - 1;
-        uint256 votable = swood.getPastTotalVotes(snapshotAt);
+        uint256 filingSnapshot = block.timestamp - 1;
+        uint256 votable = swood.getPastTotalVotes(filingSnapshot);
         uint256 accusedAtExecution;
         for (uint256 i = 0; i < accused.length; i++) {
-            uint256 w = swood.getPastStake(accused[i], snapshotAt);
+            uint256 w = swood.getPastStake(accused[i], filingSnapshot);
             votable = votable > w ? votable - w : 0;
             // The accused count only up to their stake at the approve snapshot and at
             // execution: a top-up after approving raises no slash, so it must not raise the bar.
@@ -441,9 +441,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             accusedAtExecution += atExec < w ? atExec : w;
         }
         uint256 totalStake = votable + accusedAtExecution;
-        // No conviction could clear the quorum, so the filing is refused rather
-        // than taking a bond that can only burn. Same value the challenge pins
-        // below, so the door and the bar cannot drift apart.
+        // No conviction could clear the quorum, so the filing is refused rather than taking a
+        // bond that can only burn. A pass is not a guarantee: stake added after the propose
+        // snapshot sits in this denominator but cannot vote (see `voteOnChallenge`).
         if (votable * BPS_DENOMINATOR < challengeQuorumBps * totalStake) revert NoVotableStake();
 
         _challenges[challengeId] = Challenge({
@@ -480,7 +480,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             convictWeight: 0,
             acquitWeight: 0,
             proposer: p.proposer,
-            votableAtFiling: votable
+            votableAtFiling: votable,
+            // forge-lint: disable-next-line(unsafe-typecast)
+            snapshotAt: uint64(p.snapshotTimestamp)
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -533,9 +535,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     // ── Deciding ──
 
-    /// @notice Cast a guardian's vote on a live challenge. Weight is the
-    ///         voter's staked WOOD one second before the filing — the same
-    ///         instant the challenge's total stake was measured at.
+    /// @notice Cast a guardian's vote on a live challenge. Weight is the lower
+    ///         of the voter's staked WOOD one second before the filing and at
+    ///         the proposal's propose-time snapshot (`snapshotAt`).
     /// @dev Four parties are refused: the challenger, the proposal's lead
     ///      proposer, its co-proposers, and the approvers the filing accuses.
     ///      Each has a direct stake in the verdict's own payouts.
@@ -552,6 +554,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (address(swood) == address(0)) revert ZeroAddress();
         if (!swood.isActiveGuardian(msg.sender)) revert NoVotableStake();
         uint256 weight = swood.getPastStake(msg.sender, c.filedAt - 1);
+        // Only stake held since the propose-time snapshot votes, the electorate the guardian review used.
+        uint256 atSnapshot = swood.getPastStake(msg.sender, c.snapshotAt);
+        if (atSnapshot < weight) weight = atSnapshot;
         if (weight == 0) revert NoVotableStake();
 
         _voted[challengeId][msg.sender] = true;
