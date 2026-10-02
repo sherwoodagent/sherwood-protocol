@@ -10,7 +10,7 @@ what the code does.
 
 Documents only. No executable source changes; natspec comments only in `src/` and one test comment.
 
-- Guardian review and emergency block votes weigh raw `getPastStake` at the propose-time snapshot;
+- Guardian review and emergency block votes weigh raw `getPastStake` at the proposal's snapshot (one second before it entered Pending);
   only `TokenCourt.vote` uses the age-weighted `getPastVotes`.
 - Per-vault voting period floor is 1 hour on the mainnet implementation (factory default 24 hours);
   veto threshold bounds are 20–80%; votingPeriod maximum is 3 days; strategy duration maximum 30 days.
@@ -21,10 +21,11 @@ Documents only. No executable source changes; natspec comments only in `src/` an
   vote lands.
 - The approve-time slot floor, the coverage measurement that scales a partial book, and the absence
   of a quorum tier threshold.
-- Queued deposits claim at the live `previewDeposit` price and cancel at any time until claimed; the
-  settle stamp divides by `_pricingSupply()`.
+- Queued deposits claim at the live `previewDeposit` price, behind the pause and the depositor
+  whitelist; the settle stamp divides by `_pricingSupply()`. Request cancellation is specified by
+  `audit-1002-vault-governor-gates` and is not repeated here.
 - Docs: the emergency path in `docs/guardian-network.md` (what an unblocked round lets the owner do,
-  the propose-time electorate, the reviewer rule); lock retention after a cancel and price outages
+  the snapshot electorate, the reviewer rule); lock retention after a cancel and price outages
   during the challenge window in `docs/coverage.md`; the management-fee base and `setProtocolConfig`
   in `docs/fees.md`.
 
@@ -43,13 +44,27 @@ Documents only. No executable source changes; natspec comments only in `src/` an
 
 ## Archive order
 
-Several open changes modify the same requirements with text that predates the code
-(`declared-coverage-locks`, `proportional-quorum-sizing`, `anchor-coverage-at-execution`,
-`per-call-capital-declarations`, `structural-batch-rules`). Archive this change after them so its
-text is the one that lands. The emergency finalize budget and the batch recipient rules are already
-corrected in `emergency-path-zero-egress-and-rebond` and `structural-batch-rules`, and the per-approver
-slash-rate, allocation and fee-attribution requirements in `declared-coverage-locks`; this change does
-not repeat them.
+This change archives cleanly on its own against `openspec/specs/` (checked with
+`openspec archive --yes` in a scratch copy). Requirements whose scenarios no longer fit are
+REMOVED and re-ADDED under a new name. Other open changes still carry older text for some of the
+same requirements and need a sync before they are archived after this one:
+
+- `per-call-capital-declarations`: "Governance parameter management" (votingPeriod floor 24h,
+  veto ceiling 50%, duration 3650d, performance-fee cap 1,500).
+- `declared-coverage-locks`: "Execute-time approve quorum" (all-or-nothing, `quorumTierThreshold`),
+  "Booking failures never fail the approve vote" (never reverts), "Review-path slash
+  (registry-only)" in guardian-staking (no severity scaling), and "Approval recording books a
+  guardian-declared WOOD lock" (no slot floor); this change adds a requirement of that name, so
+  the two must converge.
+- `proportional-quorum-sizing`: "Execute-time approve quorum" (reservation wording,
+  `quorumTierThreshold`).
+- `anchor-coverage-at-execution`: allocation and settlement requirements this change does not
+  touch, against a reservation model the code no longer has.
+
+Already corrected elsewhere and not repeated: the emergency finalize budget
+(`emergency-path-zero-egress-and-rebond`), the batch recipient rules (`structural-batch-rules`),
+the per-approver slash rate, allocation and fee attribution (`declared-coverage-locks`), and
+request cancellation and the rescue recipient (`audit-1002-vault-governor-gates`).
 
 ## Impact
 

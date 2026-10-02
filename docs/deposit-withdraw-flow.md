@@ -147,4 +147,4 @@ deposit cancels at any time until it is claimed, including after settlement.
 |---|---|---|
 | No proposal open | instant `deposit` | instant `withdraw` up to idle float |
 | Any proposal open (from `propose` to settle or a terminal state) | `requestDeposit` → claim once nothing is open | `requestRedeem` → claim after settle |
-| Worst-case wait while live | — | `strategyDuration` remainder (≤ 30 d default cap), then permissionless settle — unless the settle fails (below the drawdown floor or a reverting leg, which only the owner's `unstick` or bonded emergency path closes) or the owner pauses the vault, which blocks every settle path and which only the owner can lift |
+| Worst-case wait while live | — | `strategyDuration` remainder (≤ 30 d default cap), then permissionless settle — unless the settle fails: below the proposal's drawdown floor (closable by the owner's `unstick`, which applies the looser `MAX_STAMP_DRAWDOWN_BPS` floor, or by the bonded emergency path) or on a reverting leg (only the bonded emergency path); or the owner pauses the vault, which blocks every settle path and which only the owner can lift |

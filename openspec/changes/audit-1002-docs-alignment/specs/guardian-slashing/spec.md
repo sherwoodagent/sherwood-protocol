@@ -14,7 +14,7 @@ An approver's slash SHALL be sized from its own WOOD lock on the proposal, not f
 
 A zero lock owes nothing and is skipped. `minSlashBps` is the single deterrence floor: a negligible lock still costs `minSlashBps` of the basis. Only an approver whose lock equals its basis can lose its whole bond on a verdict.
 
-#### Scenario: Approver convicted with a partial lock
+#### Scenario: Approver convicted
 - **WHEN** an approver with a 1,000,000 WOOD basis locked 50,000 WOOD and the proposal is convicted at `minSlashBps` = 10%
 - **THEN** the rate is 500 bps, clamped up to 1,000 bps, and 100,000 WOOD is burned
 

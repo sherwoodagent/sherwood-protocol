@@ -177,8 +177,9 @@ Not one-time steps. Nothing below is enforced on-chain.
   passed to `setWoodFeed`. It is permissionless and a no-op when a pool is early
   or below its depth floor, so a failing keeper looks like nothing at all — and a
   stale feed is `NoWoodPrice`: block votes still land, but approve votes,
-  `propose`, `executeProposal` and `ChallengeGame.file` all revert, and the
-  challenge window keeps running (see [coverage.md](coverage.md)).
+  `ChallengeGame.file`, and `propose` and `executeProposal` for any proposal
+  with non-zero required coverage all revert, and the challenge window keeps
+  running (see [coverage.md](coverage.md)).
 - **Alert on `woodPriceX8()` reverting**, and on the cap binding (the served
   price sitting at `haircut(woodUsdPriceX8)` rather than tracking market).
   Neither emits an event; both have to be polled.

@@ -1,17 +1,11 @@
 ## RENAMED Requirements
 
-- FROM: `### Requirement: WOOD pricing is feed-first with governance fallback`
-- TO: `### Requirement: WOOD is priced by the feed, capped by governance, with no fallback`
-- FROM: `### Requirement: Governance WOOD price is rate-limited upward only`
-- TO: `### Requirement: The WOOD price cap has no on-chain rate limit`
 - FROM: `### Requirement: WOOD haircut is bounded and rate-limited`
 - TO: `### Requirement: WOOD haircut is bounded`
-- FROM: `### Requirement: Approval recording reserves full coverage per approver`
-- TO: `### Requirement: Approval recording books a declared WOOD lock`
 - FROM: `### Requirement: Booking failures never fail the approve vote`
 - TO: `### Requirement: Approval recording reverts rather than seat an unbacked approver`
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: WOOD is priced by the feed, capped by governance, with no fallback
 `woodPriceX8()` SHALL return `haircut(min(feedX8, woodUsdPriceX8))`, floored at 1, where `feedX8` is the wired WOOD/USD feed's answer normalised to 8 decimals. `woodUsdPriceX8` SHALL be an upper cap only and SHALL never be served as a price. `woodPriceX8()` SHALL revert `NoWoodPrice` when the cap is zero or when the feed is unset, codeless, reverts, answers `<= 0`, or is older than its configured `maxDelay`. There is no fallback price and no detail view.
@@ -43,14 +37,7 @@
 - **WHEN** the owner cuts the cap tenfold in one call
 - **THEN** the update is accepted at once, so bonds are not left over-valued during a crash
 
-### Requirement: WOOD haircut is bounded
-`setWoodHaircutBps` SHALL be owner-only and SHALL accept only values in `[5_000, 10_000]` bps, with no interval between updates. The haircut default SHALL be `10_000` (no haircut).
-
-#### Scenario: Haircut below the floor
-- **WHEN** the owner sets a haircut below 5_000 bps or above 10_000 bps
-- **THEN** the call reverts `InvalidParameter`
-
-### Requirement: Approval recording books a declared WOOD lock
+### Requirement: Approval recording books a guardian-declared WOOD lock
 `recordApproval(governor, proposalId, guardian, lockWood)` SHALL be callable only by the wired guardian registry and SHALL be idempotent per (proposal, guardian). It SHALL lock `min(lockWood, free budget)` WOOD, where free budget is `kNumerator × guardianStake(guardian) − openExposure(guardian)`, all in WOOD. The lock SHALL be booked into the epoch bucket containing `executeBy + strategyDuration` (floored at the current epoch), recorded per guardian as the single figure that is at once the guardian's booking, pledge and slash base, appended to the ledger's own approver list, and announced via `ExposureRecorded`. There SHALL be no cohort cap: a proposal's locks MAY sum to more than its requirement.
 
 #### Scenario: Successful lock
@@ -64,6 +51,15 @@
 #### Scenario: Repeat recording is a no-op
 - **WHEN** `recordApproval` is called again for a (proposal, guardian) that already holds a non-zero lock
 - **THEN** nothing changes (vote-change round trips cannot double-lock)
+
+## MODIFIED Requirements
+
+### Requirement: WOOD haircut is bounded
+`setWoodHaircutBps` SHALL be owner-only and SHALL accept only values in `[5_000, 10_000]` bps, with no interval between updates. The haircut default SHALL be `10_000` (no haircut).
+
+#### Scenario: Haircut below the floor
+- **WHEN** the owner sets a haircut below 5_000 bps or above 10_000 bps
+- **THEN** the call reverts `InvalidParameter`
 
 ### Requirement: Approval recording reverts rather than seat an unbacked approver
 `recordApproval` SHALL revert, taking the approve vote with it, when: the coverage inputs cannot be read (`CoverageInputsUnreadable`); the need cannot be priced (`coverageUsd` reverts `FeedNotConfigured` or `StalePrice`); WOOD cannot be priced (`woodPriceX8()` reverts `NoWoodPrice`); the lock is zero, the guardian's whole-budget valuation is zero, or the lock is worth less than the slot floor (`ApproveLockBelowFloor`); or settlement lies beyond the coverage horizon (`CoverageHorizonExceeded`). The slot floor is `ceil(needUsd / APPROVER_SLOTS)`, or the guardian's whole-budget valuation when that is no larger and fewer than `APPROVER_SLOTS / 2` approvers are booked. So an approve vote reverts during a WOOD-price or vault-asset-feed outage; a block vote makes no ledger call and still lands.
@@ -97,9 +93,21 @@
 
 #### Scenario: No covering approver
 - **WHEN** a proposal with non-zero required coverage reaches execute with no approver, or with a zero aggregate
-- **THEN** execution reverts `InsufficientApproveCoverage` and the proposal expires at `executeBy` unless covering approvals arrive
+- **THEN** execution reverts `InsufficientApproveCoverage`; no vote is possible after `reviewEnd`, so the proposal stays Approved until it expires at `executeBy`
 
 ## REMOVED Requirements
+
+### Requirement: WOOD pricing is feed-first with governance fallback
+**Reason**: There is no fallback. `woodPriceX8()` is the feed capped by `woodUsdPriceX8` and reverts `NoWoodPrice` without a fresh feed.
+**Migration**: Replaced by "WOOD is priced by the feed, capped by governance, with no fallback".
+
+### Requirement: Governance WOOD price is rate-limited upward only
+**Reason**: `setWoodUsdPrice` has no interval and no size ceiling; rate limiting is off-chain.
+**Migration**: Replaced by "The WOOD price cap has no on-chain rate limit".
+
+### Requirement: Approval recording reserves full coverage per approver
+**Reason**: The ledger books the guardian's declared WOOD lock, not a USD reservation.
+**Migration**: Replaced by "Approval recording books a guardian-declared WOOD lock".
 
 ### Requirement: Quorum tier threshold defaults to every tier
 **Reason**: The ledger has no `quorumTierThreshold`. The governor runs the coverage measurement for every proposal with a wired ledger and non-zero required coverage, at every tier.

@@ -60,14 +60,14 @@ recorded on entering Pending.
 
 | Step | Parameter | Default | Min | Max | Where enforced |
 |---|---|---|---|---|---|
-| 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:280` |
+| 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:268` |
 | 1. LP voting | `votingPeriod` | 24 h (factory default) | 1 h (`MIN_VOTING_PERIOD` on the mainnet impl; absolute floor 1 min) | 3 d | `GovernorParameters.sol:323-325` |
 | 1a. LP veto threshold | `vetoThresholdBps` | 20% | 20% | 80% | `GovernorParameters.sol:331-333` |
 | 2. Guardian review | `registry.reviewPeriod` | 24 h | 6 h (mainnet immutable floor; absolute floor 1 min) | 3 d | `GuardianRegistry.sol:1002` |
-| 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:338` |
-| 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:250-268` |
-| 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:350` |
-| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:837-857` |
+| 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:204` |
+| 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:235-258` |
+| 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:260` |
+| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:559` |
 
 Cross-contract timing invariants (all enforced at the setters):
 
@@ -98,7 +98,8 @@ Cross-contract timing invariants (all enforced at the setters):
   governor cap (see [fees.md](fees.md)).
 - **Proposer bond** pulled into `ProposerBondEscrow`:
   `bondWood = coverageUsd × proposerBondBps (default 1%) / woodPrice`. Fail-closed —
-  unpriceable WOOD blocks proposing (`src/ExposureLedger.sol:951`).
+  unpriceable WOOD blocks proposing any proposal with non-zero required coverage;
+  a zero-coverage proposal needs no bond and no price (`src/ExposureLedger.sol:680-686`).
 
   This is **not** the 10k owner stake. The amount **scales** (tier-2 uncertified =
   full notional × ~1% in USD, converted at `woodPriceX8()`). Do not treat a fixed
@@ -130,9 +131,11 @@ Cross-contract timing invariants (all enforced at the setters):
 
 - `openReview` — permissionless keeper call once `voteEnd` passes.
 - **Voters:** active staked-WOOD guardians; weight is raw stake
-  (`getPastStake`) at the propose-time snapshot, `propose − 1 s`, with no age
-  discount (`GuardianRegistry.sol:590`). The denominator is total stake at the
-  same instant.
+  (`getPastStake`) at `snapshotAt`, one second before the block in which the
+  proposal entered Pending (the `propose` block, or for a collaborative
+  proposal the last co-proposer approval), with no age discount
+  (`GuardianRegistry.sol:393, 590`). The denominator is total stake at the same
+  instant.
 - Blocked if blocking stake reaches `blockQuorumBps` (default 30%, bounds 10–100%).
 - There is no cohort-size floor: any positive total stake decides its own
   review; only a zero total fails open.

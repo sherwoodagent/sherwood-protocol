@@ -13,7 +13,7 @@
 
 ## 3. Emergency path
 
-- [x] 3.1 `docs/guardian-network.md`: what an unblocked round lets the owner do, the propose-time electorate, the reviewer rule.
+- [x] 3.1 `docs/guardian-network.md`: what an unblocked round lets the owner do, the snapshot electorate, the reviewer rule.
 
 ## 4. Fees, feeds and the queue
 
