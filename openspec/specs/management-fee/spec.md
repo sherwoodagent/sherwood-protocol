@@ -62,19 +62,6 @@ and redemptions are unlocked so depositors may leave freely.
 - **WHEN** an agent stops proposing entirely while depositors remain in the vault
 - **THEN** no management fee accrues for as long as no proposal is live
 
-### Requirement: Strategies that self-manage their fees still pay the management fee
-
-The existing exemption for strategies that collect their own fees SHALL apply to the
-performance leg only. Because the management fee is computed from deployed capital and
-time rather than from realized profit, the profit-measurement problem that motivates the
-exemption does not apply to it.
-
-#### Scenario: A self-managing strategy pays management but not performance
-
-- **WHEN** a proposal whose strategy self-manages fees settles profitably
-- **THEN** the management fee is charged and distributed by the recorded management split,
-  and the governor charges no performance fee
-
 ### Requirement: A recipient that cannot receive payment does not block settlement
 
 If a management-fee recipient reverts or otherwise cannot be paid, settlement SHALL
@@ -116,4 +103,13 @@ through the settlement queue, so no flow can change the base mid-proposal.
 - **WHEN** a proposal whose execute batch moves no capital is executed and later settles
 - **THEN** its management fee is the whole fund's assets at execute times the time it was
   Executed, at the configured rate
+
+### Requirement: No proposal is exempt from either fee
+
+Every settlement SHALL charge the management fee and compute the performance fee the same way, whatever the proposal's strategy reports about itself. No strategy can opt out of either leg.
+
+#### Scenario: Every proposal pays management
+
+- **WHEN** any proposal settles
+- **THEN** the management fee is charged and distributed by the recorded management split, and the performance fee is computed from the high-water mark and the realized profit
 

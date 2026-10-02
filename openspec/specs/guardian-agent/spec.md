@@ -239,22 +239,6 @@ adverse review liquidates its whole position rather than a bounded fraction.
 - **WHEN** required coverage is affordable but above the configured per-proposal ceiling
 - **THEN** the agent abstains
 
-### Requirement: Reviews are discovered from registry events, not configuration
-
-The agent SHALL discover the governor for each proposal from the registry's review-registration
-event, which carries the governor address, and SHALL NOT require a governor to be configured.
-
-Governors are minted per vault by the factory, so any single configured governor address is wrong by
-construction on a multi-vault deployment.
-
-#### Scenario: Second vault's proposal
-- **WHEN** a review opens on a governor the agent has never seen
-- **THEN** the agent resolves that governor from the registration event and evaluates the proposal
-
-#### Scenario: Review-opened carries no governor
-- **WHEN** the agent observes a review-opened event, which identifies only the proposal
-- **THEN** it joins that proposal to its governor using the earlier registration event
-
 ### Requirement: The sanctioned-target set derives from the deployed address book
 
 The agent SHALL treat a call target as known only if it appears in the committed address book for the
@@ -275,8 +259,10 @@ redeploys while core addresses are patched in place.
 ### Requirement: Timing decisions read chain time
 
 Every deadline decision — whether a review is open, whether the late-vote lockout has begun, whether
-the window has closed — SHALL be computed from the chain's block timestamp and the window recorded
-on-chain, never from the agent's local clock.
+the window has closed — SHALL be computed from the registry's pause-adjusted clock for that review
+(`effectiveNowFor(governor, proposalId)`) against the window recorded on-chain (`reviewWindow`),
+never from the agent's local clock and never from the raw block timestamp, which misjudges any review
+that spanned a registry pause.
 
 The fork's clock is advanced deliberately in large steps during simulation, so a local clock diverges
 from chain time by days within a single run.
@@ -292,14 +278,17 @@ from chain time by days within a single run.
 ### Requirement: On-chain review state overrides local state
 
 Before signing any vote the agent SHALL read the review's on-chain state and SHALL NOT vote when the
-chain already records a vote from its address for that proposal.
+chain already records a vote from its address for that proposal. The registry exposes no per-guardian
+vote view, so the agent SHALL reconstruct its prior vote from the registry's `GuardianVoteCast` /
+`GuardianVoteChanged` events (and `getApproverWeights` for an Approve); a same-side re-vote reverts
+`NoVoteChange` on-chain in any case.
 
 The adversary here is the agent's own restart: local progress state can be lost, rolled back, or
 restored from a stale volume, and a duplicate vote wastes gas at best and misrepresents intent at worst.
 
 #### Scenario: Restart with lost local state
 - **WHEN** the agent restarts with an empty state directory and re-observes a review it already voted on
-- **THEN** it reads its existing vote from the chain and does not vote again
+- **THEN** it reads its existing vote from the registry's vote events and does not vote again
 
 #### Scenario: Review already resolved
 - **WHEN** a review has been resolved before the agent reaches it
@@ -351,4 +340,17 @@ one.
 #### Scenario: Non-voting stake makes the quorum unreachable
 - **WHEN** the agent decides to block and the raw snapshot stake of every guardian expected to vote Block is below `blockQuorumBps` of the snapshot total
 - **THEN** it records the quorum as unreachable, and its report distinguishes this from a cleared review
+
+### Requirement: Reviews are discovered from registry events, which carry the governor
+
+The agent SHALL discover the governor for each proposal from the registry's review events —
+`ReviewRegistered(governor, proposalId, voteEnd, reviewEnd)` and `ReviewOpened(governor, proposalId,
+totalStakeAtOpen)` both carry the governor address — and SHALL NOT require a governor to be configured.
+
+Governors are minted per vault by the factory, so any single configured governor address is wrong by
+construction on a multi-vault deployment.
+
+#### Scenario: Second vault's proposal
+- **WHEN** a review opens on a governor the agent has never seen
+- **THEN** the agent resolves that governor from the event and evaluates the proposal
 

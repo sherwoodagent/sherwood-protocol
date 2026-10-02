@@ -65,27 +65,6 @@ transaction wastes.
 - **THEN** it discovers outstanding reviews from registry registration events and bounds its search
   at the registry's deployment block rather than scanning from genesis
 
-### Requirement: A voting identity signs only votes
-
-A guardian identity that holds stake SHALL sign `voteOnProposal` and nothing else, and SHALL NOT open
-or resolve reviews.
-
-The adversary is an operator reasoning about blast radius from an incorrect inventory of what a
-staked key can do. Keeping the two duties on separate keys means the redundantly-run role is provably
-unslashable and the staked role has a signing surface small enough to audit in one line. It also
-removes the gas cost of keeper duty from the identities whose balances gate blockable capacity.
-
-#### Scenario: A voter encounters an unopened review
-
-- **WHEN** a voting identity observes a registered review whose voting window has elapsed but which
-  no keeper has opened
-- **THEN** it reports the gap and does not open the review itself
-
-#### Scenario: A voter encounters an unresolved review past its window
-
-- **WHEN** a voting identity observes an opened review whose review window has elapsed
-- **THEN** it reports the gap and does not call `resolveReview`
-
 ### Requirement: Each guardian identity is an isolated service with its own key
 
 Every voting identity SHALL run as its own service with its own signing key and its own persistent
@@ -140,8 +119,10 @@ only the guardians that approved a blocked proposal are slashed.
 ### Requirement: Fleet health is reported as blockable capacity
 
 The fleet SHALL report whether the guardians that are currently able to act still carry enough weight
-to reach the block quorum, computing weight with the same growth gate the registry applies, and
-counting an identity only when its heartbeat is fresh and its gas balance is funded.
+to reach the block quorum, computing each identity's weight exactly as the registry does — its raw
+stake at the review's snapshot (`getPastStake(identity, snapshotAt)`) against the block quorum over
+`getPastTotalVotes(snapshotAt)` — and counting an identity only when its heartbeat is fresh and its gas
+balance is funded.
 
 The adversary is a fleet that appears healthy while being unable to block anything. Per-instance
 liveness answers whether a process is running, not whether the layer works. Gas belongs in the signal
@@ -150,8 +131,8 @@ from a healthy identity that has seen no reviews.
 
 #### Scenario: Enough identities are down to lose the quorum
 
-- **WHEN** the summed weight of identities with fresh heartbeats and funded balances falls below the
-  block quorum against the current staked total
+- **WHEN** the summed snapshot weight of identities with fresh heartbeats and funded balances falls
+  below the block quorum against the snapshot staked total
 - **THEN** the fleet reports itself as unable to block, distinctly from any individual instance being
   unhealthy
 
@@ -162,24 +143,45 @@ from a healthy identity that has seen no reviews.
 
 ### Requirement: Fleet composition is decided before stake is placed
 
-The fleet's identity count and per-identity stake allocation SHALL be decided before staking, and any
-subsequent reallocation between identities SHALL be treated as reducing total fleet weight for a full
-stake-growth lookback period.
-
-The registry clamps a voter whose raw stake has grown to its value one lookback period earlier. Moving
-stake between identities therefore reduces the source's weight immediately while the destination
-stays clamped to its pre-transfer value, so the fleet's total weight falls by the moved amount until
-the lookback elapses. The adversary is an operator who discovers this by rebalancing during an
-incident and silently loses the ability to block for a month.
+The fleet's identity count and per-identity stake allocation SHALL be decided before staking. Stake
+cannot be moved between identities in part: the source must request unstake in full, which zeroes its
+voting weight at once for every review snapshotted after the request, and its WOOD is released only
+after the cooldown and once its open exposure has run down. The destination counts at full raw weight
+only for reviews whose snapshot falls after it stakes. Rebalancing therefore removes the source's
+whole stake from fleet blocking weight from the request until the destination is staked and new
+reviews are snapshotted, and this SHALL be reported rather than discovered during an incident.
 
 #### Scenario: Stake is moved between two identities
 
-- **WHEN** stake is transferred from one guardian identity to another
-- **THEN** total fleet blocking weight is reduced by the transferred amount until the lookback period
-  elapses, and this is reported rather than discovered later
+- **WHEN** an operator moves stake from one guardian identity to another
+- **THEN** the source's whole stake leaves fleet blocking weight at its unstake request, the
+  destination counts only for reviews snapshotted after it stakes, and the fleet reports the gap
 
 #### Scenario: Adding an identity after staking
 
-- **WHEN** a new identity is funded from existing guardian stake
-- **THEN** it contributes no additional blocking weight until the lookback period elapses
+- **WHEN** a new identity is funded with freshly staked WOOD
+- **THEN** it contributes blocking weight only to reviews whose snapshot falls after its stake
+
+### Requirement: A voting identity signs only guardian votes
+
+A guardian identity that holds stake SHALL sign only guardian votes — `voteOnProposal`,
+`voteBlockEmergencySettle` and `ChallengeGame.voteOnChallenge` — and its own stake management, and
+SHALL NOT call `openReview` or `resolveReview`. The registry opens an unopened review lazily on its
+first vote, so a voter's ballot can open a review; that is a side effect of voting, not keeper duty.
+
+The adversary is an operator reasoning about blast radius from an incorrect inventory of what a
+staked key can do. Keeping keeper duty on separate keys means the redundantly-run role is provably
+unslashable and the staked role has a small, auditable signing surface. It also removes the gas cost of
+keeper duty from the identities whose balances gate blockable capacity.
+
+#### Scenario: A voter encounters an unopened review past its voting deadline
+
+- **WHEN** a voting identity observes a registered review whose voting window has elapsed but which
+  no keeper has opened
+- **THEN** it reports the gap and does not call `openReview`; casting its own vote, if it votes, opens the review on-chain
+
+#### Scenario: A voter encounters an unresolved review past its window
+
+- **WHEN** a voting identity observes an opened review whose review window has elapsed
+- **THEN** it reports the gap and does not call `resolveReview`
 

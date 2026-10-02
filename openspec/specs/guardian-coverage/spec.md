@@ -45,7 +45,7 @@ Exposure SHALL be booked into epoch buckets of immutable width `epochLength` anc
 - **THEN** `openExposure` still returns, because it is pure WOOD arithmetic
 
 ### Requirement: Capped-duration coverage horizon
-The ledger SHALL refuse to book coverage whose settlement (`executeBy + strategyDuration`) lands more than `MAX_COVERAGE_HORIZON = 60 days` past the current time. `requireWithinCoverageHorizon(executeBy, strategyDuration)` SHALL revert `CoverageHorizonExceeded` beyond the horizon and SHALL be called at propose so the error lands on the proposer; at vote time `recordApproval` SHALL book nothing (not revert) for a proposal beyond the horizon. The horizon is expressed in TIME, not epochs, so narrowing the bucket width cannot silently shrink it.
+The ledger SHALL refuse to book coverage whose settlement (`executeBy + strategyDuration`) lands more than `MAX_COVERAGE_HORIZON = 60 days` past the current time. `requireWithinCoverageHorizon(executeBy, strategyDuration)` SHALL revert `CoverageHorizonExceeded` beyond the horizon and SHALL be called at propose so the error lands on the proposer; at vote time `recordApproval` SHALL revert `CoverageHorizonExceeded` for a proposal beyond the horizon, taking the approve vote with it. The horizon is expressed in TIME, not epochs, so narrowing the bucket width cannot silently shrink it.
 
 #### Scenario: Over-horizon proposal at propose
 - **WHEN** a proposal's `executeBy + strategyDuration` exceeds `block.timestamp + 60 days` and the governor calls `requireWithinCoverageHorizon`
@@ -53,21 +53,21 @@ The ledger SHALL refuse to book coverage whose settlement (`executeBy + strategy
 
 #### Scenario: Over-horizon at vote
 - **WHEN** an approve vote reaches `recordApproval` for a proposal whose settlement is beyond the horizon
-- **THEN** the ledger books nothing and returns, leaving the vote itself to succeed
+- **THEN** `recordApproval` reverts `CoverageHorizonExceeded` and the approve vote reverts with it
 
 ### Requirement: Bounded bucket scan
-The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`: the constructor and `setChallengeWindow` SHALL reject any `(challengeWindow, epochLength)` combination where `(challengeWindow + 60 days) / epochLength + 2 > 16`. This bound replaces the former `challengeWindow <= epochLength` rule, freeing bucket width to be tuned for release precision.
+The bucket walk in `openExposure` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`: the constructor and `setChallengeWindow` SHALL reject any `(challengeWindow, epochLength)` combination where `(challengeWindow + 60 days) / epochLength + 2 > 16`. This bound replaces the former `challengeWindow <= epochLength` rule, freeing bucket width to be tuned for release precision.
 
 #### Scenario: Scan-busting parameters rejected
 - **WHEN** a challenge window is proposed that would push the bucket walk past 16 buckets at the current epoch length
 - **THEN** the setter reverts `InvalidParameter`
 
 ### Requirement: Approval release
-`releaseApproval(governor, proposalId, guardian)` SHALL be registry-only, SHALL release exactly the recorded amount from exactly the bucket it was booked into, SHALL be a no-op when nothing is recorded, and SHALL swap-and-pop the guardian out of the approver list in O(1). It SHALL revert `CoverageFrozen` while the proposal's coverage is frozen — a guardian under live challenge may not release and recycle the accused budget.
+`releaseApproval(governor, proposalId, guardian)` SHALL be registry-only, SHALL release exactly the recorded WOOD lock from the epoch bucket the lock currently occupies, SHALL be a no-op when nothing is recorded, and SHALL swap-and-pop the guardian out of the approver list in O(1). It SHALL revert `CoverageFrozen` while the proposal's coverage is frozen — a guardian under live challenge may not release and recycle the accused budget.
 
 #### Scenario: Vote change Approve to Block
 - **WHEN** the registry releases a recorded approval on an unfrozen proposal
-- **THEN** the recorded USD is subtracted from the original bucket and the committed total, the guardian is removed from the approver list, and `ExposureReleased` is emitted
+- **THEN** the recorded WOOD lock is subtracted from the bucket it occupies, the lock record is deleted, the guardian is removed from the approver list, and `ExposureReleased` is emitted
 
 #### Scenario: Release under freeze
 - **WHEN** `releaseApproval` is called while the proposal's coverage is frozen
@@ -93,7 +93,7 @@ The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`
 - **THEN** execution reverts `InsufficientApproveCoverage`; no vote is possible after `reviewEnd`, so the proposal stays Approved until it expires at `executeBy`
 
 ### Requirement: Covered-TVL cap
-`requireWithinCoveredTvlCap(asset, requiredCoverage)` SHALL revert `CoveredTvlCapExceeded` when the USD value of the required coverage exceeds `coveredTvlCapUsd`. The cap SHALL default to zero, which fails closed: nothing can be proposed through a wired governor until governance seeds the cap. The governor SHALL invoke this check at propose.
+`requireWithinCoveredTvlCap(asset, requiredCoverage)` SHALL revert `CoveredTvlCapExceeded` when the USD value of the required coverage exceeds `coveredTvlCapUsd`. The cap SHALL default to zero, which fails closed: nothing with non-zero priced coverage can be proposed through a governor wired to the ledger until governance seeds the cap (a zero-coverage proposal passes). The governor SHALL invoke this check at propose whenever a ledger is wired.
 
 #### Scenario: Unseeded cap
 - **WHEN** `coveredTvlCapUsd` is zero and a coverage-consuming proposal is opened
@@ -119,14 +119,14 @@ The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`
 - **THEN** the per-guardian counters do not drift, and a lock moves again only if the second call's `liveUntil` lies in a later bucket — never earlier
 
 ### Requirement: Freezer rotation refused while anything is frozen
-`setCoverageFreezer` SHALL revert `CoverageFrozen` while `frozenCoverageCount() != 0`, so rotating the role can never orphan a live freeze (whose only clearer is the freezer). Zero SHALL be a legal freezer value — the unwire switch — but only reachable once every live challenge has drained. `frozenCoverageCount` SHALL expose the global count governance sequences a rotation against.
+`setCoverageFreezer` SHALL revert `CoverageFrozen` while `frozenCoverageCount() != 0`, so rotating the role can never orphan a live freeze (whose only clearer is the freezer). It SHALL also refuse a non-zero freezer whose own `challengeWindow` exceeds the ledger's (`InvalidParameter`; `CoverageFreezerUnreadable` when it cannot answer). Zero SHALL be a legal freezer value — the unwire switch — but only reachable once every live challenge has drained. `frozenCoverageCount` SHALL expose the global count governance sequences a rotation against.
 
 #### Scenario: Rotation during a live challenge
 - **WHEN** the owner attempts to change `coverageFreezer` while any proposal's coverage is frozen
 - **THEN** the call reverts `CoverageFrozen`; the rotation is deferred, not forbidden
 
 ### Requirement: Challenge window bounds
-`setChallengeWindow` SHALL reject zero, SHALL enforce the scan bound, and — when a registry is wired — SHALL enforce the floor `challengeWindow >= registry.reviewPeriod() + 7 days` (the maximum governor execution window), so a bucket always outlives the approve-to-execute gap and one bond cannot cover two live drains. `setGuardianRegistry` SHALL re-check the same floor against the incoming registry (tolerantly, when the registry answers `reviewPeriod()`), closing the wiring-order bypass. The window applies retroactively to already-booked buckets: shrinking it frees coverage early, growing it re-counts expired buckets.
+`setChallengeWindow` SHALL reject zero, SHALL enforce the scan bound, and — when a registry is wired and answers `reviewPeriod()` — SHALL enforce the floor `challengeWindow >= registry.reviewPeriod() + 7 days` (the maximum governor execution window), so a bucket always outlives the approve-to-execute gap and one bond cannot cover two live drains. A decrease SHALL additionally be refused below the wired coverage freezer's own `challengeWindow` (`CoverageFreezerUnreadable` when a non-zero freezer cannot answer). `setGuardianRegistry` SHALL re-check the same floor against the incoming registry (tolerantly, when the registry answers `reviewPeriod()`), closing the wiring-order bypass. The window applies retroactively to already-booked buckets: shrinking it frees coverage early, growing it re-counts expired buckets.
 
 #### Scenario: Window below the approve-execute gap
 - **WHEN** the owner sets a challenge window below `reviewPeriod + 7 days` while a registry is wired
@@ -137,11 +137,11 @@ The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`
 - **THEN** `setGuardianRegistry` reverts `InvalidParameter`
 
 ### Requirement: Risk-scaled proposer bond
-`proposerBondWood(asset, requiredCoverage)` SHALL return the WOOD amount of the proposer bond: the coverage's USD value times `proposerBondBps` (default 100 = 1%), converted at `woodPriceX8()`. It SHALL return zero when the bps slice floors to zero USD and SHALL revert (fail closed) when the WOOD price is unset. `setProposerBondBps` SHALL accept only values up to 10_000.
+`proposerBondWood(asset, requiredCoverage)` SHALL return the WOOD amount of the proposer bond: the coverage's USD value times `proposerBondBps` (default 100 = 1%), converted at `woodPriceX8()`. It SHALL return zero, without reading the WOOD price, when the bps slice floors to zero USD, and otherwise SHALL revert (fail closed) when WOOD cannot be priced (`NoWoodPrice`). `setProposerBondBps` SHALL accept only values up to 10_000.
 
 #### Scenario: Bond with unset WOOD price
-- **WHEN** `proposerBondWood` is called with a non-zero USD slice while `woodPriceX8()` is zero
-- **THEN** the call reverts `InvalidParameter`
+- **WHEN** `proposerBondWood` is called with a non-zero USD slice while no source can price WOOD
+- **THEN** the call reverts `NoWoodPrice`
 
 ### Requirement: Exposure cap multiplier
 `kNumerator` (default 1) SHALL scale the per-guardian exposure budget `k × guardianStake`, in WOOD. `setKNumerator` SHALL reject zero. All parameter setters on the ledger SHALL be owner-only and SHALL emit `ParameterChangeFinalized` (or their dedicated event) with old and new values. At `k = 1` the ledger SHALL guarantee containment whenever each convicted approver's lock is at least `minSlashBps` of its slash basis: because `Σ live locks ≤ live stake`, burning one proposal's lock leaves `stake − lock_A ≥ Σ_{j≠A} lock_j`, so a conviction on one proposal leaves every other proposal the guardian backs fully covered. A lock below that floor is slashed at `minSlashBps` of the basis, more than the lock, and can eat into the stake backing the guardian's other locks. Any `k > 1` is deliberate leverage that trades containment away, and the setter's documentation SHALL say so; the adversary is a future operator raising `k` for capital efficiency without understanding that it reintroduces cross-proposal contagion.
