@@ -98,7 +98,7 @@ The clone SHALL support reranging a live position, and the resulting range SHALL
 Because no discretion remains, `rerange()` SHALL be permissionless. It SHALL be admissible only when all of the following hold, and SHALL revert otherwise:
 
 1. The clone is in the Executed state.
-2. The current price has reached or passed the approved trigger fraction of the active range's boundary.
+2. The current price has reached or passed the approved trigger fraction of the active range's boundary, measured as TWAP-tick travel from the active range's midpoint, and that travel is at least one tick spacing whatever the trigger fraction computes to. The range the rerange would derive also differs from the active range: a rerange onto an unchanged range SHALL revert `RerangeTriggerNotReached`. Together these make a second rerange in the same transaction always revert, including when the derived range is clamped at the tick-domain edge (audit 2026-10-01 V2-03).
 3. At least the approved minimum interval has elapsed since execute or the previous rerange.
 4. The rerange count is below the approved maximum.
 5. The spot-vs-TWAP deviation is within the same bound `execute()` enforces.
@@ -120,6 +120,14 @@ Once the maximum rerange count is reached the position SHALL remain in its last 
 #### Scenario: Rerange before the trigger
 - **WHEN** price is still inside the trigger fraction of the range
 - **THEN** the call reverts
+
+#### Scenario: Second rerange in the same transaction
+- **WHEN** a rerange has just succeeded and any caller calls `rerange()` again in the same transaction, with the TWAP unaligned to the tick spacing or the derived range clamped at the tick-domain edge
+- **THEN** the call reverts `RerangeTriggerNotReached`
+
+#### Scenario: Zero-travel rerange from a narrow initial band
+- **WHEN** the initial range is narrower than the policy's half-width and the TWAP has travelled less than one tick spacing from its midpoint
+- **THEN** the call reverts `RerangeTriggerNotReached`
 
 #### Scenario: Rerange inside the minimum interval
 - **WHEN** the minimum interval has not elapsed since the previous rerange

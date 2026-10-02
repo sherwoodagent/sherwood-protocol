@@ -42,6 +42,8 @@ contract MorphoSupplyStrategy is BaseStrategy {
     error MarketNotCreated();
     /// @notice `morpho_` is not a counterparty in the `TierRegistry` the vault's governor names.
     error MorphoNotAllowed(address morpho, address registry);
+    /// @notice The market's oracle, or a collateral token other than the asset, is not an allowed counterparty.
+    error CounterpartyNotAllowed(address counterparty, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no registry at `_initialize`.
     error TierRegistryUnresolved();
     /// @notice Nothing is tunable between execute and settle; `updateParams` always reverts.
@@ -84,6 +86,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
 
         address vaultAsset = IERC4626(vault()).asset();
         if (mp.loanToken != vaultAsset) revert LoanAssetMismatch();
+        _requireAllowedMarket(registry, mp, vaultAsset);
 
         Id id = mp.id();
         if (IMorpho(morpho_).market(id).lastUpdate == 0) revert MarketNotCreated();
@@ -127,6 +130,15 @@ contract MorphoSupplyStrategy is BaseStrategy {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) revert TierRegistryUnresolved();
         if (!_isCounterpartyAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
+        _requireAllowedMarket(registry, _marketParams, asset);
+    }
+
+    /// @dev The market's oracle, and its collateral unless it is the vault asset, are protocol-chosen.
+    function _requireAllowedMarket(address registry, MarketParams memory mp, address vaultAsset) private view {
+        if (!_isCounterpartyAllowed(registry, mp.oracle)) revert CounterpartyNotAllowed(mp.oracle, registry);
+        if (mp.collateralToken != vaultAsset && !_isCounterpartyAllowed(registry, mp.collateralToken)) {
+            revert CounterpartyNotAllowed(mp.collateralToken, registry);
+        }
     }
 
     /// @dev `vault() → governor() → tierRegistry()` walk; `address(0)` when unresolved.

@@ -1132,8 +1132,8 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      deterrent that, because the slot is deleted after any successful
     ///      slash, kept passing forever. What it was deterring is
     ///      `finalizeEmergencySettle`, which runs OWNER-SUPPLIED calldata with
-    ///      EMPTY per-call caps (`BatchExecutorLib` metering off entirely),
-    ///      bounded only by `effectiveMaxCapital` — up to 100% of vault assets.
+    ///      EMPTY per-call caps (`BatchExecutorLib` metering off entirely)
+    ///      and a zero net egress budget.
     ///
     ///      Splitting the two decisions is the fix: the sentinel keeps meaning
     ///      "anyone may OPEN a vault" (`bindOwnerStake` / `prepareOwnerStake` /
@@ -1143,7 +1143,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      already-voted settlement batch with no bond requirement, and the
     ///      route back to a funded slot is `rotateOwner` →
     ///      `transferOwnerStakeSlot`, whose incoming owner may be the outgoing
-    ///      one.
+    ///      one — even while a proposal is open (re-bond after a blocked round).
     ///
     ///      TVL SCALING IS STILL NOT IMPLEMENTED and is deliberately out of
     ///      scope here: a bond proportional to vault assets changes the value

@@ -338,7 +338,7 @@ contract SyndicateVault is
 
     /// @notice Blocks direct `OwnableUpgradeable` owner rotation. The factory's
     ///         `rotateOwner` is the only legal route — it enforces no active or
-    ///         open proposal, owner-stake clear and registry alignment, then calls
+    ///         open proposal (unless re-bonding the same owner), owner-stake clear and registry alignment, then calls
     ///         `rotateOwnership` here. The inherited setters would desync factory
     ///         and registry records and, via `renounceOwnership`, permanently
     ///         orphan the vault.
@@ -464,7 +464,7 @@ contract SyndicateVault is
                 if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);
                 continue;
             }
-            // A zero first argument (`balanceOf(address(0))`) names no spender; resetting it would revert.
+            // Transfers name no spender (zero); resetting address(0) would revert `ERC20InvalidSpender`.
             address spender = AssetCallRules.spenderOf(address(this), calls[i].data);
             if (spender != address(0)) spenders[n++] = spender;
         }

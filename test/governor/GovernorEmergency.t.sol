@@ -17,10 +17,18 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {AssetPuller} from "../mocks/AssetPuller.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry, PermissiveTierRegistry} from "../helpers/TierRegistryFixture.sol";
 import {IStrategyFactory} from "../../src/interfaces/IStrategyFactory.sol";
+
+/// @dev An `AssetPuller` that can hand everything it pulled back to the caller.
+contract AssetBouncer is AssetPuller {
+    function giveBack(address token) external {
+        IERC20(token).transfer(msg.sender, IERC20(token).balanceOf(address(this)));
+    }
+}
 
 /// @title GovernorEmergency.t
 /// @notice Tests for the Task 24 guardian-review emergency settle lifecycle.
@@ -1343,17 +1351,11 @@ contract GovernorEmergencyTest is Test {
         assertEq(usdc.balanceOf(sink), 0, "nothing moved by either attempt");
     }
 
-    /// @notice The spec's rescue story end to end: from the SAME stuck-Executed
-    ///         proposal a settlement-leg cap breach produces, the owner's
-    ///         guardian-reviewed `emergencySettleWithCalls` ->
-    ///         `finalizeEmergencySettle` path succeeds under EMPTY caps —
-    ///         bounded only by the batch-level `maxCapital`, not the
-    ///         declaration that stranded the proposal. This is precisely why
-    ///         the rescue path must accept empty caps (design.md D3): a
-    ///         settlement-leg `CallCapExceeded` is a legitimate reason to
-    ///         need it.
+    /// @notice From a proposal stuck on a settlement-leg `CallCapExceeded`, the emergency path runs under EMPTY caps
+    ///         (a call may move more than its declared cap) but with a zero net egress budget (V1-02): re-running the
+    ///         pull alone reverts `MaxNetOutflowExceeded(1_000e6, 0)`; a batch that pulls and hands back settles.
     function test_capBreach_settleLeg_emergencyRescueSucceedsUnderEmptyCaps() public {
-        address sink = address(new AssetPuller());
+        address sink = address(new AssetBouncer());
         uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
         BatchExecutorLib.Call[] memory settleCalls = _pullCalls(sink, 1_000e6);
         uint256[] memory settleCaps = new uint256[](2);
@@ -1365,17 +1367,29 @@ contract GovernorEmergencyTest is Test {
         vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1_000e6, 500e6));
         governor.settleProposal(pid); // confirms the stuck state this test starts from
 
-        // Owner rescues with the SAME calls (an honest unwind, just re-declared
-        // outside the per-call cap system) via the guardian-reviewed path.
+        // The same calls net vault float out: refused by the zero egress budget.
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, settleCalls);
-        // No guardian block votes cast -> not blocked.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 1_000e6, 0));
+        governor.finalizeEmergencySettle(pid);
+
+        // Pull past the 500e6 cap, then hand it back: empty caps, zero net egress.
+        BatchExecutorLib.Call[] memory rescue = new BatchExecutorLib.Call[](3);
+        rescue[0] = settleCalls[0];
+        rescue[1] = settleCalls[1];
+        rescue[2] = BatchExecutorLib.Call({
+            target: sink, data: abi.encodeCall(AssetBouncer.giveBack, (address(usdc))), value: 0
+        });
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, rescue);
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(owner);
         governor.finalizeEmergencySettle(pid);
 
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(usdc.balanceOf(sink), 1_000e6, "the rescue actually moved the funds");
+        assertEq(usdc.balanceOf(sink), 0, "the call moved past its cap and the batch handed it back");
     }
 
     /// @notice An owner-supplied emergency batch is held to the same structural rules as a
