@@ -13,7 +13,7 @@ Reviews snapshot `blockQuorumBps` and the slash envelope at `openReview`; 30% of
 
 #### Scenario: Fresh cohort blocks
 - **WHEN** six guardians each stake 10,000 WOOD, time advances 1s, the proposal is created, and all six vote Block in its review
-- **THEN** their raw snapshot weight is 60,000 against an 18,000 bar and the proposal is rejected and its approvers slashed
+- **THEN** their raw snapshot weight is 60,000 against an 18,000 bar and the proposal is rejected and any approvers slashed
 
 #### Scenario: Non-voting stake raises the bar
 - **WHEN** another 100,000 WOOD is staked before `propose` and never votes

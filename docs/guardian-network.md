@@ -277,8 +277,10 @@ Two independent axes:
 
 Certification is two-step (owner proposes, anyone executes after the delay if the
 codehash still matches). Revocation is instant: owner `demote`, challenge-driven
-`demoteByChallenge`, or permissionless `poke` on codehash mismatch — and demoting
-any one selector clears the **whole adapter's** allowlist entry.
+`demoteByChallenge`, or permissionless `poke` on codehash mismatch. A demotion
+affects only that `(target, selector)`: it deletes the certification and denies
+the class tier to that address, and leaves the counterparty allowlist untouched
+(`TierRegistry.sol:585-603`).
 
 Known blind spot (documented in-contract): EXTCODEHASH attestation catches
 same-address bytecode swaps, but not proxy implementation swaps or storage rewiring.

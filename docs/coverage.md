@@ -255,7 +255,8 @@ is unwired or older than `WOOD_FEED_MAX_DELAY`, the V3 pool's `liquidity()` is
 below `MIN_V3_LIQUIDITY` or the V2 pair's WETH reserve is below
 `MIN_WETH_RESERVE` at read time, ETH/USD is older than `ETH_USD_MAX_AGE`, the
 vault-asset feed is older than its max delay, or the cap is zero. Propose,
-approve and execute halt on the same outage.
+approve and the execution of any proposal with non-zero required coverage halt
+on the same outage.
 
 - **The challenger's counter.** Both depth floors are read-time checks, so a
   challenger with the capital can add liquidity, file and remove it in one

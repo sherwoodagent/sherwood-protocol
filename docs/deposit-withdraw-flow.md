@@ -102,7 +102,7 @@ games, no price drift between claimants. Deposit requests do not use the stamp.
 
 ### Claim (permissionless per request)
 
-- **Deposit claim:** allowed whenever no proposal is open. The queue reads
+- **Deposit claim:** requires that no proposal is open. The queue reads
   `previewDeposit(assets)` at the live price, pushes the escrowed assets into the
   vault, then the vault mints that many shares to the receiver (`settleDeposit`;
   `VaultWithdrawalQueue.claim`). Auto-delegates voting power.
