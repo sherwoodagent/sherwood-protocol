@@ -123,7 +123,7 @@ games, no price drift between claimants. Deposit requests do not use the stamp.
 ### Cancel
 
 `cancel` on the queue returns the escrowed shares (redeem) or assets (deposit) to
-the owner (`src/queue/VaultWithdrawalQueue.sol:247`), also while the vault is paused.
+the owner (`VaultWithdrawalQueue.cancel`, `src/queue/VaultWithdrawalQueue.sol:243`), also while the vault is paused.
 A redeem cancels only until its proposal is stamped; its payout is then fixed. A
 deposit cancels at any time until it is claimed, including after settlement.
 

@@ -12,7 +12,7 @@
 - **THEN** `woodPriceX8()` reverts `NoWoodPrice`; the cap is not used as a price
 
 ### Requirement: Vote weight is not spendable WOOD and not the slash basis
-`WOOD{voteWeight}` (`getPastVotes`) SHALL be aged own stake: the raw own-stake checkpoint times the age factor. There is no delegated component. It is WOOD-scaled but NOT spendable WOOD and NOT the slash basis. `getPastStake` returns the raw, un-aged trace, and is the weight guardian review and emergency ballots use; subtracting one trace from the other is a basis error.
+`WOOD{voteWeight}` (`getPastVotes`) SHALL be aged own stake: the raw own-stake checkpoint times the age factor. There is no delegated component. It is WOOD-scaled but NOT spendable WOOD and NOT the slash basis. `getPastStake` returns the raw, un-aged trace, and is the weight guardian review, emergency and challenge ballots use; subtracting one trace from the other is a basis error.
 
 #### Scenario: Mixing aged and raw traces
 - **WHEN** code computes `getPastVotes(...) - getPastStake(...)` or otherwise combines the two traces arithmetically
