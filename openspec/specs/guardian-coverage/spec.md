@@ -18,43 +18,6 @@ The ledger SHALL value a guardian's slashable bond in USD (8-decimal price) as `
 - **WHEN** a guardian tops up its stake after the proposal it approved has executed, and a post-execution coverage read (coverage, liability, or slash rate) values that guardian
 - **THEN** the guardian is valued at its stake as of the execution instant (clamped to live), and the top-up moves none of the proposal's coverage figures
 
-### Requirement: WOOD pricing is feed-first with governance fallback
-`woodPriceX8()` SHALL return the Chainlink WOOD/USD feed price normalised to 8 decimals when a feed is wired and healthy, and SHALL fall back to the owner-set `woodUsdPriceX8` — without reverting — when the feed is unset, returns a non-positive answer, is older than its configured `maxDelay`, or reverts. The haircut `woodHaircutBps` SHALL be applied to BOTH the feed price and the fallback price. `woodPriceDetail()` SHALL expose whether the returned price came from the fallback, so monitoring can observe the degraded path.
-
-#### Scenario: Healthy feed
-- **WHEN** a WOOD feed is wired, fresh, and returns a positive answer
-- **THEN** `woodPriceX8()` returns the feed answer normalised to 8 decimals times `woodHaircutBps / 10_000`, and `woodPriceDetail()` reports `usingFallback == false`
-
-#### Scenario: Stale, non-positive, or reverting feed
-- **WHEN** the wired feed is stale beyond `maxDelay`, answers `<= 0`, or reverts
-- **THEN** `woodPriceX8()` returns `woodUsdPriceX8 × woodHaircutBps / 10_000` without reverting, and `woodPriceDetail()` reports `usingFallback == true`
-
-#### Scenario: Feed unwired
-- **WHEN** `setWoodFeed(address(0), 0)` is called by the owner
-- **THEN** the feed is cleared and pricing returns to the governance fallback; a clear with `maxDelay != 0`, or a non-zero feed with `maxDelay == 0`, reverts `InvalidParameter`
-
-### Requirement: Governance WOOD price is rate-limited upward only
-`setWoodUsdPrice` SHALL be owner-only, SHALL reject any update within `1 day` of the previous update (first-ever update exempt), and SHALL reject any upward move above `2×` the current price (recovery from a current price of zero exempt). Downward moves SHALL NOT be bounded — the price exists to absorb a WOOD crash. Zero SHALL remain settable as the emergency stop. Each accepted update SHALL emit `WoodUsdPriceSet`.
-
-#### Scenario: Upward move beyond 2x
-- **WHEN** the owner sets a new price greater than twice the current non-zero price
-- **THEN** the call reverts `InvalidParameter`
-
-#### Scenario: Update inside the interval
-- **WHEN** the owner sets a price less than 1 day after the previous set (and a previous set exists)
-- **THEN** the call reverts `InvalidParameter`, so a zero-then-restore round trip costs at least a day
-
-#### Scenario: Crash response
-- **WHEN** the owner cuts the price by 10x in one update
-- **THEN** the update is accepted (subject only to the interval), so bonds are not left over-valued during a crash
-
-### Requirement: WOOD haircut is bounded and rate-limited
-`setWoodHaircutBps` SHALL be owner-only and SHALL accept only values in `[5_000, 10_000]` bps, rejecting updates within `1 day` of the previous haircut update (first exempt). The haircut default SHALL be `10_000` (no haircut), so wiring a feed alone does not change valuations.
-
-#### Scenario: Haircut below the floor
-- **WHEN** the owner sets a haircut below 5_000 bps or above 10_000 bps
-- **THEN** the call reverts `InvalidParameter`
-
 ### Requirement: Asset coverage pricing fails closed
 `coverageUsd(asset, amount)` SHALL return the USD-18 value of `amount` of `asset` using the registered Chainlink feed, flooring on conversion, and SHALL revert `FeedNotConfigured` when the asset has no registered feed and `StalePrice` when the feed answer is non-positive or older than its `maxDelay`. A proposal in an unpriceable asset cannot be coverage-checked and therefore cannot proceed through any path that requires pricing.
 
@@ -99,32 +62,6 @@ The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`
 - **WHEN** a challenge window is proposed that would push the bucket walk past 16 buckets at the current epoch length
 - **THEN** the setter reverts `InvalidParameter`
 
-### Requirement: Approval recording reserves full coverage per approver
-`recordApproval(governor, proposalId, guardian)` SHALL be callable only by the wired guardian registry and SHALL be idempotent per (proposal, guardian). It SHALL book a RESERVATION of `min(free budget, the proposal's full USD coverage)` — never merely the still-uncovered remainder — where free budget is `kNumerator × slashableBondUsd(guardian) − openExposureUsd(guardian)`. The reservation SHALL be booked into the epoch bucket containing `executeBy + strategyDuration` (floored at the current epoch), added to the proposal's committed total, recorded per-guardian, appended to the ledger's own approver list, and announced via `ExposureRecorded`.
-
-#### Scenario: Successful booking
-- **WHEN** the registry records an approval for a guardian with free budget on a priceable, in-horizon proposal with non-zero coverage
-- **THEN** the guardian's reservation of `min(free, needUsd)` is added to the settlement bucket and the committed total, and the guardian joins the approver list with `ExposureRecorded` emitted
-
-#### Scenario: Unauthorized caller
-- **WHEN** any address other than the wired guardian registry calls `recordApproval` or `releaseApproval`
-- **THEN** the call reverts `NotGuardianRegistry`
-
-#### Scenario: Repeat recording is a no-op
-- **WHEN** `recordApproval` is called again for a (proposal, guardian) that already holds a non-zero recorded exposure
-- **THEN** nothing changes (vote-change round trips cannot double-book)
-
-### Requirement: Booking failures never fail the approve vote
-`recordApproval` SHALL book nothing and return — never revert — when the asset price is unreadable (unconfigured or stale feed), when the proposal's required coverage prices to zero, when the guardian has no free budget (`open >= cap`), or when settlement lies beyond the coverage horizon. The exposure cap is enforced by committing zero and letting the execute-time quorum fail, not by reverting the vote; `ExposureCapExceeded` is retained in the ABI but never thrown.
-
-#### Scenario: Guardian with exhausted budget
-- **WHEN** a guardian whose open exposure already meets or exceeds `kNumerator × slashableBondUsd` casts an approve vote
-- **THEN** the vote succeeds, the ledger books nothing, and the proposal can only execute if other approvers cover it
-
-#### Scenario: Unpriceable asset at vote time
-- **WHEN** the vault asset's feed is unconfigured or stale during an approve vote
-- **THEN** the vote succeeds with nothing booked, so the review is never forced block-only
-
 ### Requirement: Approval release
 `releaseApproval(governor, proposalId, guardian)` SHALL be registry-only, SHALL release exactly the recorded amount from exactly the bucket it was booked into, SHALL be a no-op when nothing is recorded, and SHALL swap-and-pop the guardian out of the approver list in O(1). It SHALL revert `CoverageFrozen` while the proposal's coverage is frozen — a guardian under live challenge may not release and recycle the accused budget.
 
@@ -137,30 +74,23 @@ The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`
 - **THEN** the call reverts `CoverageFrozen`
 
 ### Requirement: Execute-time approve quorum
-`requireApproveQuorum(governor, proposalId, asset, requiredCoverage)` SHALL revert `InsufficientApproveCoverage` unless the covering approvers' aggregate `Σ min(reservation_i, live slashableBondUsd_i)` meets `coverageUsd(asset, requiredCoverage)`. The approver set SHALL come from the ledger's own list, never the registry's. Zero committed approvers SHALL always revert, even at zero priced coverage. The governor SHALL invoke this check at execute for every proposal with a wired ledger, non-zero `requiredCoverage`, and `envelopeTier >= quorumTierThreshold`; zero-`requiredCoverage` proposals keep optimistic passage.
+`requireApproveQuorum(governor, proposalId, asset, requiredCoverage)` SHALL measure coverage and return `(coverageRaisedUsd, requiredCoverageUsd)`, where `requiredCoverageUsd = coverageUsd(asset, requiredCoverage)` and `coverageRaisedUsd` is the covering approvers' running aggregate of `min(lock_i, slashableStakeAt(g_i, now)) × woodPriceX8()`, one price read for the cohort; it MAY stop summing once the aggregate reaches `requiredCoverageUsd`, so a fully covered proposal may report a partial sum. The approver set SHALL come from the ledger's own list, never the registry's. Zero committed approvers SHALL always revert `InsufficientApproveCoverage`, even at zero priced coverage; with approvers listed it SHALL revert `InsufficientApproveCoverage` only when the aggregate is zero and short of the requirement, and otherwise return the aggregate. `NoWoodPrice` and the asset feed's `FeedNotConfigured` / `StalePrice` SHALL propagate. The governor SHALL invoke this check at execute for every proposal with a wired ledger and non-zero `requiredCoverage`, at every tier, and SHALL scale `effectiveMaxCapital` and every per-call cap by `coverageRaisedUsd / requiredCoverageUsd` when the aggregate falls short; zero-`requiredCoverage` proposals skip it.
 
 #### Scenario: Aggregate coverage across a cohort
-- **WHEN** two guardians each hold a live bond worth $600k and both reserved on a $1M-coverage proposal
-- **THEN** the quorum passes on the aggregate — no single approver must cover the proposal alone
+- **WHEN** two guardians each lock WOOD worth $600k at execute on a $1M-coverage proposal
+- **THEN** the aggregate meets the requirement and the proposal executes at full capital
+
+#### Scenario: Partial coverage scales the proposal
+- **WHEN** the covering approvers' aggregate is 80% of `requiredCoverageUsd`
+- **THEN** the call returns it without reverting and the governor executes at 80% of `maxCapital`
 
 #### Scenario: Bond shrank since the vote
-- **WHEN** an approver's live bond (unstake, or a WOOD price fall) is now worth less than its reservation
-- **THEN** it counts at the shrunken live value, so coverage must still hold in dollars at execution
+- **WHEN** an approver's stake (unstake, or a WOOD price fall) is now worth less than its lock
+- **THEN** it counts at the shrunken value
 
 #### Scenario: No covering approver
-- **WHEN** a coverage-consuming proposal at or above the tier threshold reaches execute with no live committed approver
-- **THEN** execution reverts `InsufficientApproveCoverage` and the proposal expires at `executeBy` unless covering approvals arrive
-
-### Requirement: Quorum tier threshold defaults to every tier
-`quorumTierThreshold` SHALL default to `0`, making the approve quorum fail-closed for EVERY envelope tier (ROE validation resolved: the gate passes at tier 0/1 and fails at tier 2, and enforcement below tier 2 is a correctness fix). The owner setter SHALL accept only values `0..3`, where `3` disables the quorum for all tiers. Tier-2 exposure remains admissible on-chain — the proposed on-chain tier ceiling was dropped in favour of off-chain incentives.
-
-#### Scenario: Threshold out of range
-- **WHEN** the owner sets a threshold greater than 3
-- **THEN** the call reverts `InvalidParameter`
-
-#### Scenario: Launch default
-- **WHEN** the ledger is deployed
-- **THEN** `quorumTierThreshold` is 0 without any setter call, so a deployment that forgets configuration still enforces the quorum at every tier
+- **WHEN** a proposal with non-zero required coverage reaches execute with no approver, or with a zero aggregate
+- **THEN** execution reverts `InsufficientApproveCoverage`; no vote is possible after `reviewEnd`, so the proposal stays Approved until it expires at `executeBy`
 
 ### Requirement: Covered-TVL cap
 `requireWithinCoveredTvlCap(asset, requiredCoverage)` SHALL revert `CoveredTvlCapExceeded` when the USD value of the required coverage exceeds `coveredTvlCapUsd`. The cap SHALL default to zero, which fails closed: nothing can be proposed through a wired governor until governance seeds the cap. The governor SHALL invoke this check at propose.
@@ -356,4 +286,56 @@ The ledger SHALL keep each lock in the epoch bucket that matches how long the lo
 #### Scenario: Under-subscribed cohort reports what it can pay
 - **WHEN** approvers' locks are worth $600 against a $1,000 need
 - **THEN** `liabilityUsd` returns $600
+
+### Requirement: WOOD haircut is bounded
+`setWoodHaircutBps` SHALL be owner-only and SHALL accept only values in `[5_000, 10_000]` bps, with no interval between updates. The haircut default SHALL be `10_000` (no haircut).
+
+#### Scenario: Haircut below the floor
+- **WHEN** the owner sets a haircut below 5_000 bps or above 10_000 bps
+- **THEN** the call reverts `InvalidParameter`
+
+### Requirement: Approval recording reverts rather than seat an unbacked approver
+`recordApproval` SHALL revert, taking the approve vote with it, when: the coverage inputs cannot be read (`CoverageInputsUnreadable`); the need cannot be priced (`coverageUsd` reverts `FeedNotConfigured` or `StalePrice`); WOOD cannot be priced (`woodPriceX8()` reverts `NoWoodPrice`); the lock is zero, the guardian's whole-budget valuation is zero, or the lock is worth less than the slot floor (`ApproveLockBelowFloor`); or settlement lies beyond the coverage horizon (`CoverageHorizonExceeded`). The slot floor is `ceil(needUsd / APPROVER_SLOTS)`, or the guardian's whole-budget valuation when that is no larger and fewer than `APPROVER_SLOTS / 2` approvers are booked. So an approve vote reverts during a WOOD-price or vault-asset-feed outage; a block vote makes no ledger call and still lands.
+
+#### Scenario: Guardian with exhausted budget
+- **WHEN** a guardian whose open exposure already meets or exceeds `kNumerator × guardianStake` casts an approve vote
+- **THEN** the vote reverts `ApproveLockBelowFloor`
+
+#### Scenario: Unpriceable asset at vote time
+- **WHEN** the vault asset's feed is unconfigured or stale during an approve vote
+- **THEN** the vote reverts with the feed's error
+
+#### Scenario: Unpriceable WOOD at vote time
+- **WHEN** the WOOD feed is unwired or stale, or the cap is zero, during an approve vote
+- **THEN** the vote reverts `NoWoodPrice`, while a block vote on the same review lands
+
+### Requirement: WOOD is priced by the feed, capped by governance, with no fallback
+`woodPriceX8()` SHALL return `haircut(min(feedX8, woodUsdPriceX8))`, floored at 1, where `feedX8` is the wired WOOD/USD feed's answer normalised to 8 decimals. `woodUsdPriceX8` SHALL be an upper cap only and SHALL never be served as a price. `woodPriceX8()` SHALL revert `NoWoodPrice` when the cap is zero or when the feed is unset, codeless, reverts, returns malformed data, answers `<= 0`, normalises to zero, or is older than its configured `maxDelay`. There is no fallback price and no detail view.
+
+#### Scenario: Healthy feed below the cap
+- **WHEN** a WOOD feed is wired, fresh, positive, and below `woodUsdPriceX8`
+- **THEN** `woodPriceX8()` returns the feed answer normalised to 8 decimals times `woodHaircutBps / 10_000`
+
+#### Scenario: Cap below the feed
+- **WHEN** `woodUsdPriceX8` is below the feed's answer
+- **THEN** `woodPriceX8()` returns the cap times `woodHaircutBps / 10_000`, so every bond is valued at the cap
+
+#### Scenario: Stale, non-positive, or reverting feed
+- **WHEN** the wired feed is stale beyond `maxDelay`, answers `<= 0`, or reverts
+- **THEN** `woodPriceX8()` reverts `NoWoodPrice`
+
+#### Scenario: Feed unwired
+- **WHEN** `setWoodFeed(address(0), 0)` is called by the owner
+- **THEN** the feed is cleared and every price read reverts `NoWoodPrice`; a clear with `maxDelay != 0`, or a non-zero feed with `maxDelay == 0`, reverts `InvalidParameter`
+
+### Requirement: The WOOD price cap has no on-chain rate limit
+`setWoodUsdPrice` SHALL be owner-only and SHALL accept any value at any time, with no interval and no size ceiling; rate limiting is enforced off-chain by a Zodiac module on the owner Safe (see the deployment-docs capability). Zero SHALL remain settable as a hard stop: with a zero cap every price read reverts `NoWoodPrice`. Each update SHALL emit `WoodUsdPriceSet`.
+
+#### Scenario: Large raise in one call
+- **WHEN** the owner raises the cap tenfold in one call
+- **THEN** the call succeeds
+
+#### Scenario: Crash response
+- **WHEN** the owner cuts the cap tenfold in one call
+- **THEN** the update is accepted at once, so bonds are not left over-valued during a crash
 

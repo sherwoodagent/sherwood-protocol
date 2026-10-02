@@ -12,7 +12,6 @@ what the vault looks like after settlement, rather than by recognising target ad
 the decoder's ABI catalogue is not a gap in the review. Approve is reachable only through
 deterministic evaluation and only within underwriting capacity; every unavailable input fails toward
 not-approving.
-
 ## Requirements
 ### Requirement: Proposals are simulated through the governor's own entrypoints
 
@@ -306,20 +305,6 @@ restored from a stale volume, and a duplicate vote wastes gas at best and misrep
 - **WHEN** a review has been resolved before the agent reaches it
 - **THEN** the agent records the outcome and casts no vote
 
-### Requirement: A block that cannot reach quorum is reported, not cast
-
-When the agent determines a proposal should be blocked, it SHALL compute whether the achievable
-block weight at review-open can reach the snapshotted block quorum, and when it cannot, SHALL record
-that the quorum is unreachable rather than reporting a successful defence.
-
-The quorum denominator is raw staked weight while the numerator is age-weighted, so a sufficiently
-young cohort cannot block regardless of participation. Silently casting a doomed vote would present
-an undefended protocol as a defended one.
-
-#### Scenario: Cohort too young to block
-- **WHEN** the agent decides to block and the cohort's age-weighted ceiling is below the block quorum
-- **THEN** it records the quorum as unreachable, and its report distinguishes this from a cleared review
-
 ### Requirement: The guardian agent is independent of the proposing agent
 
 The guardian agent SHALL run as its own process with its own signing key, and SHALL NOT share a
@@ -348,4 +333,22 @@ the model — the agent SHALL resolve to Block or Abstain, and SHALL NOT resolve
 #### Scenario: RPC endpoint gone
 - **WHEN** the configured RPC returns not-found, as an expired vnet does
 - **THEN** the agent reports the endpoint as gone and retries, without exiting or casting votes
+
+### Requirement: A block that cannot reach the snapshot quorum is reported, not cast
+
+When the agent determines a proposal should be blocked, it SHALL compute whether the achievable
+block weight can reach the snapshotted block quorum, and when it cannot, SHALL record that the
+quorum is unreachable rather than reporting a successful defence.
+
+Both sides are measured at the proposal's snapshot `snapshotAt`, one second before the block in which
+it entered Pending: the
+denominator is `getPastTotalVotes(snapshotAt)` and each ballot is the voter's raw
+`getPastStake(voter, snapshotAt)`, with no age discount. Stake counted at `snapshotAt` that does not vote
+still counts in the denominator, so a cohort outweighed by non-voting stake cannot block regardless
+of participation. Silently casting a doomed vote would present an undefended protocol as a defended
+one.
+
+#### Scenario: Non-voting stake makes the quorum unreachable
+- **WHEN** the agent decides to block and the raw snapshot stake of every guardian expected to vote Block is below `blockQuorumBps` of the snapshot total
+- **THEN** it records the quorum as unreachable, and its report distinguishes this from a cleared review
 

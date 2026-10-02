@@ -213,16 +213,18 @@ stamped, and its only exit is the queue's `cancel`.
 
 When the governor notifies settlement via `onProposalSettled(pid)` (governor-only),
 the vault SHALL stamp one frozen settle price into the queue: `num = totalAssets() +
-1`, `den = totalSupply() + 10^decimalsOffset`, reproducing ERC-4626 conversion
-rounding exactly; on a queueless vault the call SHALL be a no-op. The queue SHALL
-accept at most one stamp per proposal id (`AlreadySettled` on re-stamp) and SHALL, at
-stamp time, reserve `mulDiv(queuedRedeemShares(pid), num, den)` assets for that
-proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
+1`, `den = _pricingSupply() + 10^decimalsOffset`, where `_pricingSupply()` is
+`totalSupply()` minus the shares of earlier stamped-but-unclaimed redeems (whose
+assets `totalAssets()` already excludes); on a queueless vault the call SHALL be a
+no-op. The queue SHALL accept at most one stamp per proposal id (`AlreadySettled` on
+re-stamp, `StampOutOfOrder` for a proposal id below the last stamped one) and SHALL, at stamp time, reserve `mulDiv(queuedRedeemShares(pid), num,
+den)` assets for that proposal's queued redemptions, adding it to the aggregate
+`reservedAssets`.
 
 #### Scenario: One frozen price per proposal
 
 - **WHEN** a proposal settles with queued requests tagged to it
-- **THEN** every request tagged to that proposal claims against a single stamped
+- **THEN** every redeem request tagged to that proposal claims against a single stamped
   `num/den`, and a second stamp for the same pid reverts
 
 #### Scenario: Reserve created at stamp
@@ -230,21 +232,6 @@ proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
 - **WHEN** a proposal with queued redeem shares is stamped
 - **THEN** `reservedAssets` increases by the aggregate asset value of those shares at
   the stamped price
-
-### Requirement: Claiming settled requests
-`claim(requestId)` SHALL be permissionless, SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and the vault to be unlocked (`VaultLocked` while a proposal is active), and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim SHALL mint `mulDiv(assets, den, num)` shares priced at the LATEST stamped settlement (not the request's own pid), pushing the escrowed assets into the vault immediately before the queue-only `settleDeposit` mint — pricing at the request's own pid would grant depositors a free look-back option across later settlements.
-
-#### Scenario: Redeem claim at frozen price
-- **WHEN** a settled redeem request is claimed
-- **THEN** the escrowed shares are burned, the owner receives assets at the request's own stamped price, and `RequestClaimed` is emitted
-
-#### Scenario: Deposit claim priced at latest stamp
-- **WHEN** a deposit request tagged to proposal N is claimed after proposal N+1 has also stamped
-- **THEN** shares are minted at proposal N+1's (latest) stamped price
-
-#### Scenario: No claims mid-proposal
-- **WHEN** a later proposal is active at claim time
-- **THEN** `claim` reverts `VaultLocked`
 
 ### Requirement: Reserve release and remainder path
 Each redeem claim SHALL release reserve: partial claims release exactly their floored payout, and the claim that empties a proposal's remaining queued shares SHALL release that proposal's entire remaining reservation — including the `floor(Σ) − Σfloor` rounding remainder — so aggregate `reservedAssets` never accumulates phantom dust that would over-restrict withdrawals or brick governor batches.
@@ -528,4 +515,23 @@ For every governor-batch call whose `target` is `asset()`: calldata shorter than
 #### Scenario: Approve-then-drain in a later block is impossible
 - **WHEN** a batch approves `attacker` for `type(uint256).max` and no call pulls
 - **THEN** in the next block `asset.transferFrom(vault, attacker, 1)` by `attacker` reverts for insufficient allowance
+
+### Requirement: Claiming queued requests
+`claim(requestId)` SHALL be permissionless and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and redemptions to be unlocked (`VaultLocked` while any proposal is open, Draft included), and SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim SHALL require that deposits are unlocked (`VaultLocked` while any proposal is open); it carries no stamped price and SHALL mint `previewDeposit(assets)` shares at the live price read before the escrowed assets are pushed into the vault (`ZeroShares` if that rounds to zero), then the queue-only `settleDeposit` mints them. `settleDeposit` SHALL revert while the vault is paused and when the receiver fails the depositor whitelist rule (`NotApprovedDepositor`); the receiver recovers the assets with `cancel`.
+
+#### Scenario: Redeem claim at frozen price
+- **WHEN** a settled redeem request is claimed
+- **THEN** the escrowed shares are burned, the owner receives assets at the request's own stamped price, and `RequestClaimed` is emitted
+
+#### Scenario: Deposit claim priced live
+- **WHEN** a deposit request is claimed while no proposal is open
+- **THEN** shares are minted at `previewDeposit(assets)` read immediately before the assets reach the vault, whatever proposal the request was tagged to
+
+#### Scenario: No claims mid-proposal
+- **WHEN** a later proposal is open at claim time, Draft included
+- **THEN** `claim` reverts `VaultLocked`
+
+#### Scenario: Deposit claim refused while paused
+- **WHEN** a deposit request is claimed while the vault is paused
+- **THEN** the claim reverts and the receiver can `cancel` the request
 

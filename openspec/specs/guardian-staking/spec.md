@@ -84,22 +84,22 @@ A guardian SHALL be active if and only if `stakedAmount > 0` and no unstake requ
 
 ### Requirement: Age-weighted vote weight
 
-A guardian's vote weight SHALL be its raw votable own-stake checkpoint discounted by a linear age factor: the factor ramps from `ageFloorBps` (bps of raw stake) at age 0 to par (10,000 bps) at `maturationPeriod`, then plateaus at par. Age is measured from the `stakedAt` anchor AS OF THE READ TIMESTAMP: sWOOD SHALL checkpoint the anchor (timestamp-keyed trace, pushed in the same transaction as every anchor write — first stake, top-up re-anchor, unstake request) and `getPastVotes(guardian, ts)` SHALL return `rawOwnCheckpoint(ts) * ageFactorBps(anchorCheckpoint(ts), ts) / 10_000`. Historical reads are therefore exact: a later top-up or re-anchor can neither inflate nor deflate an already-past read (the former live-anchor saturation, "deflation-only drift", is removed). A read at a timestamp before the guardian's first anchor checkpoint sees an empty trace (anchor 0) and a zero raw checkpoint, and returns 0. `getVotes(account)` SHALL return the live equivalent (`getPastVotes` at the current timestamp), which is unchanged: at the current timestamp the checkpointed anchor IS the live anchor. Weight MUST never exceed raw stake at the same timestamp. A guardian with a pending unstake request has a zero votable checkpoint and therefore zero weight. The age factor's `ageFloorBps` / `maturationPeriod` parameters are read live at evaluation time, for historical reads as for current ones — parameter changes re-price history identically to today; the anchor trace does not change that.
+`getPastVotes` SHALL be the age-weighted read: a guardian's raw votable own-stake checkpoint discounted by a linear age factor that ramps from `ageFloorBps` (bps of raw stake) at age 0 to par (10,000 bps) at `maturationPeriod`, then plateaus at par. No contract reads it: guardian review votes, emergency block votes and challenge votes weigh the raw `getPastStake` (see "Distinct vote-read bases"); it serves off-chain Snapshot reads. Age is measured from the `stakedAt` anchor AS OF THE READ TIMESTAMP: sWOOD SHALL checkpoint the anchor (timestamp-keyed trace, pushed in the same transaction as every anchor write — first stake, top-up re-anchor, unstake request) and `getPastVotes(guardian, ts)` SHALL return `rawOwnCheckpoint(ts) * ageFactorBps(anchorCheckpoint(ts), ts) / 10_000`. Historical reads are therefore exact: a later top-up or re-anchor can neither inflate nor deflate an already-past read. A read at a timestamp before the guardian's first anchor checkpoint sees an empty trace (anchor 0) and a zero raw checkpoint, and returns 0. `getVotes(account)` SHALL return the live equivalent (`getPastVotes` at the current timestamp): at the current timestamp the checkpointed anchor IS the live anchor. Weight MUST never exceed raw stake at the same timestamp. A guardian with a pending unstake request has a zero votable checkpoint and therefore zero weight. The age factor's `ageFloorBps` / `maturationPeriod` parameters are read live at evaluation time, for historical reads as for current ones.
 
 #### Scenario: Fresh stake votes at the floor
 
 - **WHEN** a guardian's stake was anchored at the read timestamp (age 0)
-- **THEN** its vote weight is `ageFloorBps` of its raw checkpointed stake
+- **THEN** its `getPastVotes` weight is `ageFloorBps` of its raw checkpointed stake
 
 #### Scenario: Matured stake votes at par
 
 - **WHEN** the stake's age at the read timestamp is at least `maturationPeriod`
-- **THEN** its vote weight equals its raw checkpointed stake
+- **THEN** its `getPastVotes` weight equals its raw checkpointed stake
 
 #### Scenario: A later top-up does not deflate an earlier read
 
 - **WHEN** a guardian stakes, a snapshot timestamp `ts` passes, the guardian tops up (re-anchoring the live `stakedAt` forward past what it was at `ts`), and `getPastVotes(g, ts)` is then evaluated
-- **THEN** the result uses the anchor as it stood at `ts` — the same value the read would have returned before the top-up — not the re-anchored live value that previously saturated the age toward the floor
+- **THEN** the result uses the anchor as it stood at `ts` — the same value the read would have returned before the top-up
 
 #### Scenario: Unstake-requested guardian has zero weight
 
@@ -112,11 +112,15 @@ A guardian's vote weight SHALL be its raw votable own-stake checkpoint discounte
 - **THEN** the result is 0 — the raw trace is empty there, and the empty anchor trace cannot manufacture weight
 
 ### Requirement: Distinct vote-read bases — aged, raw, and total
-sWOOD SHALL expose three deliberately distinct historical reads. `getPastVotes` is the AGE-WEIGHTED per-guardian weight (correct for weighing a vote). `getPastStake(guardian, ts)` is the RAW votable own-stake checkpoint — the same basis `getPastTotalVotes` sums, so the two are comparable and subtractable; it reads the checkpoint directly with no live, re-anchorable factor, denying an accused approver the lever of requesting unstake to shrink its own contribution to a participation floor. `getPastTotalVotes(ts)` (and its alias `getPastTotalSupply(ts)`) SHALL return the raw total-active-stake checkpoint: totals stay RAW because aging only shrinks numerators, so the raw denominator is a conservative (upper-bound) quorum denominator — the aged per-account weights sum to at most the total. `getPastVotes` is NOT a term of `getPastTotalVotes`; consumers subtracting from the total MUST use `getPastStake`. sWOOD SHALL NOT implement the full OZ `IVotes` interface (no `delegate`/`delegates`/`delegateBySig`); the read surface exists for Snapshot's `erc20-votes` strategy and on-chain consumers.
+sWOOD SHALL expose three deliberately distinct historical reads. `getPastVotes` is the AGE-WEIGHTED per-guardian weight; no contract reads it. `getPastStake(guardian, ts)` is the RAW votable own-stake checkpoint — the same basis `getPastTotalVotes` sums, so the two are comparable and subtractable; it reads the checkpoint directly with no live, re-anchorable factor. `GuardianRegistry` weighs every guardian review vote and every emergency block vote with `getPastStake` at the proposal's snapshot (`snapshotAt`, one second before the block in which the proposal entered Pending; the emergency round stores it as `openedAt`, falling back to one second before the round opened for a review registered without a snapshot), against `getPastTotalVotes` at the same instant, so stake checkpointed at a timestamp strictly earlier than that block's votes at full weight. `ChallengeGame.voteOnChallenge` weighs a ballot as `min(getPastStake(voter, filedAt - 1), getPastStake(voter, snapshotAt))`, and `ChallengeGame.file` subtracts the accused cohort from `getPastTotalVotes(filedAt - 1)` with `getPastStake`, the same raw basis the total sums. `getPastTotalVotes(ts)` (and its alias `getPastTotalSupply(ts)`) SHALL return the raw total-active-stake checkpoint; the aged per-account weights sum to at most the total. `getPastVotes` is NOT a term of `getPastTotalVotes`; consumers subtracting from the total MUST use `getPastStake`. sWOOD SHALL NOT implement the full OZ `IVotes` interface (no `delegate`/`delegates`/`delegateBySig`); the read surface exists for Snapshot's `erc20-votes` strategy and on-chain consumers.
 
 #### Scenario: Raw and aged reads diverge on young stake
 - **WHEN** a guardian's stake is younger than `maturationPeriod` at timestamp `ts`
 - **THEN** `getPastStake(g, ts)` returns the full raw checkpoint while `getPastVotes(g, ts)` returns the age-discounted fraction
+
+#### Scenario: Review ballots are raw
+- **WHEN** a guardian staked 30,000 WOOD at a timestamp strictly earlier than the `propose` block and votes Block in that proposal's review or emergency round
+- **THEN** its ballot weighs 30,000, not the age-discounted `getPastVotes` figure; a challenge ballot on that proposal is likewise raw
 
 #### Scenario: Conservative quorum denominator
 - **WHEN** any set of guardians' aged weights (`getPastVotes`) at `ts` are summed

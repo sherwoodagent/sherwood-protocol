@@ -3,9 +3,7 @@
 ## Purpose
 
 The dimensional vocabulary for the guardian / insurance layer, expressed as enforceable conventions. Every bug this vocabulary exists to expose has one shape: two quantities of identical Solidity type and precision where only one is correct, with no compiler check between them (`USD18{reserved}` vs `USD18{allocated}`; `WOOD{votable}` vs `WOOD{liability}`; the raw governance WOOD scalar vs the feed-composed price; vote weight vs raw stake). Where this spec disagrees with the source code, the code wins — this is a reading of the code, not a check the code is run against. Anchors are symbol names, never line numbers.
-
 ## Requirements
-
 ### Requirement: Notation
 Dimensional annotations SHALL use the form `<PREFIX>{<unit>}` — e.g. `D18{USD}` is a USD amount carried as an integer scaled by `1e18`. A brace tag after a unit (`USD18{reserved}`) SHALL mark a SEMANTIC subtype: same integer scale, NOT interchangeable with sibling subtypes.
 
@@ -98,11 +96,15 @@ The derived USD quantities SHALL compose as follows, and substitutions between r
 - **THEN** the comparison is invalid — the need is feed-live and must be re-derived at each consumption point
 
 ### Requirement: The composed WOOD price and the raw scalar are different quantities
-`D8{USD/WOOD}` (`priceX8`) SHALL be the WOOD price normalized to 8 decimals via `(uint256(answer) * 1e8) / (10 ** f.feedDecimals)`, then multiplied by `woodHaircutBps / 10_000`. `woodPriceX8()` is feed-first with the governance-set `woodUsdPriceX8` as the degraded fallback. The raw storage scalar `woodUsdPriceX8` (a conservative governance floor) and the composed `woodPriceX8()` (feed-derived, haircut-applied) are DIFFERENT QUANTITIES at the same precision and SHALL NOT be substituted: `ChallengeGame.file` prices the challenger bond with `woodPriceX8()` so the bond and the slash rails share a basis — it previously read the raw scalar, and that mismatch was the bug.
+`D8{USD/WOOD}` (`priceX8`) SHALL be the WOOD price normalized to 8 decimals via `(uint256(answer) * 1e8) / (10 ** f.feedDecimals)`. `woodPriceX8()` SHALL be `haircut(min(feedX8, woodUsdPriceX8))`, floored at 1: the governance-set `woodUsdPriceX8` is an UPPER CAP only. It is never served as a price and there is no fallback: a stale, unset or non-positive feed, or a zero cap, reverts `NoWoodPrice`. A cap set below market binds on every read and understates every bond valued at `woodPriceX8()`. The raw storage scalar `woodUsdPriceX8` and the composed `woodPriceX8()` (feed-derived, capped, haircut-applied) are DIFFERENT QUANTITIES at the same precision and SHALL NOT be substituted: `ChallengeGame.file` prices the challenger bond with `woodPriceX8()` so the bond and the slash rails share a basis — it previously read the raw scalar, and that mismatch was the bug.
 
 #### Scenario: Bond priced off the raw scalar
 - **WHEN** any slash-coupled figure reads `woodUsdPriceX8` directly instead of `woodPriceX8()`
 - **THEN** the bond and the slash rails diverge whenever the feed is live — the composed accessor is the only valid basis
+
+#### Scenario: No market source
+- **WHEN** the WOOD feed is stale or unset while `woodUsdPriceX8` is non-zero
+- **THEN** `woodPriceX8()` reverts `NoWoodPrice`; the cap is not used as a price
 
 ### Requirement: Feed prices use the feed's own decimals
 `Dn{USD/TOK}` — a raw Chainlink `answer` — SHALL be interpreted at the feed's own `decimals()` (`AssetFeed.feedDecimals`, `PortfolioStrategy._priceDecimals`). 18 or 8 SHALL NEVER be assumed: `PortfolioStrategy` supports 8 (tokenized stocks) and 18 (crypto).
@@ -140,11 +142,11 @@ The `{ASSET}/{SHARE}` vault conversion rate SHALL be materialized as the frozen 
 - **THEN** its aged weight is `ageFloorBps / 10_000` of raw stake, growing linearly to full weight at maturation
 
 ### Requirement: Vote weight is not spendable WOOD and not the slash basis
-`WOOD{voteWeight}` (`getPastVotes`) SHALL be aged own stake plus delegated inbound, capped at `delegatedWeightCapX × agedOwn`. It is WOOD-scaled but NOT spendable WOOD and NOT the slash basis. `getPastStake` returns the raw, un-aged trace; subtracting one from the other is a basis error.
+`WOOD{voteWeight}` (`getPastVotes`) SHALL be aged own stake: the raw own-stake checkpoint times the age factor. There is no delegated component. It is WOOD-scaled but NOT spendable WOOD and NOT the slash basis. `getPastStake` returns the raw, un-aged trace, and is the weight guardian review, emergency and challenge ballots use; subtracting one trace from the other is a basis error.
 
 #### Scenario: Mixing aged and raw traces
 - **WHEN** code computes `getPastVotes(...) - getPastStake(...)` or otherwise combines the two traces arithmetically
-- **THEN** it is a basis error — one is aged-and-capped, the other raw
+- **THEN** it is a basis error — one is aged, the other raw
 
 ### Requirement: Liability and votable checkpoints are distinct traces
 `WOOD{liability}` and `WOOD{votable}` SHALL be maintained as two distinct checkpoint traces on the same guardian: `_liabilityCheckpoints` is NOT zeroed by `requestUnstakeGuardian`; `_stakeCheckpoints` is. `_slashOne` SHALL take `Math.max` of the two. Substituting the votable trace for the liability trace is the PR #25 F1b bug — an exiting guardian would escape a slash it already owed.
@@ -170,3 +172,4 @@ The precision vocabulary SHALL be: `D6` = `1e6` (USDC/USDT native decimals); `D8
 #### Scenario: Static scale where Dn is required
 - **WHEN** a conversion hard-codes `1e8` for a feed whose `decimals()` is dynamic
 - **THEN** it is the Sherlock #21/#29 bug class — the scale must come from the runtime `decimals()` read
+
