@@ -29,9 +29,9 @@ flowchart TD
     S -- yes --> Q1["requestDeposit(assets)\nassets escrowed IN QUEUE\n(never swept to strategy)"]
     Q1 --> QW[VaultWithdrawalQueue\nholds escrow]
     P6 -. stampSettlement .-> QW
-    QW --> C1["claim: shares minted at\nfrozen post-fee settle price"]
+    QW --> C1["claim: shares minted at\nlive price (previewDeposit)"]
     C1 --> SH
-    Q1 -. before settlement .-> C0[cancel: assets returned]
+    Q1 -. until claimed .-> C0[cancel: assets returned]
 
     %% ---- exit: instant ----
     SH --> E{Strategy live?}
@@ -54,7 +54,8 @@ flowchart TD
 - Gate 1 — whitelist: `receiver` must be approved unless the vault is in
   open-deposit mode (`_openDeposits`). Owner manages via `approveDepositor(s)` /
   `setOpenDeposits`.
-- Gate 2 — `_depositsLocked()` must be false (no proposal past execution).
+- Gate 2 — `depositsLocked()` must be false (no open proposal: it reads the
+  governor's `openProposalCount()`).
 - Shares minted at current NAV; the fund's first deposit seeds the performance
   high-water mark; shares auto-delegate to the receiver so depositors get voting
   power without a separate transaction.
@@ -67,9 +68,9 @@ flowchart TD
 - `maxWithdraw`/`maxRedeem` report the true instant capacity (0 while locked), so
   ERC-4626 integrators never propose an impossible exit.
 
-## Locked path (strategy live)
+## Locked path (any proposal open)
 
-The moment `executeProposal` runs, `_activeProposal` is set:
+From `propose` until the proposal settles or ends (`openProposalCount() != 0`):
 
 - `deposit`/`mint` revert `DepositsLocked` (`src/SyndicateVault.sol:1340`).
 - `maxWithdraw`/`maxRedeem` return 0; `withdraw`/`redeem` are closed.
@@ -95,15 +96,16 @@ Both directions run through the per-vault `VaultWithdrawalQueue`:
 At `settleProposal`, after both fees are charged and the high-water mark ratchets,
 the governor calls `onProposalSettled` → `queue.stampSettlement(pid, num, den)`
 (`src/SyndicateVault.sol:1527`). `num/den` carry the vault's ERC-4626 virtual
-offsets, so the queue reproduces the vault's rounding exactly. Every request tagged
-to that proposal claims at this **single frozen post-fee price** — no ordering
-games, no price drift between claimants.
+offsets, so the queue reproduces the vault's rounding exactly. Every redeem request
+tagged to that proposal claims at this **single frozen post-fee price** — no ordering
+games, no price drift between claimants. Deposit requests do not use the stamp.
 
 ### Claim (permissionless per request)
 
-- **Deposit claim:** queue pushes the escrowed assets into the vault, then the vault
-  mints shares to the receiver at the frozen price (`settleDeposit`,
-  `src/SyndicateVault.sol:1517`). Auto-delegates voting power. The claim reverts
+- **Deposit claim:** requires that no proposal is open. The queue reads
+  `previewDeposit(assets)` at the live price, pushes the escrowed assets into the
+  vault, then the vault mints that many shares to the receiver (`settleDeposit`;
+  `VaultWithdrawalQueue.claim`). Auto-delegates voting power. The claim reverts
   while the vault is paused, and for a receiver that no longer passes the depositor
   whitelist rule; the receiver can `cancel` the request instead.
 - **Redeem claim:** vault burns the escrowed shares and pays assets to the owner at
@@ -114,9 +116,9 @@ games, no price drift between claimants.
 ### Cancel
 
 `cancel` on the queue returns the escrowed shares (redeem) or assets (deposit) to
-the owner (`src/queue/VaultWithdrawalQueue.sol:258`), also while the vault is paused.
-A queued redeem's cancel shuts once its proposal settles — its payout is then fixed.
-A queued deposit stays cancellable until it is claimed.
+the owner (`src/queue/VaultWithdrawalQueue.sol:247`), also while the vault is paused.
+A redeem cancels only until its proposal is stamped; its payout is then fixed. A
+deposit cancels at any time until it is claimed, including after settlement.
 
 ## Why this design
 
@@ -144,6 +146,5 @@ A queued deposit stays cancellable until it is claimed.
 | Situation | Entry | Exit |
 |---|---|---|
 | No proposal open | instant `deposit` | instant `withdraw` up to idle float |
-| Proposal in vote/review (not yet executed) | instant `deposit` | instant `withdraw` |
-| Strategy live (executed, not settled) | `requestDeposit` → claim after settle | `requestRedeem` → claim after settle |
-| Worst-case wait while live | — | `strategyDuration` remainder (≤ 30 d default cap), then permissionless settle |
+| Any proposal open (from `propose` to settle or a terminal state) | `requestDeposit` → claim once nothing is open and the vault is unpaused and the receiver is still an approved depositor | `requestRedeem` → claim after settle |
+| Worst-case wait while live | — | `strategyDuration` remainder (≤ 30 d default cap), then permissionless settle — unless the settle fails: below the proposal's drawdown floor (closable by the owner's `unstick`, which applies `MAX_STAMP_DRAWDOWN_BPS`, a 90% drawdown allowance, i.e. a floor at 10% of the execute-time price per share, or by the bonded emergency path) or on a reverting leg (only the bonded emergency path); or the owner pauses the vault, which blocks every settle path and which only the owner can lift |
