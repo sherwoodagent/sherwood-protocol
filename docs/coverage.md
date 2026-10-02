@@ -123,10 +123,10 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **Slash = the lock, under the stake envelope.** `slashBpsFor` returns each
   approver's lock over their slash basis, in bps, rounded up (saturating at
   10_000 when the lock meets or exceeds the basis). `StakedWood` then clamps
-  that rate into `[minSlashBps, maxSlashBps]` and burns `min(lock, basis)`. The
-  basis is `min(stake at the anchor, live stake)`: `openedAt` on the review path
-  (the at-open checkpoint from pashov #11, clamped to live so a concurrent slash
-  is not double-counted) and `executedAt` on the verdict path. Denominating on
+  that rate into `[minSlashBps, maxSlashBps]` and burns the clamped rate of the basis (at least
+  `minSlashBps` of it). The basis is `min(max(stake, liability) checkpoint at the
+  anchor, live stake)`: `openedAt` on the review path (clamped to live so a
+  concurrent slash is not double-counted) and `executedAt` on the verdict path. Denominating on
   the anchored basis rather than raw live stake is what stops a post-drain
   top-up from diluting the burn — double the stake after the fact and the burn
   is still the lock. On a blocked review the block's deterministic severity

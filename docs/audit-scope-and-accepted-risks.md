@@ -142,8 +142,9 @@ budget and blocks `StakedWood.claimUnstakeGuardian`. The proposer can cause this
 cannot be challenged.
 
 **5.5 Slash size.** A convicted approver loses max(lock, `minSlashBps` × slash basis), capped at the
-basis and at `maxSlashBps` × basis. The basis is min(max(stake, booked liability) at `executedAt` − 1,
-live stake) (`StakedWood._slashableAt`); the rate is `ceil(lock / basis)`
+basis and at `maxSlashBps` × basis. The basis is min(max(stake checkpoint, liability checkpoint) at
+`executedAt` − 1, live stake), the liability checkpoint keeping unstake-requested stake slashable until
+it is claimed (`StakedWood._slashableAt`); the rate is `ceil(lock / basis)`
 (`ExposureLedger.slashBpsForAt`), raised to `minSlashBps` and capped at `maxSlashBps`
 (`StakedWood.slashVerdict`; 10% and 100% at launch). A guardian whose lock is below the floor loses
 more than it locked. A blocked guardian review slashes approvers at lock rate × severity, clamped the
@@ -168,6 +169,8 @@ and checks that `vault()`, `proposer()` and `executed()` answer. A batch may cal
 any registered strategy (`SyndicateVault._guardBatchCalls`); containment comes from the per-call caps
 (`BatchExecutorLib.executeBatch`), the net-outflow ceiling (`executeGovernorBatch`), the asset-call
 rules (`AssetCallRules.spenderOf`, allowances reset after each batch) and guardian review.
+It also requires code and pins the codehash; a proxy keeps its codehash when its implementation is
+swapped, and a registered target need not name the vault whose batch calls it.
 
 **5.8 New vaults ship with the capital caps inert.** `maxCapitalBps()` and `tier2CallCapBps()` read
 100% until set, and `minBufferBps` is 0 (`GovernorParameters`, `SyndicateVault.setMinBufferBps`). Only
@@ -188,8 +191,9 @@ the vault owner sets them (`docs/pre-deployment-parameter-review.md`).
   vault. Also `setMorphoMarketAllowed`, `setCounterpartyAllowed`, `setPriceSourceForToken`, `certify` /
   `certifyClass` / `demote`.
 - `ExposureLedger.setWoodFeed`, `setAssetFeed`, `setWoodUsdPrice`, `setWoodHaircutBps`,
-  `setCoveredTvlCapUsd`, `setProposerBondBps`. Lowering `challengeWindow` (game, or ledger then game)
-  retroactively closes filing deadlines and frees locks sooner.
+  `setCoveredTvlCapUsd`, `setProposerBondBps`. Lowering the game's `challengeWindow` retroactively closes filing deadlines of executed
+  proposals; lowering the ledger's too (game first: the ledger refuses a window below the game's, or
+  below `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`) frees locks sooner.
 - `GuardianRegistry.pause` halts review voting and `openEmergency` / `finalizeEmergency` (anyone may
   unpause after `DEADMAN_UNPAUSE_DELAY` = 7 days); `refundSlash` pays out of the appeal reserve.
 - Raising `minOwnerStake` above a vault's posted bond makes `emergencySettleWithCalls` revert
@@ -206,8 +210,11 @@ the vault owner sets them (`docs/pre-deployment-parameter-review.md`).
   disable it (`setAgentRegistry`).
 - Chainlink feeds on 4663 have no sequencer-uptime feed, and none is checked: `ExposureLedger.coverageUsd`,
   `WoodPoolFeed._ethUsdX8`, `PortfolioStrategy._feedPrice`. Min/max-answer clamping is not detected.
-- A single holder of most WOOD pool liquidity can halt the WOOD price by withdrawing below
-  `MIN_V3_LIQUIDITY` (`WoodPoolFeed.latestRoundData`; `docs/coverage.md`).
+- A holder of most of the V3 in-range liquidity, or of most of the V2 pair's WETH, can halt the WOOD
+  price by withdrawing. Anyone can halt it for as long as they hold the price there, by swapping the V3
+  tick out of the range that holds the liquidity (not possible while all V3 liquidity is full-range)
+  or draining the pair's WETH below `MIN_WETH_RESERVE`, at the cost of price impact; a filing near its
+  deadline can be front-run this way (`WoodPoolFeed._poolTwapX112`, `_twapX112`; `docs/coverage.md`).
 
 **5.12 Portfolio, Morpho and stray tokens.** The Portfolio strategy runs only on a vault asset the
 ledger prices within `PEG_TOLERANCE_BPS` (1%) of $1, at init and execute
@@ -256,8 +263,9 @@ and the settler chooses the block. Portfolio sells each token at the Chainlink v
 settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
-reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy borrows up to
-LLTV − 5 percentage points at init (`MIN_LLTV_BUFFER_BPS`) with no relief before settle, so interest
+reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at
+init, at most LLTV − 5 percentage points (`MIN_LLTV_BUFFER_BPS`), borrows at execute, and has no
+relief before settle, so interest
 can push it into Morpho liquidation; if proceeds do not cover the debt, settle reverts until someone
 transfers the asset to the clone (`_repayAndWithdraw`, `_deleverage`). The market-id allowlist is the
 only check. Before allowing an id the Safe must review collateral token, oracle, lltv, irm and

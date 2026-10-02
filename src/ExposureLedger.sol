@@ -953,7 +953,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      blocks (`releaseApproval`) or whose gate it fails (`retireApproval`),
     ///      so nothing can transit a listed guardian's figure through zero while
     ///      the challenge naming them is live. The old booking/pledge split
-    ///      existed precisely because one of the two COULD (audit-181 finding A).
+    ///      existed precisely because one of the two COULD.
     function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (!_frozen[key]) {

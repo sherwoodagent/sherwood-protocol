@@ -98,7 +98,7 @@ interface IExposureLedger {
     /// @notice A vote-change unwind released `guardian`'s lock of `wood` from
     ///         bucket `epoch`.
     event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 epoch);
-    /// @notice A dead lock was swept by `retireApproval` (audit #181 finding 11)
+    /// @notice A dead lock was swept by `retireApproval`
     ///         — a lock past its challenge window, unfrozen, and unpinned,
     ///         released from its bucket the same way `ExposureReleased` releases
     ///         a vote-change unwind.

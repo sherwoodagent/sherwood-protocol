@@ -240,7 +240,7 @@ shrink or grow it.
   governance decision, not a code default; `DeployPlanB` refuses zero and requires
   `maxSlashBps = 100%` so a full-stake lock can burn in full.
 - **Fee attribution is the lock.** `GuardianRegistry.getApproverCoverage` reads
-  `coverageUsdOf` — `min(lock, live stake) × woodPriceX8()`, **uncapped**: a
+  `coverageUsdOf` — `min(lock, slash basis at executedAt) × woodPriceX8()`, **uncapped**: a
   guardian who locked more took more risk and earns proportionally more, even when
   the cohort over-subscribed. There is no settlement step before payout; the lock a
   guardian holds at payout is their attribution. `priced == false` means retry, not
