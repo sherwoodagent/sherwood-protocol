@@ -156,7 +156,7 @@ Consequences for onboarding:
   wiring. The check is init-time only: a strategy already initialized and
   executed against an adapter that is later demoted is not re-checked at
   settle (by design — see
-  `openspec/changes/portfolio-swap-adapter-allowlist/design.md` decision 3).
+  `openspec/changes/archive/2026-10-02-portfolio-swap-adapter-allowlist/design.md` decision 3).
 - **This does not change §2.1–§2.3.** The adapter still must not be a generic
   executor, still needs a written selector inventory, and still must not be a
   proxy — the strategy-side check only enforces the SAME allowlist bit, one

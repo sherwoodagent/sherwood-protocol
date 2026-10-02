@@ -283,25 +283,35 @@ is `increaseObservationCardinalityNext` on the pool.
 ## 6. Documents
 
 `docs/` describes the code on this branch. `docs/papers/` is design rationale; where it differs from
-the code, the code and `docs/` govern. `openspec/specs/` is the archived baseline;
-`openspec/changes/*/specs/` hold deltas not yet archived, and where they differ the delta is
-current. Some open changes still carry older text for requirements a later change also modifies;
-prefer the later change:
+the code, the code and `docs/` govern.
 
-- `per-call-capital-declarations`: "Governance parameter management" (older bounds); superseded by
-  `audit-1002-docs-alignment`.
-- `declared-coverage-locks`: "Execute-time approve quorum", "Booking failures never fail the approve
-  vote", the review-path slash and "Approval recording books a guardian-declared WOOD lock" are
-  superseded by `audit-1002-docs-alignment`; "Challenger bond sized to the coverage the filing
-  freezes" is superseded by `audit-1002-v2-challenge-game-docs`.
-- `proportional-quorum-sizing`: "Execute-time approve quorum" (reservation wording); superseded by
-  `audit-1002-docs-alignment`.
-- `anchor-coverage-at-execution`: allocation and settlement requirements written against a
-  reservation model the code no longer has; its `design.md` also describes `TokenCourt` mechanics,
-  which are `v1-deploy` history.
-- `frozen-lock-rebucketing`: its delta now names the v2 freeze end (`filedAt + voteWindowAtFiling`);
-  its design, proposal and tasks text about dispute timeouts, `rule` and `TokenCourt` is `v1-deploy`
-  history.
+`openspec/specs/` is current with the code as of this commit: every change whose behaviour is
+implemented here has been archived into it (`openspec/changes/archive/2026-10-02-*`), with its deltas
+corrected against the code first, and `openspec-sync-corrections` fixed the remaining requirements no
+change had touched. The archive folders are history; their `design.md`, `proposal.md` and `tasks.md`
+files (some of which describe `TokenCourt` and other `v1-deploy` mechanisms) are not normative. Two
+archived changes, `wood-price-twap-ceiling` and `propose-time-target-validation`, were archived without
+applying their deltas because their behaviour shipped in a different shape; each proposal says where
+the normative text lives.
 
-The reasoning is in `openspec/changes/audit-1002-docs-alignment/proposal.md` and
-`openspec/changes/audit-1002-v2-challenge-game-docs/proposal.md`.
+Two change folders remain open under `openspec/changes/`, and neither describes code on this branch:
+
+- `permissionless-tier2-sandbox`: a per-proposal sandbox for arbitrary tier-2 calls. Not
+  implemented; no sandbox contract exists.
+- `target-based-batch-gating`: an adapter-allowlist callee gate for governor batches. Not
+  implemented; superseded by the registered-strategy batch rule (`SyndicateVault._guardBatchCalls`).
+
+Known limits of the specs:
+
+- `## Purpose` paragraphs cannot be changed through an OpenSpec delta, and some still carry history
+  that the requirements beneath them supersede: `epoch-nav` (names `WoodTwapOracle`, the retired
+  `PriceRouter` and a fallback rule), `syndicate-vault` (Lane A), `dimensional-conventions`
+  ("insurance", reserved/allocated subtypes), `guardian-staking` ("age-weighted vote checkpoints"),
+  `guardian-coverage` ("USD exposure"), `challenge-game` (omits the convict-majority condition),
+  `guardian-fleet` and `fee-splits`. `portfolio-strategy`, `strategy-lifecycle` and
+  `continuous-integration` carry the tool's placeholder Purpose. Where a Purpose and a requirement
+  differ, the requirement governs.
+- `guardian-agent` and `guardian-fleet` specify an off-chain daemon that is not in this repository;
+  only the on-chain facts they cite were checked.
+- `operator-docs` requires an onboarding checklist that `docs/adapter-onboarding-checklist.md` does
+  not yet meet; that document is marked stale at its top.
