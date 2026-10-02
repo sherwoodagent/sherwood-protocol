@@ -13,6 +13,7 @@ import {
     MockVaultGovernorStub,
     MockPermissiveTierRegistry
 } from "./mocks/MockGovernorAlwaysActive.sol";
+import {MockAssetLedger} from "./mocks/MockAssetLedger.sol";
 
 /// @notice Minimal Chainlink AggregatorV3 push-feed mock.
 contract MockAggregatorV3 {
@@ -54,7 +55,7 @@ contract PortfolioStrategyTest is Test {
     MockAggregatorV3 public fNflx;
     mapping(address token => address feed) public feedOf;
 
-    ERC20Mock public weth; // vault asset
+    ERC20Mock public usd; // vault asset
     ERC20Mock public tsla;
     ERC20Mock public amzn;
     ERC20Mock public nflx;
@@ -69,7 +70,7 @@ contract PortfolioStrategyTest is Test {
     address public vault;
     address public proposer = makeAddr("proposer");
 
-    uint256 constant TOTAL_AMOUNT = 10e18; // 10 WETH
+    uint256 constant TOTAL_AMOUNT = 10e18; // 10 USD
     uint256 constant MAX_SLIPPAGE = 100; // 1%
     uint256 constant RATE_PRECISION = 1e18;
 
@@ -82,10 +83,15 @@ contract PortfolioStrategyTest is Test {
         // points at a permissive registry.
         MockGovernorAlwaysActive governorStub = new MockGovernorAlwaysActive();
         governorStub.setTierRegistry(address(new MockPermissiveTierRegistry()));
-        vault = address(new MockVaultGovernorStub(address(governorStub)));
+        MockVaultGovernorStub vaultStub = new MockVaultGovernorStub(address(governorStub));
+        vault = address(vaultStub);
 
-        // Deploy mock tokens
-        weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        // Deploy mock tokens. The vault asset is a $1 token the ledger prices (FP-01).
+        usd = new ERC20Mock("USD Stable", "USD", 18);
+        vaultStub.setAsset(address(usd));
+        MockAssetLedger ledger = new MockAssetLedger();
+        ledger.setPrice(address(usd), 1e8);
+        governorStub.setExposureLedger(address(ledger));
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
         amzn = new ERC20Mock("Amazon Token", "AMZN", 18);
         nflx = new ERC20Mock("Netflix Token", "NFLX", 18);
@@ -100,24 +106,24 @@ contract PortfolioStrategyTest is Test {
         feedOf[address(amzn)] = address(fAmzn);
         feedOf[address(nflx)] = address(fNflx);
 
-        // Set exchange rates (1 WETH = 100 TSLA, 50 AMZN, 200 NFLX)
-        adapter.setRate(address(weth), address(tsla), 100e18);
-        adapter.setRate(address(weth), address(amzn), 50e18);
-        adapter.setRate(address(weth), address(nflx), 200e18);
+        // Set exchange rates (1 USD = 100 TSLA, 50 AMZN, 200 NFLX)
+        adapter.setRate(address(usd), address(tsla), 100e18);
+        adapter.setRate(address(usd), address(amzn), 50e18);
+        adapter.setRate(address(usd), address(nflx), 200e18);
 
         // Reverse rates for selling
-        adapter.setRate(address(tsla), address(weth), 0.01e18); // 1 TSLA = 0.01 WETH
-        adapter.setRate(address(amzn), address(weth), 0.02e18); // 1 AMZN = 0.02 WETH
-        adapter.setRate(address(nflx), address(weth), 0.005e18); // 1 NFLX = 0.005 WETH
+        adapter.setRate(address(tsla), address(usd), 0.01e18); // 1 TSLA = 0.01 USD
+        adapter.setRate(address(amzn), address(usd), 0.02e18); // 1 AMZN = 0.02 USD
+        adapter.setRate(address(nflx), address(usd), 0.005e18); // 1 NFLX = 0.005 USD
 
-        // Fund vault with WETH
-        weth.mint(vault, 100e18);
+        // Fund vault with USD
+        usd.mint(vault, 100e18);
 
         // Fund adapter with stock tokens for swaps
         tsla.mint(address(adapter), 100_000e18);
         amzn.mint(address(adapter), 100_000e18);
         nflx.mint(address(adapter), 100_000e18);
-        weth.mint(address(adapter), 100_000e18);
+        usd.mint(address(adapter), 100_000e18);
 
         // Deploy template and clone
         template = new PortfolioStrategy();
@@ -145,7 +151,7 @@ contract PortfolioStrategyTest is Test {
         extraData[2] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -187,7 +193,7 @@ contract PortfolioStrategyTest is Test {
     function test_initialize() public view {
         assertEq(strategy.vault(), vault);
         assertEq(strategy.proposer(), proposer);
-        assertEq(strategy.asset(), address(weth));
+        assertEq(strategy.asset(), address(usd));
         assertEq(address(strategy.swapAdapter()), address(adapter));
         address[] memory feeds = strategy.getFeeds();
         assertEq(feeds[0], address(fTsla));
@@ -229,7 +235,7 @@ contract PortfolioStrategyTest is Test {
         extraData[1] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -257,7 +263,7 @@ contract PortfolioStrategyTest is Test {
         }
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -288,7 +294,7 @@ contract PortfolioStrategyTest is Test {
         extraData[1] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -347,7 +353,7 @@ contract PortfolioStrategyTest is Test {
         extraData[1] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -372,7 +378,7 @@ contract PortfolioStrategyTest is Test {
         extraData[0] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -390,7 +396,7 @@ contract PortfolioStrategyTest is Test {
 
     function test_execute() public {
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
 
         vm.prank(vault);
         strategy.execute();
@@ -400,16 +406,16 @@ contract PortfolioStrategyTest is Test {
 
         PortfolioStrategy.TokenAllocation[] memory allocs = strategy.getAllocations();
 
-        // TSLA: 40% of 10 WETH = 4 WETH * 100 rate = 400 TSLA
+        // TSLA: 40% of 10 USD = 4 USD * 100 rate = 400 TSLA
         assertEq(allocs[0].tokenAmount, 400e18);
         assertEq(allocs[0].investedAmount, 4e18);
         assertEq(tsla.balanceOf(address(strategy)), 400e18);
 
-        // AMZN: 35% of 10 WETH = 3.5 WETH * 50 rate = 175 AMZN
+        // AMZN: 35% of 10 USD = 3.5 USD * 50 rate = 175 AMZN
         assertEq(allocs[1].tokenAmount, 175e18);
         assertEq(allocs[1].investedAmount, 3.5e18);
 
-        // NFLX: 25% of 10 WETH = 2.5 WETH * 200 rate = 500 NFLX
+        // NFLX: 25% of 10 USD = 2.5 USD * 200 rate = 500 NFLX
         assertEq(allocs[2].tokenAmount, 500e18);
         assertEq(allocs[2].investedAmount, 2.5e18);
     }
@@ -422,7 +428,7 @@ contract PortfolioStrategyTest is Test {
 
     function test_execute_twice_reverts() public {
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
 
@@ -436,11 +442,11 @@ contract PortfolioStrategyTest is Test {
     function test_settle() public {
         // Execute first
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
 
-        uint256 vaultBefore = weth.balanceOf(vault);
+        uint256 vaultBefore = usd.balanceOf(vault);
 
         // Settle
         vm.prank(vault);
@@ -448,12 +454,12 @@ contract PortfolioStrategyTest is Test {
 
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
 
-        // All tokens sold, WETH returned to vault
-        // 400 TSLA * 0.01 = 4 WETH
-        // 175 AMZN * 0.02 = 3.5 WETH
-        // 500 NFLX * 0.005 = 2.5 WETH
-        // Total = 10 WETH (no profit/loss with these rates)
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
+        // All tokens sold, USD returned to vault
+        // 400 TSLA * 0.01 = 4 USD
+        // 175 AMZN * 0.02 = 3.5 USD
+        // 500 NFLX * 0.005 = 2.5 USD
+        // Total = 10 USD (no profit/loss with these rates)
+        uint256 returned = usd.balanceOf(vault) - vaultBefore;
         assertEq(returned, TOTAL_AMOUNT);
         assertEq(tsla.balanceOf(address(strategy)), 0);
         assertEq(amzn.balanceOf(address(strategy)), 0);
@@ -462,33 +468,33 @@ contract PortfolioStrategyTest is Test {
 
     function test_settle_withProfit() public {
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
 
         // Simulate price appreciation: selling rates go up 20%
-        adapter.setRate(address(tsla), address(weth), 0.012e18); // was 0.01
-        adapter.setRate(address(amzn), address(weth), 0.024e18); // was 0.02
-        adapter.setRate(address(nflx), address(weth), 0.006e18); // was 0.005
+        adapter.setRate(address(tsla), address(usd), 0.012e18); // was 0.01
+        adapter.setRate(address(amzn), address(usd), 0.024e18); // was 0.02
+        adapter.setRate(address(nflx), address(usd), 0.006e18); // was 0.005
 
-        uint256 vaultBefore = weth.balanceOf(vault);
+        uint256 vaultBefore = usd.balanceOf(vault);
 
         vm.prank(vault);
         strategy.settle();
 
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
+        uint256 returned = usd.balanceOf(vault) - vaultBefore;
         assertGt(returned, TOTAL_AMOUNT); // profit!
 
-        // 400 TSLA * 0.012 = 4.8 WETH
-        // 175 AMZN * 0.024 = 4.2 WETH
-        // 500 NFLX * 0.006 = 3.0 WETH
-        // Total = 12.0 WETH (20% profit)
+        // 400 TSLA * 0.012 = 4.8 USD
+        // 175 AMZN * 0.024 = 4.2 USD
+        // 500 NFLX * 0.006 = 3.0 USD
+        // Total = 12.0 USD (20% profit)
         assertEq(returned, 12e18);
     }
 
     function test_settle_onlyVault() public {
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
 
@@ -615,7 +621,7 @@ contract PortfolioStrategyTest is Test {
         bytes[] memory extraData = new bytes[](3);
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -689,13 +695,13 @@ contract PortfolioStrategyTest is Test {
         _executeStrategy();
         // TSLA doubles at the feed only, so the slot is overweight and the sell leg runs.
         fTsla.set(int256(0.02e18), block.timestamp);
-        adapter.setRate(address(tsla), address(weth), (0.02e18 * (10_000 - MAX_SLIPPAGE - 1)) / 10_000);
+        adapter.setRate(address(tsla), address(usd), (0.02e18 * (10_000 - MAX_SLIPPAGE - 1)) / 10_000);
 
         vm.prank(proposer);
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         strategy.rebalanceDelta();
 
-        adapter.setRate(address(tsla), address(weth), (0.02e18 * (10_000 - MAX_SLIPPAGE)) / 10_000);
+        adapter.setRate(address(tsla), address(usd), (0.02e18 * (10_000 - MAX_SLIPPAGE)) / 10_000);
         vm.prank(proposer);
         strategy.rebalanceDelta();
     }
@@ -706,13 +712,13 @@ contract PortfolioStrategyTest is Test {
         _executeStrategy();
         // TSLA doubles at the feed and the route: the sell leg fills, AMZN is underweight.
         _setPrice(tsla, fTsla, 0.02e18);
-        adapter.setRate(address(weth), address(amzn), (50e18 * (10_000 - MAX_SLIPPAGE - 1)) / 10_000);
+        adapter.setRate(address(usd), address(amzn), (50e18 * (10_000 - MAX_SLIPPAGE - 1)) / 10_000);
 
         vm.prank(proposer);
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         strategy.rebalanceDelta();
 
-        adapter.setRate(address(weth), address(amzn), (50e18 * (10_000 - MAX_SLIPPAGE)) / 10_000);
+        adapter.setRate(address(usd), address(amzn), (50e18 * (10_000 - MAX_SLIPPAGE)) / 10_000);
         vm.prank(proposer);
         strategy.rebalanceDelta();
     }
@@ -730,7 +736,7 @@ contract PortfolioStrategyTest is Test {
     function test_fullLifecycle() public {
         // 1. Execute
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
 
@@ -739,16 +745,16 @@ contract PortfolioStrategyTest is Test {
         strategy.rebalanceDelta();
 
         // 3. Prices go up 10%
-        adapter.setRate(address(tsla), address(weth), 0.011e18);
-        adapter.setRate(address(amzn), address(weth), 0.022e18);
-        adapter.setRate(address(nflx), address(weth), 0.0055e18);
+        adapter.setRate(address(tsla), address(usd), 0.011e18);
+        adapter.setRate(address(amzn), address(usd), 0.022e18);
+        adapter.setRate(address(nflx), address(usd), 0.0055e18);
 
         // 4. Settle
-        uint256 vaultBefore = weth.balanceOf(vault);
+        uint256 vaultBefore = usd.balanceOf(vault);
         vm.prank(vault);
         strategy.settle();
 
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
+        uint256 returned = usd.balanceOf(vault) - vaultBefore;
         assertGt(returned, TOTAL_AMOUNT); // profit from 10% appreciation
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
     }
@@ -768,7 +774,7 @@ contract PortfolioStrategyTest is Test {
         extraData[0] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -801,7 +807,7 @@ contract PortfolioStrategyTest is Test {
         extraData[0] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -815,14 +821,14 @@ contract PortfolioStrategyTest is Test {
 
         assertEq(s.allocationCount(), 1);
 
-        // Execute: 5 WETH → 500 TSLA
+        // Execute: 5 USD → 500 TSLA
         vm.prank(vault);
-        weth.approve(address(s), 5e18);
+        usd.approve(address(s), 5e18);
         vm.prank(vault);
         s.execute();
 
         PortfolioStrategy.TokenAllocation[] memory allocs = s.getAllocations();
-        assertEq(allocs[0].tokenAmount, 500e18); // 5 WETH * 100 rate
+        assertEq(allocs[0].tokenAmount, 500e18); // 5 USD * 100 rate
         assertEq(allocs[0].investedAmount, 5e18);
         assertEq(tsla.balanceOf(address(s)), 500e18);
 
@@ -834,11 +840,11 @@ contract PortfolioStrategyTest is Test {
         assertEq(allocs[0].tokenAmount, 500e18); // same — no price change
 
         // Settle
-        uint256 vaultBefore = weth.balanceOf(vault);
+        uint256 vaultBefore = usd.balanceOf(vault);
         vm.prank(vault);
         s.settle();
 
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
+        uint256 returned = usd.balanceOf(vault) - vaultBefore;
         assertEq(returned, 5e18); // no profit/loss
         assertEq(tsla.balanceOf(address(s)), 0);
     }
@@ -862,14 +868,14 @@ contract PortfolioStrategyTest is Test {
             weights[i] = 500; // 5% each, 20 * 500 = 10000
             extraData[i] = "";
 
-            // Set swap rates: 1 WETH → 10 token, 1 token → 0.1 WETH
-            adapter.setRate(address(weth), address(token), 10e18);
-            adapter.setRate(address(token), address(weth), 0.1e18);
+            // Set swap rates: 1 USD → 10 token, 1 token → 0.1 USD
+            adapter.setRate(address(usd), address(token), 10e18);
+            adapter.setRate(address(token), address(usd), 0.1e18);
             token.mint(address(adapter), 1_000_000e18);
         }
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -883,26 +889,26 @@ contract PortfolioStrategyTest is Test {
 
         assertEq(s.allocationCount(), 20);
 
-        // Execute: 20 WETH split equally
-        weth.mint(vault, 20e18); // extra WETH for this test
+        // Execute: 20 USD split equally
+        usd.mint(vault, 20e18); // extra USD for this test
         vm.prank(vault);
-        weth.approve(address(s), 20e18);
+        usd.approve(address(s), 20e18);
         vm.prank(vault);
         s.execute();
 
-        // Each token: 5% of 20 WETH = 1 WETH * 10 rate = 10 tokens
+        // Each token: 5% of 20 USD = 1 USD * 10 rate = 10 tokens
         PortfolioStrategy.TokenAllocation[] memory allocs = s.getAllocations();
         for (uint256 i; i < count; ++i) {
             assertEq(allocs[i].tokenAmount, 10e18);
             assertEq(allocs[i].investedAmount, 1e18);
         }
 
-        // Settle: all sold back at same rates → 20 WETH returned
-        uint256 vaultBefore = weth.balanceOf(vault);
+        // Settle: all sold back at same rates → 20 USD returned
+        uint256 vaultBefore = usd.balanceOf(vault);
         vm.prank(vault);
         s.settle();
 
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
+        uint256 returned = usd.balanceOf(vault) - vaultBefore;
         assertEq(returned, 20e18);
     }
 
@@ -927,7 +933,7 @@ contract PortfolioStrategyTest is Test {
         extraData[2] = "";
 
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -944,17 +950,17 @@ contract PortfolioStrategyTest is Test {
 
         // Execute: NFLX should get 0 allocation
         vm.prank(vault);
-        weth.approve(address(s), TOTAL_AMOUNT);
+        usd.approve(address(s), TOTAL_AMOUNT);
         vm.prank(vault);
         s.execute();
 
         PortfolioStrategy.TokenAllocation[] memory allocs = s.getAllocations();
 
-        // TSLA: 60% of 10 WETH = 6 WETH * 100 = 600 TSLA
+        // TSLA: 60% of 10 USD = 6 USD * 100 = 600 TSLA
         assertEq(allocs[0].tokenAmount, 600e18);
         assertEq(allocs[0].investedAmount, 6e18);
 
-        // AMZN: 40% of 10 WETH = 4 WETH * 50 = 200 AMZN
+        // AMZN: 40% of 10 USD = 4 USD * 50 = 200 AMZN
         assertEq(allocs[1].tokenAmount, 200e18);
         assertEq(allocs[1].investedAmount, 4e18);
 
@@ -972,7 +978,7 @@ contract PortfolioStrategyTest is Test {
         PortfolioStrategy.TokenAllocation[] memory before_ = s.getAllocations();
         assertEq(before_[2].tokenAmount, 0, "premise: 0% slot empty at execute");
 
-        nflx.mint(address(s), 100e18); // 0.5 WETH of drift into the 0% slot
+        nflx.mint(address(s), 100e18); // 0.5 USD of drift into the 0% slot
 
         vm.prank(proposer);
         s.rebalanceDelta();
@@ -995,11 +1001,11 @@ contract PortfolioStrategyTest is Test {
         vm.prank(proposer);
         s.rebalanceDelta();
 
-        uint256 vaultBefore = weth.balanceOf(vault);
+        uint256 vaultBefore = usd.balanceOf(vault);
         vm.prank(vault);
         s.settle();
 
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
+        uint256 returned = usd.balanceOf(vault) - vaultBefore;
         assertGt(returned, 0);
         assertEq(nflx.balanceOf(address(s)), 0);
         assertEq(tsla.balanceOf(address(s)), 0);
@@ -1026,10 +1032,10 @@ contract PortfolioStrategyTest is Test {
         strategy.rebalanceDelta();
         _assertSharesAtTargets();
 
-        uint256 vaultBefore = weth.balanceOf(vault);
+        uint256 vaultBefore = usd.balanceOf(vault);
         vm.prank(vault);
         strategy.settle();
-        assertGt(weth.balanceOf(vault) - vaultBefore, 0);
+        assertGt(usd.balanceOf(vault) - vaultBefore, 0);
         assertEq(tsla.balanceOf(address(strategy)), 0);
         assertEq(amzn.balanceOf(address(strategy)), 0);
         assertEq(nflx.balanceOf(address(strategy)), 0);
@@ -1055,21 +1061,21 @@ contract PortfolioStrategyTest is Test {
             weights[i] = 500; // 5% each
             extraData[i] = "";
 
-            adapter.setRate(address(weth), address(token), 10e18);
-            adapter.setRate(address(token), address(weth), 0.1e18);
+            adapter.setRate(address(usd), address(token), 10e18);
+            adapter.setRate(address(token), address(usd), 0.1e18);
             token.mint(address(adapter), 1_000_000e18);
         }
         address[] memory feeds = _newFeeds(count, 18, int256(0.1e18));
 
         bytes memory initData = abi.encode(
-            address(weth), address(adapter), tokens, weights, 20e18, MAX_SLIPPAGE, extraData, _pd(tokens.length), feeds
+            address(usd), address(adapter), tokens, weights, 20e18, MAX_SLIPPAGE, extraData, _pd(tokens.length), feeds
         );
         s.initialize(vault, proposer, initData);
 
-        weth.mint(vault, 20e18);
+        usd.mint(vault, 20e18);
 
         vm.prank(vault);
-        weth.approve(address(s), 20e18);
+        usd.approve(address(s), 20e18);
         vm.prank(vault);
         s.execute();
 
@@ -1101,37 +1107,37 @@ contract PortfolioStrategyTest is Test {
 
     function _executeStrategy() internal {
         vm.prank(vault);
-        weth.approve(address(strategy), TOTAL_AMOUNT);
+        usd.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
     }
 
     /// @dev Move a token's price at its feed and at the adapter (both directions).
-    function _setPrice(ERC20Mock token, MockAggregatorV3 feed, uint256 priceInWeth) internal {
-        feed.set(int256(priceInWeth), block.timestamp);
-        adapter.setRate(address(token), address(weth), priceInWeth);
-        adapter.setRate(address(weth), address(token), 1e36 / priceInWeth);
+    function _setPrice(ERC20Mock token, MockAggregatorV3 feed, uint256 priceInUsd) internal {
+        feed.set(int256(priceInUsd), block.timestamp);
+        adapter.setRate(address(token), address(usd), priceInUsd);
+        adapter.setRate(address(usd), address(token), 1e36 / priceInUsd);
     }
 
     /// @dev Every fixture route fills exactly at the feed floor: feed x (1 - MAX_SLIPPAGE).
     function _setFloorFillingRoutes() internal {
         uint256 keep = 10_000 - MAX_SLIPPAGE;
-        adapter.setRate(address(weth), address(tsla), (100e18 * keep) / 10_000);
-        adapter.setRate(address(weth), address(amzn), (50e18 * keep) / 10_000);
-        adapter.setRate(address(weth), address(nflx), (200e18 * keep) / 10_000);
-        adapter.setRate(address(tsla), address(weth), (0.01e18 * keep) / 10_000);
-        adapter.setRate(address(amzn), address(weth), (0.02e18 * keep) / 10_000);
-        adapter.setRate(address(nflx), address(weth), (0.005e18 * keep) / 10_000);
+        adapter.setRate(address(usd), address(tsla), (100e18 * keep) / 10_000);
+        adapter.setRate(address(usd), address(amzn), (50e18 * keep) / 10_000);
+        adapter.setRate(address(usd), address(nflx), (200e18 * keep) / 10_000);
+        adapter.setRate(address(tsla), address(usd), (0.01e18 * keep) / 10_000);
+        adapter.setRate(address(amzn), address(usd), (0.02e18 * keep) / 10_000);
+        adapter.setRate(address(nflx), address(usd), (0.005e18 * keep) / 10_000);
     }
 
-    /// @dev Basket value in WETH at the feeds, plus idle WETH.
+    /// @dev Basket value in USD at the feeds, plus idle USD.
     function _fairValue() internal view returns (uint256 total) {
         PortfolioStrategy.TokenAllocation[] memory allocs = strategy.getAllocations();
         for (uint256 i; i < allocs.length; ++i) {
             (, int256 answer,,,) = MockAggregatorV3(feedOf[allocs[i].token]).latestRoundData();
             total += (IERC20(allocs[i].token).balanceOf(address(strategy)) * uint256(answer)) / 1e18;
         }
-        total += weth.balanceOf(address(strategy));
+        total += usd.balanceOf(address(strategy));
     }
 
     /// @dev Each slot's value share is at its init weight, to rounding.
@@ -1156,7 +1162,7 @@ contract PortfolioStrategyTest is Test {
         weights[0] = 6000;
         weights[1] = 4000;
         bytes memory initData = abi.encode(
-            address(weth),
+            address(usd),
             address(adapter),
             tokens,
             weights,
@@ -1183,7 +1189,7 @@ contract PortfolioStrategyTest is Test {
     function test_rebalanceDelta_handles1e8FeedDecimals() public {
         // Deploy a fresh clone configured with 8-decimal price feeds. Tokens
         // (TSLA / AMZN / NFLX) remain 18-decimal — only the feed scale
-        // changes. Asset (WETH) is 18-decimal.
+        // changes. Asset (USD) is 18-decimal.
         address clone = Clones.clone(address(template));
         PortfolioStrategy s = PortfolioStrategy(clone);
 
@@ -1200,27 +1206,27 @@ contract PortfolioStrategyTest is Test {
         pd[0] = 8; // Chainlink tokenized-stock feed
         pd[1] = 8;
         pd[2] = 8;
-        // 8-dec prices at the adapter's fair rate: TSLA 0.01, AMZN 0.02, NFLX 0.005 WETH.
+        // 8-dec prices at the adapter's fair rate: TSLA 0.01, AMZN 0.02, NFLX 0.005 USD.
         address[] memory feeds = new address[](3);
         feeds[0] = address(new MockAggregatorV3(8, int256(1e6), block.timestamp));
         feeds[1] = address(new MockAggregatorV3(8, int256(2e6), block.timestamp));
         feeds[2] = address(new MockAggregatorV3(8, int256(5e5), block.timestamp));
 
         bytes memory initData = abi.encode(
-            address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, MAX_SLIPPAGE, extraData, pd, feeds
+            address(usd), address(adapter), tokens, weights, TOTAL_AMOUNT, MAX_SLIPPAGE, extraData, pd, feeds
         );
         s.initialize(vault, proposer, initData);
 
         vm.prank(vault);
-        weth.approve(address(s), TOTAL_AMOUNT);
+        usd.approve(address(s), TOTAL_AMOUNT);
         vm.prank(vault);
         s.execute();
         PortfolioStrategy.TokenAllocation[] memory before_ = s.getAllocations();
 
         // TSLA doubles on its 8-dec feed and at the adapter.
         MockAggregatorV3(feeds[0]).set(int256(2e6), block.timestamp);
-        adapter.setRate(address(tsla), address(weth), 0.02e18);
-        adapter.setRate(address(weth), address(tsla), 50e18);
+        adapter.setRate(address(tsla), address(usd), 0.02e18);
+        adapter.setRate(address(usd), address(tsla), 50e18);
 
         vm.prank(proposer);
         s.rebalanceDelta();
@@ -1268,14 +1274,14 @@ contract PortfolioStrategyTest is Test {
             vault,
             proposer,
             abi.encode(
-                address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, MAX_SLIPPAGE, extraData, pd, feeds
+                address(usd), address(adapter), tokens, weights, TOTAL_AMOUNT, MAX_SLIPPAGE, extraData, pd, feeds
             )
         );
     }
 
     function _execute(PortfolioStrategy s) internal {
         vm.prank(vault);
-        weth.approve(address(s), TOTAL_AMOUNT);
+        usd.approve(address(s), TOTAL_AMOUNT);
         vm.prank(vault);
         s.execute();
     }
@@ -1293,7 +1299,7 @@ contract PortfolioStrategyTest is Test {
         feeds[0] = feed;
         return
             abi.encode(
-                address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, MAX_SLIPPAGE, extraData, pd, feeds
+                address(usd), address(adapter), tokens, weights, TOTAL_AMOUNT, MAX_SLIPPAGE, extraData, pd, feeds
             );
     }
 
@@ -1321,8 +1327,8 @@ contract PortfolioStrategyTest is Test {
         PortfolioStrategy.TokenAllocation[] memory before_ = s.getAllocations();
 
         f0.set(int256(2e6), block.timestamp);
-        adapter.setRate(address(tsla), address(weth), 0.02e18);
-        adapter.setRate(address(weth), address(tsla), 50e18);
+        adapter.setRate(address(tsla), address(usd), 0.02e18);
+        adapter.setRate(address(usd), address(tsla), 50e18);
 
         vm.prank(proposer);
         s.rebalanceDelta();
@@ -1362,7 +1368,7 @@ contract PortfolioStrategyTest is Test {
     function test_execute_revertsWhenAnyBasketFeedIsStale() public {
         (PortfolioStrategy s, MockAggregatorV3 f0, MockAggregatorV3 f1, MockAggregatorV3 f2) = _init8DecStrategy();
         vm.prank(vault);
-        weth.approve(address(s), TOTAL_AMOUNT);
+        usd.approve(address(s), TOTAL_AMOUNT);
 
         // Only the middle slot goes dark; the other two stay fresh.
         vm.warp(vm.getBlockTimestamp() + 26 hours + 1);
@@ -1373,7 +1379,7 @@ contract PortfolioStrategyTest is Test {
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         s.execute();
         assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending), "no capital moved");
-        assertEq(weth.balanceOf(vault), 100e18, "vault untouched");
+        assertEq(usd.balanceOf(vault), 100e18, "vault untouched");
 
         // Control: refresh the dark feed and the same execute fills.
         f1.set(int256(2e6), vm.getBlockTimestamp());
