@@ -224,7 +224,7 @@ abstract contract GovernorParameters is ProposalLifecycle {
         emit ParameterChangeFinalized(PARAM_MAX_PERF_FEE, old, newValue);
     }
 
-    function _protocolMaxStrategyDuration() private view returns (uint256) {
+    function _protocolMaxStrategyDuration() internal view returns (uint256) {
         address cfg = protocolConfig;
         if (cfg == address(0)) return type(uint256).max;
         uint256 ceiling = IProtocolConfig(cfg).maxStrategyDuration();

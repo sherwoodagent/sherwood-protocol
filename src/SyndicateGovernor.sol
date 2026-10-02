@@ -339,7 +339,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Cancel stamps the deadline too, so cancel+propose cycling cannot keep redemptions locked.
         if (block.timestamp < _cooldownEndsAt) revert CooldownNotElapsed();
         if (!_isRegisteredStrategy(strategy)) revert StrategyNotRegistered(strategy);
-        if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
+        // A lowered protocol ceiling does not rewrite stored maxima, so it binds here too (FP-13).
+        if (strategyDuration > _params.maxStrategyDuration || strategyDuration > _protocolMaxStrategyDuration()) {
+            revert StrategyDurationTooLong();
+        }
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
         if (settlementCalls.length == 0) revert EmptySettlementCalls();

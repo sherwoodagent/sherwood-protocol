@@ -1,19 +1,19 @@
 ## ADDED Requirements
 
-### Requirement: Each Morpho market's oracle and collateral are counterparty-allowlisted before its proposal
+### Requirement: Each Morpho market is allowlisted by id before its proposal
 
-Morpho Blue market creation is permissionless for any oracle and collateral token, so the market a strategy clone names is only as sound as the oracle that prices it. `ConcentratedLiquidityStrategy._initialize` SHALL bind `marketParams.oracle` through `isCounterpartyAllowed` and re-check it at `execute()` and `rerange()`. `MorphoSupplyStrategy._initialize` SHALL bind `marketParams.oracle`, and `marketParams.collateralToken` unless it equals the vault asset, and re-check both at `execute()`. A market with `oracle == address(0)` SHALL be refused, and the registry owner SHALL NOT allowlist `address(0)`.
+Morpho Blue market creation is permissionless for any oracle, collateral token, irm and lltv, so the market a strategy clone names is only as sound as all five of its parameters together. `ConcentratedLiquidityStrategy._initialize` and `MorphoSupplyStrategy._initialize` SHALL require the market id (`MarketParamsLib.id` over all five fields) to be allowlisted through `isMorphoMarketAllowed`, read fail-closed, and SHALL re-check it at `execute()` (and, for CL, at `rerange()`). Separate counterparty grants for the oracle or the collateral token SHALL NOT admit a market (amended by `audit-1002-morpho-market-cl-slippage`, FP-02; this requirement originally bound the oracle and collateral as separate counterparties).
 
-This is a PER-PROPOSAL obligation, not a ceremony step: the market is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setCounterpartyAllowed(<oracle>, true)` (and, for the supply strategy, `setCounterpartyAllowed(<collateral>, true)`) for each market a proposal is expected to use, before clone-init. Settle paths are NOT gated on it, so a demotion cannot strand the funds it is meant to protect.
+This is a PER-PROPOSAL obligation, not a ceremony step: the market is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setMorphoMarketAllowed(<marketId>, true)` for each market a proposal is expected to use, before clone-init, after reading the market's five parameters from Morpho and refusing a market whose `irm` is the zero address or whose oracle does not price its collateral. For the known 4663 USDG market the call is `setMorphoMarketAllowed(0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114, true)`. Settle paths are NOT gated on it, so a demotion cannot strand the funds it is meant to protect.
 
-#### Scenario: Proposal naming an unvouched oracle
-- **WHEN** a CL or Morpho-supply clone names a market whose oracle is not counterparty-allowlisted
-- **THEN** clone-init reverts `CounterpartyNotAllowed(oracle, registry)`
+#### Scenario: Proposal naming a market that is not allowlisted
+- **WHEN** a CL or Morpho-supply clone names a market whose id is not allowlisted, even if its oracle and collateral are allowed counterparties
+- **THEN** clone-init reverts `MorphoMarketNotAllowed(marketId, registry)`
 
-#### Scenario: Supply market with an unvouched collateral
-- **WHEN** a Morpho-supply clone names a market whose collateral token is neither the vault asset nor counterparty-allowlisted
-- **THEN** clone-init reverts `CounterpartyNotAllowed(collateralToken, registry)`
+#### Scenario: Allowlisted market needs no part grants
+- **WHEN** a clone names an allowlisted market whose oracle and collateral hold no counterparty grant
+- **THEN** clone-init succeeds
 
-#### Scenario: Oracle demoted after init
-- **WHEN** the oracle is demoted between clone-init and `execute()`
-- **THEN** `execute()` reverts `CounterpartyNotAllowed(oracle, registry)` and no vault funds move
+#### Scenario: Market demoted after init
+- **WHEN** the market id is de-listed between clone-init and `execute()`
+- **THEN** `execute()` reverts `MorphoMarketNotAllowed(marketId, registry)` and no vault funds move

@@ -7,11 +7,15 @@ import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 
 /// @notice 6.4 — only risk-reducing parameters are tunable after execution.
 contract ConcentratedLiquidityStrategyTunablesTest is CLFixture {
-    function test_updateParams_proposerRetunesSlippage() public {
+    /// @dev FP-06 changed direction: the proposer may restate the reviewed slippage, not retune it.
+    function test_updateParams_proposerCannotRetuneSlippage() public {
         _execute();
         vm.prank(proposer);
+        vm.expectRevert(ConcentratedLiquidityStrategy.ImmutableParam.selector);
         strategy.updateParams(abi.encode(uint256(250), uint256(0)));
-        assertEq(strategy.settleSlippageBps(), 250);
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(uint256(500), uint256(0)));
+        assertEq(strategy.settleSlippageBps(), 500);
     }
 
     function test_updateParams_nonProposerReverts() public {
@@ -69,24 +73,21 @@ contract ConcentratedLiquidityStrategyTunablesTest is CLFixture {
         assertEq(strategy.settleSlippageBps(), approved, "settlement band widened after approval");
     }
 
-    /// @dev And the rule is a RATCHET, not a comparison against the initial
-    ///      value: once tightened, the old band is no longer reachable either.
-    function test_updateParams_slippageRatchetsDownOnly() public {
+    /// @dev FP-06 changed direction: tightening is refused too, because a band
+    ///      tighter than the venue's impact bricks every settle route.
+    function test_updateParams_slippageCannotBeLowered() public {
         _execute();
 
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(uint256(100), uint256(0)));
-        assertEq(strategy.settleSlippageBps(), 100, "tightening was refused");
-
-        vm.prank(proposer);
         vm.expectRevert(ConcentratedLiquidityStrategy.ImmutableParam.selector);
-        strategy.updateParams(abi.encode(uint256(101), uint256(0)));
+        strategy.updateParams(abi.encode(uint256(100), uint256(0)));
+        assertEq(strategy.settleSlippageBps(), 500, "tightening was admitted");
 
-        // Equal is not a widening, so it stays admissible.
+        // Equal is admissible and the deadline stays tunable.
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(uint256(100), uint256(7 days)));
-        assertEq(strategy.settleSlippageBps(), 100);
-        assertEq(strategy.settleDeadline(), 7 days, "deadline is not gated by the slippage ratchet");
+        strategy.updateParams(abi.encode(uint256(500), uint256(7 days)));
+        assertEq(strategy.settleSlippageBps(), 500);
+        assertEq(strategy.settleDeadline(), 7 days, "deadline is not gated by the slippage rule");
     }
 
     /// @dev The range, the pool, and every rerange-policy field are unreachable
@@ -104,7 +105,7 @@ contract ConcentratedLiquidityStrategyTunablesTest is CLFixture {
         // A payload carrying extra words decodes its first two and ignores the
         // rest — abi.decode does not fail on trailing data.
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(uint256(250), uint256(0), int24(500), address(0xdead), uint256(9_999)));
+        strategy.updateParams(abi.encode(uint256(500), uint256(0), int24(500), address(0xdead), uint256(9_999)));
 
         assertEq(strategy.tickLower(), lowerBefore, "range moved");
         assertEq(strategy.tickUpper(), upperBefore, "range moved");

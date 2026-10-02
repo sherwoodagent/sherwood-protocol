@@ -105,7 +105,9 @@ games, no price drift between claimants. Deposit requests do not use the stamp.
 - **Deposit claim:** requires that no proposal is open. The queue reads
   `previewDeposit(assets)` at the live price, pushes the escrowed assets into the
   vault, then the vault mints that many shares to the receiver (`settleDeposit`;
-  `VaultWithdrawalQueue.claim`). Auto-delegates voting power.
+  `VaultWithdrawalQueue.claim`). Auto-delegates voting power. The claim reverts
+  while the vault is paused, and for a receiver that no longer passes the depositor
+  whitelist rule; the receiver can `cancel` the request instead.
 - **Redeem claim:** vault burns the escrowed shares and pays assets to the owner at
   the frozen price (`settleRedeem`, `src/SyndicateVault.sol:1504`). The payout float
   is protected by `reservedQueueAssets()` — instant withdrawals, fee transfers, and
@@ -114,9 +116,9 @@ games, no price drift between claimants. Deposit requests do not use the stamp.
 ### Cancel
 
 `cancel` on the queue returns the escrowed shares (redeem) or assets (deposit) to
-the owner (`src/queue/VaultWithdrawalQueue.sol:247`). A redeem cancels only until
-its proposal is stamped. A deposit cancels at any time until it is claimed,
-including after settlement and while the vault is paused.
+the owner (`src/queue/VaultWithdrawalQueue.sol:247`), also while the vault is paused.
+A redeem cancels only until its proposal is stamped; its payout is then fixed. A
+deposit cancels at any time until it is claimed, including after settlement.
 
 ## Why this design
 
@@ -130,6 +132,14 @@ including after settlement and while the vault is paused.
 - **Owner rescues are frozen while a proposal is live** — ERC-20/ERC-721 rescue
   paths are blocked during active proposals so strategy position tokens can't be
   siphoned mid-flight.
+- **Rescued tokens stay with the fund.** `rescueERC20` never moves the vault asset,
+  and sends any other token only to a strategy clone of this vault (made by the
+  strategy factory, `vault()` equal to this vault). Such a token comes back to LPs as
+  the vault asset only if that clone's template can sell it: a Portfolio basket slot
+  with a certified price source for the token, or the CL strategy's other token or
+  collateral. Otherwise `rescueTo` only returns the same token to the vault, so a
+  stray token with no such clone has no exit and stays in the vault. Tokens can no
+  longer be sent to the owner, the Safe, or back to a mistaken sender.
 
 ## Timing summary for an LP
 

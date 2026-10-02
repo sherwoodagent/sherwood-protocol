@@ -1102,4 +1102,22 @@ contract TierRegistry is Ownable2Step {
     function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool) {
         return _tokenPriceSource[token][priceSource];
     }
+
+    // ── MORPHO MARKET ALLOWLIST ──
+
+    /// @dev Morpho `MarketParamsLib.id`: binds loan, collateral, oracle, irm and lltv in one grant.
+    mapping(bytes32 marketId => bool) private _morphoMarketAllowed;
+
+    event MorphoMarketAllowedSet(bytes32 indexed marketId, bool allowed);
+
+    /// @notice Allow or disallow the Morpho market `id` for strategy templates. `onlyOwner`.
+    function setMorphoMarketAllowed(bytes32 id, bool allowed) external onlyOwner {
+        _morphoMarketAllowed[id] = allowed;
+        emit MorphoMarketAllowedSet(id, allowed);
+    }
+
+    /// @notice Whether the Morpho market `id` is allowlisted.
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool) {
+        return _morphoMarketAllowed[id];
+    }
 }

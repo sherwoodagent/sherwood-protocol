@@ -15,6 +15,7 @@ interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool);
 }
 
 /**
@@ -42,8 +43,8 @@ contract MorphoSupplyStrategy is BaseStrategy {
     error MarketNotCreated();
     /// @notice `morpho_` is not a counterparty in the `TierRegistry` the vault's governor names.
     error MorphoNotAllowed(address morpho, address registry);
-    /// @notice The market's oracle, or a collateral token other than the asset, is not an allowed counterparty.
-    error CounterpartyNotAllowed(address counterparty, address registry);
+    /// @notice The Morpho market id (all five `MarketParams` fields) is not allowlisted in the registry.
+    error MorphoMarketNotAllowed(Id marketId, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no registry at `_initialize`.
     error TierRegistryUnresolved();
     /// @notice Nothing is tunable between execute and settle; `updateParams` always reverts.
@@ -86,9 +87,8 @@ contract MorphoSupplyStrategy is BaseStrategy {
 
         address vaultAsset = IERC4626(vault()).asset();
         if (mp.loanToken != vaultAsset) revert LoanAssetMismatch();
-        _requireAllowedMarket(registry, mp, vaultAsset);
-
         Id id = mp.id();
+        _requireAllowedMarket(registry, id);
         if (IMorpho(morpho_).market(id).lastUpdate == 0) revert MarketNotCreated();
 
         morpho = IMorpho(morpho_);
@@ -130,15 +130,13 @@ contract MorphoSupplyStrategy is BaseStrategy {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) revert TierRegistryUnresolved();
         if (!_isCounterpartyAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
-        _requireAllowedMarket(registry, _marketParams, asset);
+        _requireAllowedMarket(registry, marketId);
     }
 
-    /// @dev The market's oracle, and its collateral unless it is the vault asset, are protocol-chosen.
-    function _requireAllowedMarket(address registry, MarketParams memory mp, address vaultAsset) private view {
-        if (!_isCounterpartyAllowed(registry, mp.oracle)) revert CounterpartyNotAllowed(mp.oracle, registry);
-        if (mp.collateralToken != vaultAsset && !_isCounterpartyAllowed(registry, mp.collateralToken)) {
-            revert CounterpartyNotAllowed(mp.collateralToken, registry);
-        }
+    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone (FP-02).
+    function _requireAllowedMarket(address registry, Id id) private view {
+        bytes memory call_ = abi.encodeCall(ITierBindingPath.isMorphoMarketAllowed, (Id.unwrap(id)));
+        if (!_readAllowed(registry, call_)) revert MorphoMarketNotAllowed(id, registry);
     }
 
     /// @dev `vault() → governor() → tierRegistry()` walk; `address(0)` when unresolved.
@@ -149,9 +147,12 @@ contract MorphoSupplyStrategy is BaseStrategy {
     }
 
     function _isCounterpartyAllowed(address registry, address venue) private view returns (bool) {
+        return _readAllowed(registry, abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (venue)));
+    }
+
+    function _readAllowed(address registry, bytes memory data) private view returns (bool) {
         if (registry.code.length == 0) return false;
-        (bool ok, bytes memory ret) =
-            registry.staticcall(abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (venue)));
+        (bool ok, bytes memory ret) = registry.staticcall(data);
         if (!ok || ret.length != 32) return false;
         uint256 word;
         assembly ("memory-safe") {
