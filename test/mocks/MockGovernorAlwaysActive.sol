@@ -28,6 +28,13 @@ contract MockGovernorAlwaysActive {
         tierRegistry = registry;
     }
 
+    /// @notice Hop read by `PortfolioStrategy`'s $1-asset check. Zero by default (fail closed).
+    address public exposureLedger;
+
+    function setExposureLedger(address ledger) external {
+        exposureLedger = ledger;
+    }
+
     function getActiveProposal() external pure returns (uint256) {
         return 1;
     }
@@ -83,6 +90,13 @@ contract MockVaultGovernorStub {
 
     constructor(address governor_) {
         governor = governor_;
+    }
+
+    /// @notice ERC4626 `asset()`; `PortfolioStrategy._initialize` binds its asset to it.
+    address public asset;
+
+    function setAsset(address asset_) external {
+        asset = asset_;
     }
 
     function isAgent(address a) external view returns (bool) {
