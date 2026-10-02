@@ -485,10 +485,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _transition(proposal, ProposalState.Executed);
         proposal.executedAt = block.timestamp;
         // Start the management-fee clock. Must follow `_activeProposal` so the
-        // vault's `totalAssets()` reads live NAV through the now-active lane, and
-        // must precede the execute batch so capital it deploys is picked up by
-        // the batch's own base-changing hooks. Accrual runs from here to settle
-        // and nowhere else.
+        // vault's `totalAssets()` reads live NAV through the now-active lane. The
+        // base is the whole fund, stamped here once, before the execute batch;
+        // nothing restamps it before settle. Accrual runs from here to settle.
         ISyndicateVault(vault).startManagementAccrual();
         // Counter stays incremented through Executed; decremented once on the
         // Executed -> Settled edge in `_finishSettlement`. `_activeProposal`

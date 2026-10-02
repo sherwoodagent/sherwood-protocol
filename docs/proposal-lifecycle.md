@@ -53,18 +53,21 @@ executeBy = reviewEnd + executionWindow
 
 All governor parameters are **per-vault**, set instantly by the vault owner but frozen
 while any proposal is open (`whenNoActiveProposal`). Bounds are hardcoded in
-`GovernorParameters.sol`.
+`GovernorParameters.sol`. A change takes effect in the same transaction, so the
+owner can set a 1-hour voting period and an 80% veto threshold and propose in
+the same block; an open proposal keeps the `voteEnd` and veto threshold it
+recorded on entering Pending.
 
 | Step | Parameter | Default | Min | Max | Where enforced |
 |---|---|---|---|---|---|
-| 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:280` |
-| 1. LP voting | `votingPeriod` | 24 h | 24 h (mainnet deploy floor; absolute floor 1 min) | 3 d | `GovernorParameters.sol:334` |
-| 1a. LP veto threshold | `vetoThresholdBps` | 20% | 20% | 80% | `GovernorParameters.sol:342` |
+| 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:268` |
+| 1. LP voting | `votingPeriod` | 24 h (factory default) | 1 h (`MIN_VOTING_PERIOD` on the mainnet impl; absolute floor 1 min) | 3 d | `GovernorParameters.sol:323-325` |
+| 1a. LP veto threshold | `vetoThresholdBps` | 20% | 20% | 80% | `GovernorParameters.sol:331-333` |
 | 2. Guardian review | `registry.reviewPeriod` | 24 h | 6 h (mainnet immutable floor; absolute floor 1 min) | 3 d | `GuardianRegistry.sol:1002` |
-| 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:338` |
-| 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:250-268` |
-| 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:350` |
-| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:837-857` |
+| 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:204` |
+| 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:235-258` |
+| 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:260` |
+| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:560` |
 
 Cross-contract timing invariants (all enforced at the setters):
 
@@ -95,7 +98,8 @@ Cross-contract timing invariants (all enforced at the setters):
   governor cap (see [fees.md](fees.md)).
 - **Proposer bond** pulled into `ProposerBondEscrow`:
   `bondWood = coverageUsd × proposerBondBps (default 1%) / woodPrice`. Fail-closed —
-  unpriceable WOOD blocks proposing (`src/ExposureLedger.sol:951`).
+  unpriceable WOOD blocks proposing any proposal with non-zero required coverage;
+  a zero-coverage proposal needs no bond and no price (`src/ExposureLedger.sol:681-687`).
 
   This is **not** the 10k owner stake. The amount **scales** (tier-2 uncertified =
   full notional × ~1% in USD, converted at `woodPriceX8()`). Do not treat a fixed
@@ -120,21 +124,30 @@ Cross-contract timing invariants (all enforced at the setters):
   recorded at the Draft → Pending transition and lowered by the first vote to the
   same read at the end of the propose second, the two instants vote weight reads.
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
-  (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
+  (Draft/Pending). Proposer can `cancelProposal` while Pending (up to `voteEnd`),
+  during guardian review (until `reviewEnd`, and only while block quorum is not
+  reached), and while Approved (`SyndicateGovernor.sol:575-597`). Cancelling
+  after guardians approved leaves their locks booked (see
+  [coverage.md](coverage.md)).
 
 ### 2. Guardian review (`GuardianRegistry`)
 
 - `openReview` — permissionless keeper call once `voteEnd` passes.
-- **Voters:** active staked-WOOD guardians; weight is age-weighted stake at the
-  open snapshot.
+- **Voters:** active staked-WOOD guardians; weight is raw stake
+  (`getPastStake`) at `snapshotAt`, one second before the block in which the
+  proposal entered Pending (the `propose` block, or for a collaborative
+  proposal the last co-proposer approval), with no age discount
+  (`GuardianRegistry.sol:393, 590`). The denominator is total stake at the same
+  instant.
 - Blocked if blocking stake reaches `blockQuorumBps` (default 30%, bounds 10–100%).
-- Cohort below `MIN_COHORT_STAKE_AT_OPEN` (50 000 sWOOD) → review auto-clears
-  (`cohortTooSmall`).
+- There is no cohort-size floor: any positive total stake decides its own
+  review; only a zero total fails open.
 - Last 10% of the window is vote-locked (`LATE_VOTE_LOCKOUT_BPS`) — no last-second
   swings.
 - `resolveReview` — permissionless once `reviewEnd` passes. A blocked review slashes
-  approving guardians (the *economic commit*, idempotent) at a quadratic severity
-  ramp between `minSlashBps` and `maxSlashBps`.
+  approving guardians (the *economic commit*, idempotent): each approver's rate is
+  its lock over its slash basis, scaled by the block's quadratic severity and
+  clamped into `[minSlashBps, maxSlashBps]` (`GuardianRegistry.sol:900-930`).
 - Full detail: [guardian-network.md](guardian-network.md).
 
 ### 3. Execute (`executeProposal`, `src/SyndicateGovernor.sol:402`)

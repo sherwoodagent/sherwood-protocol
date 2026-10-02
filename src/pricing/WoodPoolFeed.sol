@@ -242,9 +242,9 @@ contract WoodPoolFeed {
         return cumulatives[0];
     }
 
-    /// @dev Arithmetic-mean tick over `spanSeconds`, rounded toward
-    ///      NEGATIVE INFINITY: truncating division rounds a negative delta up,
-    ///      which would report a WOOD price one tick better than the pool held.
+    /// @dev Arithmetic-mean tick over `spanSeconds`, rounded toward NEGATIVE
+    ///      INFINITY. This understates WOOD by up to one tick when WOOD is token0
+    ///      and overstates it by up to one tick when WOOD is token1.
     function _meanTick(int56 previous, int56 latest, uint32 spanSeconds) internal pure returns (int24) {
         int256 span = int256(uint256(spanSeconds));
         int256 delta = int256(latest) - int256(previous);

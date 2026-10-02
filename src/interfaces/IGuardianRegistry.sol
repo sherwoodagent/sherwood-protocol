@@ -105,9 +105,8 @@ interface IGuardianRegistry {
 
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
-    ///         is read from sWOOD's `getPastStake` at the review's `snapshotAt`,
-    ///         which is frozen when the governor registers the review at propose
-    ///         time.
+    ///         is the caller's raw sWOOD `getPastStake` at `snapshotAt` (one
+    ///         second before the proposal entered Pending), with no age discount.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
     ///         at `resolveReview`. A vote cast once the review window is due but

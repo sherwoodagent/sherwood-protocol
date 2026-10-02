@@ -183,9 +183,9 @@ abstract contract ChallengeEndToEndBase is Test {
     /// @dev RETIRED with the compensatory rate. `VERDICT_BPS` was the
     ///      coverage-proportional figure `slashBpsFor` used to derive (6,667 —
     ///      two thirds of a bond, being this fixture's share of the loss). The
-    ///      rate is now the severity ceiling for every committed approver, so
-    ///      the whole of `G1_STAKE` is taken and the split constants that
-    ///      apportioned it between LPs have no meaning.
+    ///      rate is now each approver's lock over its slash basis, floored at
+    ///      `minSlashBps`, and the split constants that apportioned the slash
+    ///      between LPs have no meaning.
 
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
