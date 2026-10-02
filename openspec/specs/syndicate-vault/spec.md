@@ -36,7 +36,8 @@ SHALL equal the asset's `decimals()`, cached once at initialization.
 - **THEN** the virtual-shares offset is 6, yielding 12-decimal shares
 
 ### Requirement: Vote checkpointing and auto-delegation
-The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder.
+
+The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder. Voting power SHALL NOT be delegated away from the holder: `delegate` and `delegateBySig` SHALL revert `DelegationDisabled` for any delegatee other than the account itself (including `address(0)`), so every share in the veto denominator is castable by its holder and the recorded electorate equals the castable weight at the snapshot.
 
 #### Scenario: Recipient auto-delegates on receipt
 - **WHEN** shares are transferred or minted to an address that is not delegated to itself
@@ -47,9 +48,12 @@ The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
 #### Scenario: Delegation away from the holder is refused
-- **WHEN** any caller invokes `delegate` or `delegateBySig` naming a delegatee other than itself
-- **THEN** the call reverts `DelegationDisabled`, so every holder's checkpointed votes
-  equal its own balance; `delegate(self)` succeeds as a no-op
+- **WHEN** a holder calls `delegate` or `delegateBySig` with a delegatee that is not itself (another holder, the queue, or `address(0)`)
+- **THEN** the call reverts `DelegationDisabled` and the holder's shares keep voting for the holder
+
+#### Scenario: Self-delegation is a no-op
+- **WHEN** a holder calls `delegate(self)`
+- **THEN** the call succeeds and `delegates(holder) == holder`
 
 ### Requirement: Instant deposit flow
 
@@ -102,37 +106,46 @@ The vault owner SHALL control deposit access via an open/closed mode flag (`setO
 
 ### Requirement: Instant withdrawal flow and capacity
 
-While no proposal is active, instant `withdraw`/`redeem` SHALL be available up to the
+While no proposal is open, instant `withdraw`/`redeem` SHALL be available up to the
 holder's balance, capped by instant capacity = available float (idle balance minus
-the queue's reserved assets). While a proposal is active, `maxWithdraw`/`maxRedeem`
-SHALL return 0 for every holder except the bound withdrawal queue, and exits route
-through the async queue — mid-proposal exits route to the queue, full stop. A
-requested exit whose assets plus the queue reserve exceed the idle balance SHALL
-revert `QueueReserveBreached`; the vault SHALL NOT pull capital from a strategy to
-serve an exit.
+the queue's reserved assets). From Draft creation until the proposal reaches a
+terminal state (settled, cancelled, rejected or expired, as committed on-chain),
+`maxWithdraw`/`maxRedeem` SHALL return 0 for every holder except the bound withdrawal
+queue, and exits route through the async queue — full stop. The lock starts at Draft
+creation, ahead of the vote snapshot and the electorate stamp, so no instant exit can
+land on either side of the stamp. Because the exit views cap every holder at the
+available float, an over-float `withdraw`/`redeem` SHALL revert in the ERC-4626 max
+check (`ERC4626ExceededMaxWithdraw` / `ERC4626ExceededMaxRedeem`); the vault SHALL
+NOT pull capital from a strategy to serve an exit.
 
 #### Scenario: Exit served from float
 
-- **WHEN** no proposal is active and a holder withdraws no more than the available
+- **WHEN** no proposal is open and a holder withdraws no more than the available
   float
-- **THEN** assets transfer out with no strategy interaction
+- **THEN** the withdrawal is served instantly from the vault's idle balance
 
 #### Scenario: Exit beyond available float reverts
 
-- **WHEN** a withdrawal's assets plus the queue reserve exceed the vault's idle
-  balance
-- **THEN** the withdrawal reverts `QueueReserveBreached`
+- **WHEN** a withdrawal's assets exceed the available float (idle balance minus the
+  queue reserve)
+- **THEN** the withdrawal reverts `ERC4626ExceededMaxWithdraw` (a redeem,
+  `ERC4626ExceededMaxRedeem`)
 
 #### Scenario: Active proposal means queue-only
 
-- **WHEN** a proposal is active
+- **WHEN** a proposal is open, Draft included
 - **THEN** `maxWithdraw` and `maxRedeem` return 0 for every holder except the bound
   withdrawal queue
+
+#### Scenario: Exit during a collaborative Draft
+
+- **WHEN** a proposal is in Draft and a holder tries an instant redeem
+- **THEN** it reverts (`maxRedeem` is 0), and the holder's path is `requestRedeem`
 
 #### Scenario: Queue bypasses caps it owns
 
 - **WHEN** the bound withdrawal queue is the caller/owner of a withdrawal
-- **THEN** the reserve cap and the active-proposal gate do not apply (the reserved
+- **THEN** the reserve cap and the open-proposal gate do not apply (the reserved
   float belongs to the queue)
 
 #### Scenario: maxRedeem excludes queued shares
@@ -149,19 +162,24 @@ serve an exit.
 
 #### Scenario: Missing governor fails closed in exit views
 
-- **WHEN** the factory resolves a zero governor for the vault
+- **WHEN** the factory resolves a zero governor for an unpaused vault and the owner is
+  not the withdrawal queue
 - **THEN** `maxWithdraw`/`maxRedeem` revert `GovernorNotSet` (via
   `redemptionsLocked()`) rather than reporting instant capacity
 
 ### Requirement: Async redemption requests (Lane B)
 
-`requestRedeem(shares, owner)` SHALL be callable only while `redemptionsLocked()` is
-true, the vault is not paused, and a withdrawal queue is bound; zero shares SHALL
-revert `InsufficientShares`, an unset queue `WithdrawalQueueNotSet`, and an unlocked
-vault `RedemptionsNotLocked`. A caller other than the share owner SHALL spend ERC-20
-allowance. The shares SHALL be transferred (not burned) into queue custody, tagged
-with the active proposal id, and a request id strictly greater than 0 SHALL be
-returned with `RedeemRequested` emitted.
+`requestRedeem(shares, owner)` SHALL be callable only while the vault is not paused,
+a withdrawal queue is bound, and `redemptionsLocked()` is true (any proposal open,
+Draft included), checked in that order: a paused vault reverts `EnforcedPause`, an
+unset queue `WithdrawalQueueNotSet`, an unlocked vault `RedemptionsNotLocked`, and
+zero shares `InsufficientShares`. A caller other than the share owner SHALL spend
+ERC-20 allowance. The shares SHALL be transferred (not burned) into queue custody,
+tagged with the executing proposal's id, or while none is executing with the latest
+proposal id (`proposalCount()`), and a request id strictly greater than 0 SHALL be
+returned with `RedeemRequested` emitted. A request is priced only by its proposal's
+settle stamp: a request tagged to a proposal that ends without settling is never
+stamped, and its only exit is the queue's `cancel`.
 
 #### Scenario: Queued exit escrows shares
 
@@ -171,9 +189,14 @@ returned with `RedeemRequested` emitted.
 
 #### Scenario: Request outside the lock window
 
-- **WHEN** no proposal is active
+- **WHEN** no proposal is open
 - **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the
   correct path)
+
+#### Scenario: Request tagged to a proposal that never settles
+
+- **WHEN** a holder queues a redemption during a Draft or a vote and that proposal is then cancelled, rejected or expires
+- **THEN** the request is never stamped, `claim` keeps reverting, and `cancel` returns the shares
 
 ### Requirement: Async deposit requests (Lane B)
 `requestDeposit(assets, receiver)` SHALL be callable only while `redemptionsLocked()` is true, the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted.

@@ -360,7 +360,7 @@ The factory SHALL additionally own the batch-executor migration primitives: `set
 - **THEN** the call SHALL revert with `NotFactoryGovernor`
 
 ### Requirement: Status surface for the vault and observers
-The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes — `getActiveProposal()` (id of the executing proposal, 0 if none), `openProposalCount()` (count of proposals binding the vault; nonzero gates instant deposits), and `strategyOf(proposalId)` (scalar strategy adapter, address(0) = none) — plus full read views (`getProposal` with the authoritative resolved state overlaid, `getProposalState`, execute/settlement calls, vote weight and hasVoted, risk envelope, tier, required coverage, cooldown end, capital snapshot, and co-proposers). `getVoteWeight` on a Draft whose snapshot is unset SHALL revert with `ProposalInDraft` rather than silently returning zero; otherwise it SHALL return the weight `vote` would record — the same end-of-propose-second cap — and zero while `block.timestamp <= snapshotTimestamp + 1`, when no vote can be cast yet.
+The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes — `getActiveProposal()` (id of the executing proposal, 0 if none), `openProposalCount()` (count of proposals binding the vault, Drafts included; nonzero gates instant deposit, instant redemption and the owner's rescue paths), and `strategyOf(proposalId)` (scalar strategy adapter, address(0) = none) — plus full read views (`getProposal` with the authoritative resolved state overlaid, `getProposalState`, execute/settlement calls, vote weight and hasVoted, risk envelope, tier, required coverage, cooldown end, capital snapshot, and co-proposers). `getVoteWeight` on a Draft whose snapshot is unset SHALL revert with `ProposalInDraft` rather than silently returning zero; otherwise it SHALL return the weight `vote` would record — the same end-of-propose-second cap — and zero while `block.timestamp <= snapshotTimestamp + 1`, when no vote can be cast yet.
 
 #### Scenario: getProposal reports resolved state
 - **WHEN** `getProposal` is read for a proposal whose stored state lags its time-determined state
@@ -373,6 +373,10 @@ The governor SHALL expose the narrow `IProposalStatus` seam the vault consumes �
 #### Scenario: Vote weight view agrees with vote
 - **WHEN** `getVoteWeight` is read for a holder who redeemed ahead of `propose` in its second, after that second has ended
 - **THEN** it SHALL return zero, matching `vote` reverting with `NoVotingPower`; for any other holder it SHALL equal the weight `vote` records
+
+#### Scenario: A Draft locks both LP flows
+- **WHEN** a collaborative Draft is the only open proposal
+- **THEN** `openProposalCount()` is 1 and `getActiveProposal()` is 0: instant deposit and instant redeem are both locked
 
 ### Requirement: Owner bond gates the normal proposal lane
 `propose` and `executeProposal` SHALL both refuse with `OwnerBondNotLive` when `IGuardianRegistry.ownerBondLive(vault)` is false, read through the registry handle the governor already holds — the same route `GovernorEmergency` uses for `ownerStake`. The gate SHALL be re-asserted at execute and not only at admission: the bond that matters is the one live WHEN CAPITAL MOVES, and the vote plus the review period sit between the two points. The reachable route between them is `slashOwnerBond`, which carries no open-proposal gate; the owner's own exit is not that route, because `requestUnstakeOwner` refuses while a proposal is open and `propose` refuses once a request is in. The gate SHALL be a state check and not a latch, so re-funding the slot reopens the lane. Registered-agent status (`isAgent`) is independent of the owner's stake and SHALL NOT be treated as a substitute for this check.
