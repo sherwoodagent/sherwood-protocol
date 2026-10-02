@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines the guardian-side economic core of Sherwood held in `StakedWood` (sWOOD), the sole WOOD custodian: guardian registration and staking, the unstake request/cancel/claim lifecycle, age-weighted vote checkpoints, the review-path and verdict-path slash mechanics with their severity envelope, the `authorizedSlasher` role, and the exposure-ledger/coverage-freezer gates on stake release.
+Defines the guardian-side economic core held in `StakedWood` (sWOOD), the sole WOOD custodian: guardian registration and staking, the unstake request/cancel/claim lifecycle, the raw stake checkpoints that guardian votes weigh (plus an age-weighted `getPastVotes` read that no contract consumes), the review-path and verdict-path slashes and their envelope, the `authorizedSlasher` role, and the exposure-ledger gates on stake release.
 ## Requirements
 ### Requirement: Guardian staking and registration
 `stakeAsGuardian(amount, agentId)` SHALL transfer `amount` WOOD from the caller into sWOOD custody and credit the caller's guardian stake. On a first stake (previous stake zero) it SHALL record `agentId` and anchor the stake-age clock (`stakedAt`) to the current timestamp; on top-ups the `agentId` argument SHALL be ignored. The resulting total stake MUST be at least `minGuardianStake`, or the call SHALL revert `InsufficientStake`. A guardian with a pending unstake request MUST NOT top up (revert `UnstakeAlreadyRequested`) — topping up while inactive would grow the quorum denominator without creating votable weight. Staking SHALL NOT be gated by any pause mechanism. Each stake SHALL push the guardian's votable-stake checkpoint, the guardian's liability checkpoint, and the global total-stake checkpoint, increase `totalGuardianStake`, and emit `GuardianStaked(guardian, amount, agentId)`.
@@ -20,11 +20,11 @@ Defines the guardian-side economic core of Sherwood held in `StakedWood` (sWOOD)
 - **THEN** the call reverts `UnstakeAlreadyRequested`; the guardian must first cancel the request
 
 ### Requirement: Stake-age re-anchor on top-up
-A top-up SHALL re-anchor `stakedAt` to the stake-weighted average timestamp `ceil((oldStake * stakedAt + amount * now) / newTotal)`, rounding toward `now`, so new WOOD matures pro-rata rather than inheriting the position's age. This closes the "stake dust early, top up the whale position later, inherit full maturity" hole. Rounding MUST never grant free age.
+A top-up SHALL re-anchor `stakedAt` to the stake-weighted average timestamp `ceil((oldStake * stakedAt + amount * now) / newTotal)`, rounding toward `now`, so new WOOD matures pro-rata rather than inheriting the position's age. Rounding MUST never grant free age. The anchor feeds only the age-weighted `getPastVotes` read, which no protocol contract consumes; every on-chain vote weighs raw stake.
 
 #### Scenario: Top-up ages in pro-rata
 - **WHEN** an aged guardian tops up an existing stake
-- **THEN** `stakedAt` moves forward to the stake-weighted average of the old anchor and now, and the position's age factor drops proportionally
+- **THEN** `stakedAt` moves forward to the stake-weighted average of the old anchor and now, and the position's `getPastVotes` age factor drops proportionally
 
 ### Requirement: Active-guardian status
 A guardian SHALL be active if and only if `stakedAmount > 0` and no unstake request is pending (`unstakeRequestedAt == 0`). `isActiveGuardian(guardian)` SHALL expose this predicate; the guardian registry consults it to gate review voting.
@@ -49,25 +49,25 @@ A guardian SHALL be active if and only if `stakedAmount > 0` and no unstake requ
 - **THEN** its liability checkpoint at any past or current instant is unchanged, so a slash sized after the request still recovers against the full bond
 
 ### Requirement: Unstake cancel
-`cancelUnstakeGuardian()` SHALL revert `UnstakeNotRequested` when no request is pending, and `NoActiveStake` when the guardian was fully slashed between request and cancel (a cancel must not resurrect a ghost guardian with no stake). A successful cancel SHALL clear the request, re-add the stake to `totalGuardianStake`, restore the votable-stake checkpoint to the current staked amount, push the total-stake checkpoint, and emit `GuardianUnstakeCancelled`. A request-then-cancel round trip yields a stake aged from the request timestamp, not from the original stake and not from the cancel.
+`cancelUnstakeGuardian()` SHALL revert `UnstakeNotRequested` when no request is pending, and `NoActiveStake` when the guardian was fully slashed between request and cancel (a cancel must not resurrect a ghost guardian with no stake). A successful cancel SHALL clear the request, re-add the stake to `totalGuardianStake`, restore the votable-stake checkpoint to the current staked amount, push the total-stake checkpoint, and emit `GuardianUnstakeCancelled`. A request-then-cancel round trip leaves the `getPastVotes` age measured from the request timestamp, not from the original stake and not from the cancel.
 
 #### Scenario: Cancel restores votability
 - **WHEN** a guardian with a pending request cancels it
-- **THEN** its votable weight (aged from the request timestamp) and its contribution to the quorum denominator are restored
+- **THEN** its votable-stake checkpoint and its contribution to the quorum denominator are restored, and its `getPastVotes` age is measured from the request timestamp
 
 #### Scenario: Cancel after full slash
 - **WHEN** a guardian was slashed to zero while its unstake request was pending and then calls `cancelUnstakeGuardian`
 - **THEN** the call reverts `NoActiveStake`
 
 ### Requirement: Unstake claim gated by cooldown and open coverage
-`claimUnstakeGuardian()` SHALL revert `UnstakeNotRequested` without a pending request and `CooldownNotElapsed` before `unstakeRequestedAt + cooldownAtRequest`. When an exposure ledger is wired (`exposureLedger != address(0)`), the claim SHALL additionally revert `CoverageStillOpen` while the guardian has either non-zero open underwriting exposure (`openExposureUsd != 0`) or any frozen coverage (`hasFrozenCoverage == true`). The gate binds the claim, not the request. When no ledger is wired the coverage gate SHALL be skipped (deliberate fail-open for the deploy/upgrade window; the deploy script asserts the wiring). A successful claim SHALL delete the guardian record entirely (deregistration — a later re-stake may record a different `agentId` and starts a fresh age clock), push a zero liability checkpoint (the moment liability actually ends), transfer the WOOD to the guardian, and emit `GuardianUnstakeClaimed`.
+`claimUnstakeGuardian()` SHALL revert `UnstakeNotRequested` without a pending request and `CooldownNotElapsed` before `unstakeRequestedAt + cooldownAtRequest`. When an exposure ledger is wired (`exposureLedger != address(0)`), the claim SHALL additionally revert `CoverageStillOpen` while the guardian has either non-zero open underwriting exposure (`openExposure != 0`, in WOOD) or any frozen or pinned coverage (`hasFrozenCoverage == true`). The gate binds the claim, not the request. When no ledger is wired the coverage gate SHALL be skipped (deliberate fail-open for the deploy/upgrade window; the post-deploy verification asserts the wiring). A successful claim SHALL delete the guardian record entirely (deregistration — a later re-stake may record a different `agentId` and starts a fresh age clock), push a zero liability checkpoint (the moment liability actually ends), transfer the WOOD to the guardian, and emit `GuardianUnstakeClaimed`.
 
 #### Scenario: Claim before cooldown
 - **WHEN** a guardian claims before the frozen cooldown has elapsed
 - **THEN** the call reverts `CooldownNotElapsed`
 
 #### Scenario: Claim blocked by open exposure
-- **WHEN** the cooldown has elapsed but the exposure ledger reports non-zero `openExposureUsd` for the guardian
+- **WHEN** the cooldown has elapsed but the exposure ledger reports non-zero `openExposure` for the guardian
 - **THEN** the claim reverts `CoverageStillOpen` until the exposure runs down
 
 #### Scenario: Claim blocked by frozen coverage
@@ -84,22 +84,22 @@ A guardian SHALL be active if and only if `stakedAmount > 0` and no unstake requ
 
 ### Requirement: Age-weighted vote weight
 
-A guardian's vote weight SHALL be its raw votable own-stake checkpoint discounted by a linear age factor: the factor ramps from `ageFloorBps` (bps of raw stake) at age 0 to par (10,000 bps) at `maturationPeriod`, then plateaus at par. Age is measured from the `stakedAt` anchor AS OF THE READ TIMESTAMP: sWOOD SHALL checkpoint the anchor (timestamp-keyed trace, pushed in the same transaction as every anchor write — first stake, top-up re-anchor, unstake request) and `getPastVotes(guardian, ts)` SHALL return `rawOwnCheckpoint(ts) * ageFactorBps(anchorCheckpoint(ts), ts) / 10_000`. Historical reads are therefore exact: a later top-up or re-anchor can neither inflate nor deflate an already-past read (the former live-anchor saturation, "deflation-only drift", is removed). A read at a timestamp before the guardian's first anchor checkpoint sees an empty trace (anchor 0) and a zero raw checkpoint, and returns 0. `getVotes(account)` SHALL return the live equivalent (`getPastVotes` at the current timestamp), which is unchanged: at the current timestamp the checkpointed anchor IS the live anchor. Weight MUST never exceed raw stake at the same timestamp. A guardian with a pending unstake request has a zero votable checkpoint and therefore zero weight. The age factor's `ageFloorBps` / `maturationPeriod` parameters are read live at evaluation time, for historical reads as for current ones — parameter changes re-price history identically to today; the anchor trace does not change that.
+`getPastVotes` SHALL be the age-weighted read: a guardian's raw votable own-stake checkpoint discounted by a linear age factor that ramps from `ageFloorBps` (bps of raw stake) at age 0 to par (10,000 bps) at `maturationPeriod`, then plateaus at par. No contract reads it: guardian review votes, emergency block votes and challenge votes weigh the raw `getPastStake` (see "Distinct vote-read bases"); it serves off-chain Snapshot reads. Age is measured from the `stakedAt` anchor AS OF THE READ TIMESTAMP: sWOOD SHALL checkpoint the anchor (timestamp-keyed trace, pushed in the same transaction as every anchor write — first stake, top-up re-anchor, unstake request) and `getPastVotes(guardian, ts)` SHALL return `rawOwnCheckpoint(ts) * ageFactorBps(anchorCheckpoint(ts), ts) / 10_000`. Historical reads are therefore exact: a later top-up or re-anchor can neither inflate nor deflate an already-past read. A read at a timestamp before the guardian's first anchor checkpoint sees an empty trace (anchor 0) and a zero raw checkpoint, and returns 0. `getVotes(account)` SHALL return the live equivalent (`getPastVotes` at the current timestamp): at the current timestamp the checkpointed anchor IS the live anchor. Weight MUST never exceed raw stake at the same timestamp. A guardian with a pending unstake request has a zero votable checkpoint and therefore zero weight. The age factor's `ageFloorBps` / `maturationPeriod` parameters are read live at evaluation time, for historical reads as for current ones.
 
 #### Scenario: Fresh stake votes at the floor
 
 - **WHEN** a guardian's stake was anchored at the read timestamp (age 0)
-- **THEN** its vote weight is `ageFloorBps` of its raw checkpointed stake
+- **THEN** its `getPastVotes` weight is `ageFloorBps` of its raw checkpointed stake
 
 #### Scenario: Matured stake votes at par
 
 - **WHEN** the stake's age at the read timestamp is at least `maturationPeriod`
-- **THEN** its vote weight equals its raw checkpointed stake
+- **THEN** its `getPastVotes` weight equals its raw checkpointed stake
 
 #### Scenario: A later top-up does not deflate an earlier read
 
 - **WHEN** a guardian stakes, a snapshot timestamp `ts` passes, the guardian tops up (re-anchoring the live `stakedAt` forward past what it was at `ts`), and `getPastVotes(g, ts)` is then evaluated
-- **THEN** the result uses the anchor as it stood at `ts` — the same value the read would have returned before the top-up — not the re-anchored live value that previously saturated the age toward the floor
+- **THEN** the result uses the anchor as it stood at `ts` — the same value the read would have returned before the top-up
 
 #### Scenario: Unstake-requested guardian has zero weight
 
@@ -112,11 +112,15 @@ A guardian's vote weight SHALL be its raw votable own-stake checkpoint discounte
 - **THEN** the result is 0 — the raw trace is empty there, and the empty anchor trace cannot manufacture weight
 
 ### Requirement: Distinct vote-read bases — aged, raw, and total
-sWOOD SHALL expose three deliberately distinct historical reads. `getPastVotes` is the AGE-WEIGHTED per-guardian weight (correct for weighing a vote). `getPastStake(guardian, ts)` is the RAW votable own-stake checkpoint — the same basis `getPastTotalVotes` sums, so the two are comparable and subtractable; it reads the checkpoint directly with no live, re-anchorable factor, denying an accused approver the lever of requesting unstake to shrink its own contribution to a participation floor. `getPastTotalVotes(ts)` (and its alias `getPastTotalSupply(ts)`) SHALL return the raw total-active-stake checkpoint: totals stay RAW because aging only shrinks numerators, so the raw denominator is a conservative (upper-bound) quorum denominator — the aged per-account weights sum to at most the total. `getPastVotes` is NOT a term of `getPastTotalVotes`; consumers subtracting from the total MUST use `getPastStake`. sWOOD SHALL NOT implement the full OZ `IVotes` interface (no `delegate`/`delegates`/`delegateBySig`); the read surface exists for Snapshot's `erc20-votes` strategy and on-chain consumers.
+sWOOD SHALL expose three deliberately distinct historical reads. `getPastVotes` is the AGE-WEIGHTED per-guardian weight; no contract reads it. `getPastStake(guardian, ts)` is the RAW votable own-stake checkpoint — the same basis `getPastTotalVotes` sums, so the two are comparable and subtractable; it reads the checkpoint directly with no live, re-anchorable factor. `GuardianRegistry` weighs every guardian review vote and every emergency block vote with `getPastStake` at the proposal's snapshot (`snapshotAt`, one second before the block in which the proposal entered Pending; the emergency round stores it as `openedAt`, falling back to one second before the round opened for a review registered without a snapshot), against `getPastTotalVotes` at the same instant, so stake checkpointed at a timestamp strictly earlier than that block's votes at full weight. `ChallengeGame.voteOnChallenge` weighs a ballot as `min(getPastStake(voter, filedAt - 1), getPastStake(voter, snapshotAt))`, and `ChallengeGame.file` subtracts the accused cohort from `getPastTotalVotes(filedAt - 1)` with `getPastStake`, the same raw basis the total sums. `getPastTotalVotes(ts)` (and its alias `getPastTotalSupply(ts)`) SHALL return the raw total-active-stake checkpoint; the aged per-account weights sum to at most the total. `getPastVotes` is NOT a term of `getPastTotalVotes`; consumers subtracting from the total MUST use `getPastStake`. sWOOD SHALL NOT implement the full OZ `IVotes` interface (no `delegate`/`delegates`/`delegateBySig`); the read surface exists for Snapshot's `erc20-votes` strategy and on-chain consumers.
 
 #### Scenario: Raw and aged reads diverge on young stake
 - **WHEN** a guardian's stake is younger than `maturationPeriod` at timestamp `ts`
 - **THEN** `getPastStake(g, ts)` returns the full raw checkpoint while `getPastVotes(g, ts)` returns the age-discounted fraction
+
+#### Scenario: Review ballots are raw
+- **WHEN** a guardian staked 30,000 WOOD at a timestamp strictly earlier than the `propose` block and votes Block in that proposal's review or emergency round
+- **THEN** its ballot weighs 30,000, not the age-discounted `getPastVotes` figure; a challenge ballot on that proposal is likewise raw
 
 #### Scenario: Conservative quorum denominator
 - **WHEN** any set of guardians' aged weights (`getPastVotes`) at `ts` are summed
@@ -127,14 +131,14 @@ sWOOD SHALL expose three deliberately distinct historical reads. `getPastVotes` 
 - **THEN** `getPastStake(g, ts)` still returns the pre-request checkpointed amount
 
 ### Requirement: Dual checkpoint traces — votability versus liability
-sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different questions. The votable trace (`getPastStake` basis) is pushed on stake, unstake request (to 0), cancel, and slash. The liability trace — what the guardian is on the hook for at a past instant — is pushed on stake, on slash, and on claim (to 0), and deliberately NOT on request or cancel, which change only votability. Sharing one trace would let an approver discharge its liability with a free, reversible `requestUnstakeGuardian` sent before the drain it voted for executed, so a later conviction sized at or after execution would recover nothing.
+sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different questions. The votable trace (`getPastStake` basis) is pushed on stake, unstake request (to 0), cancel, and on a non-zero slash of a still-active guardian. The liability trace — what the guardian is on the hook for at a past instant — is pushed on stake, on a non-zero slash, and on claim (to 0), and deliberately NOT on request or cancel, which change only votability. Sharing one trace would let an approver discharge its liability with a free, reversible `requestUnstakeGuardian` sent before the drain it voted for executed, so a later conviction sized at or after execution would recover nothing.
 
 #### Scenario: Exit pre-positioning does not void a conviction
 - **WHEN** an approver requests unstake after approving a proposal and a slash is later sized at an anchor after the request
 - **THEN** the slash basis reads the liability trace, which still carries the full bond, and the conviction recovers against it
 
 ### Requirement: Review-path slash (registry-only)
-`slashGuardians(reviewKey, openedAt, approvers, slashBps)` SHALL be callable only by the wired guardian registry (revert `NotRegistry` otherwise). For each approver it SHALL burn `slashBps` (bps of 10,000) of the approver's own stake, sized off the greater of the liability and votable checkpoints at `openedAt` and clamped to live stake (a concurrent slash may already have reduced it). Age discounts voting power, not liability: the slash basis is raw staked amount, never age-discounted. For a still-active approver the slash decrements `totalGuardianStake` and re-checkpoints votable stake; for an unstake-requested approver the aggregate was already decremented at request time, and a slash to zero clears the request stamp so no ghost guardian survives. The liability trace re-checkpoints on both branches. `GuardianSlashed(reviewKey, approver, ownSlash, delegatedSlash)` SHALL be emitted only when a non-zero amount was slashed; `delegatedSlash` is always 0 (DPoS delegation removed; parameter retained for ABI compatibility). The aggregate total-stake checkpoint is pushed once after the loop and the total is burned in a single transfer. The severity supplied by the registry is deterministic — a quadratic ramp of block-side decisiveness bounded to `[minSlashBps, maxSlashBps]` (see the guardian-review capability).
+`slashGuardians(reviewKey, openedAt, approvers, slashBps)` SHALL be callable only by the wired guardian registry (revert `NotRegistry` otherwise). For each approver it SHALL burn `slashBps` (bps of 10,000) of the approver's slash basis — the greater of the liability and votable checkpoints at `openedAt`, clamped to live stake (a concurrent slash may already have reduced it). The rate supplied for each approver SHALL be computed by the registry as `clamp(ceil(lockBps × severity / 10_000), minSlashBps, maxSlashBps)`, where `lockBps` is the approver's WOOD lock for the review over that same basis (the ledger's `slashBpsForAt` at the review-open instant, see the guardian-coverage capability) and `severity` is the review's deterministic severity — so the amount burned is `min(lock, basis) × severity / 10_000` unless the envelope binds, never a fraction of the whole bond chosen independently of the lock. The envelope `[minSlashBps, maxSlashBps]` SHALL be the one SNAPSHOTTED AT REVIEW OPEN — never the live values — so `minSlashBps` is the floor a guardian cannot declare their way under, while the owner cannot raise what an already-decided review costs between open and resolve. The staking contract SHALL NOT apply the live envelope in either direction: not the live floor (the owner could raise what a decided review costs) and not the live ceiling (the owner could zero `maxSlashBps` between open and resolve and nullify the burn). Its only cap SHALL be the arithmetic saturation at 10,000 bps, a constant no role controls. The adversary of both rules is the sWOOD owner — the same multisig that owns the registry — changing the envelope after a review has opened to punish, or to spare, a specific cohort against the terms they voted under. A rate whose lock-times-severity product is zero SHALL be passed as zero, never as the raw lock rate. With no exposure ledger wired the registry passes all-zero rates and nothing is slashed. Age discounts voting power, not liability: the slash basis is raw staked amount, never age-discounted. For a still-active approver the slash decrements `totalGuardianStake` and re-checkpoints votable stake; for an unstake-requested approver the aggregate was already decremented at request time, and a slash to zero clears the request stamp so no ghost guardian survives. The liability trace re-checkpoints on both branches. `GuardianSlashed(reviewKey, approver, ownSlash, delegatedSlash)` SHALL be emitted only when a non-zero amount was slashed; `delegatedSlash` is always 0 (parameter retained for ABI compatibility). The aggregate total-stake checkpoint is pushed once after the loop and the total is burned in a single transfer. The severity is a quadratic ramp of block-side decisiveness bounded to the at-open envelope. The adversary is a guardian who backed a bad proposal with a small lock while holding a large bond: they lose the lock scaled by severity, and never less than `minSlashBps` of the basis.
 
 #### Scenario: Non-registry caller
 - **WHEN** any address other than the wired registry calls `slashGuardians`
@@ -143,6 +147,18 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 #### Scenario: Slash sized at review open, clamped to live
 - **WHEN** an approver's checkpointed stake at `openedAt` exceeds its live stake at slash time
 - **THEN** the slash is computed on the live (smaller) amount
+
+#### Scenario: Burn tracks the lock, not the bond
+- **WHEN** an approver whose basis is 2,000 WOOD locked 500 WOOD on the reviewed proposal, the review's severity is 10,000 bps, and the envelope does not bind
+- **THEN** 500 WOOD is burned and 1,500 WOOD remains staked, covering the approver's other locks
+
+#### Scenario: Envelope floors a small lock
+- **WHEN** an approver's lock-and-severity rate is below the `minSlashBps` snapshotted at review open
+- **THEN** the burn is that at-open `minSlashBps` of the basis, not the smaller lock
+
+#### Scenario: Owner cannot raise the floor on a decided review
+- **WHEN** the owner raises `minSlashBps` after a review has opened and before it resolves Blocked
+- **THEN** the approvers are floored at the value in force at open; the raise applies only to reviews opened afterwards
 
 #### Scenario: Fully slashed guardian mid-request
 - **WHEN** an unstake-requested approver is slashed to zero stake
@@ -153,7 +169,7 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 - **THEN** the total is transferred to the dead burn address in one transfer
 
 ### Requirement: Verdict-path slash to escrow (authorizedSlasher-only)
-`slashVerdict(caseKey, openedAt, approvers, slashBpsPer)` SHALL be callable only by `authorizedSlasher` (revert `NotAuthorizedSlasher` otherwise) and SHALL BURN its proceeds — the protocol makes no compensation promise to depositors. Preconditions, each reverting: `openedAt` in the future → `VerdictNotPast`; `openedAt == 0` → `InvalidParameter` (a real verdict never anchors at the zero timestamp, and that key has no checkpoint, so the call would silently void itself); `slashBpsPer.length != approvers.length` → `SlashBpsLengthMismatch`; any address repeated within `approvers` → `DuplicateApprover` (zero-rate entries are not exempt from the duplicate scan). The verdict takes no vault address, no snapshot timestamp and no payee: nothing is apportioned, so it needs no opinion about which vault the verdict concerned. The `openedAt` bound is an honest-caller sanity check only — it does not constrain a compromised slasher, which chooses it freely. Per approver: a zero rate SHALL be skipped entirely (zero is the absence of liability, not a severity to floor); an approver already slashed under the same `caseKey` by an earlier call SHALL revert `ApproverAlreadySlashed`; each non-zero rate SHALL be clamped per-element to `[minSlashBps, maxSlashBps]`; the slash leg is the same own-stake leg as the review path (sized at `openedAt` off `max(liability, votable)`, clamped to live). The per-`(caseKey, approver)` mark SHALL be recorded only when the slash actually recovered a non-zero amount, so a zero take does not consume the verdict's one slash and foreclose a retry after re-stake. The mark (readable via `verdictSlashed(caseKey, approver)`) makes the severity envelope bind per VERDICT, not merely per call — splitting a quorum-sized batch across transactions stays legal, replaying an approver does not. The event topic key SHALL be namespaced (`keccak256("sherwood.verdict" ‖ caseKey)`) so a crafted `caseKey` cannot make a verdict slash collide with a review key in `GuardianSlashed` topics.
+`slashVerdict(caseKey, openedAt, approvers, slashBpsPer)` SHALL be callable only by `authorizedSlasher` (revert `NotAuthorizedSlasher` otherwise) and SHALL BURN its proceeds — the protocol makes no compensation promise to depositors. Preconditions, each reverting: `openedAt` in the future → `VerdictNotPast`; `openedAt == 0` → `InvalidParameter` (a real verdict never anchors at the zero timestamp, and that key has no checkpoint, so the call would silently void itself); `slashBpsPer.length != approvers.length` → `SlashBpsLengthMismatch`; any address repeated within `approvers` → `DuplicateApprover` (zero-rate entries are not exempt from the duplicate scan). The verdict takes no vault address, no snapshot timestamp and no payee: nothing is apportioned, so it needs no opinion about which vault the verdict concerned. The `openedAt` bound is an honest-caller sanity check only — it does not constrain a compromised slasher, which chooses it freely. Per approver: a zero rate SHALL be skipped entirely (zero is the absence of liability, not a severity to floor); an approver already slashed under the same `caseKey` by an earlier call SHALL revert `ApproverAlreadySlashed`; each non-zero rate SHALL be clamped per-element to `[minSlashBps, maxSlashBps]`; the slash leg is the same own-stake leg as the review path (sized off `max(liability, votable)` looked up one second before `openedAt`, clamped to live). The rate the challenge game supplies is the approver's WOOD lock for the case over that basis, so the amount is `min(lock, basis)` unless the envelope binds. The per-`(caseKey, approver)` mark SHALL be recorded only when the slash actually recovered a non-zero amount, so a zero take does not consume the verdict's one slash and foreclose a retry after re-stake. The mark (readable via `verdictSlashed(caseKey, approver)`) makes the severity envelope bind per VERDICT, not merely per call — splitting a quorum-sized batch across transactions stays legal, replaying an approver does not. The event topic key SHALL be namespaced (`keccak256("sherwood.verdict" ‖ caseKey)`) so a crafted `caseKey` cannot make a verdict slash collide with a review key in `GuardianSlashed` topics.
 
 #### Scenario: Unauthorized caller
 - **WHEN** an address other than `authorizedSlasher` calls `slashVerdict`
@@ -162,6 +178,10 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 #### Scenario: Rate clamped to the envelope
 - **WHEN** the slasher passes a non-zero per-approver rate outside `[minSlashBps, maxSlashBps]`
 - **THEN** the rate is silently clamped into the envelope before the slash is applied
+
+#### Scenario: Burn tracks the lock, not the bond
+- **WHEN** a convicted approver's lock over its basis is 2,500 bps and the envelope does not bind
+- **THEN** a quarter of their basis — the lock — is burned, and the remainder stays staked behind their other locks
 
 #### Scenario: Zero rate slashes nothing
 - **WHEN** an approver's `slashBpsPer` entry is 0
@@ -191,15 +211,15 @@ sWOOD SHALL maintain two per-guardian timestamp-keyed traces answering different
 - **THEN** there is no parameter to do it with — the only reachable destination is `BURN_ADDRESS`
 
 ### Requirement: authorizedSlasher role
-`setAuthorizedSlasher(slasher)` SHALL be owner-only and freely re-wireable (not set-once); zero is a valid value and disables the verdict path, since no caller matches a zero slasher. The setter SHALL emit `AuthorizedSlasherSet`. The verdict-slash role SHALL be distinct from the registry role by design: the review slash and the verdict slash must never share a caller, so the registry's appeal reserve can never refund a proven-malice verdict. The verdict takes no sink parameter — proceeds burn inside sWOOD, so there is no destination a caller could name and no allowance against the protocol's WOOD custody to hand out. The role is intended for the challenge game; until it is wired, a verdict is effectively a governance action by the owner-set slasher.
+`setAuthorizedSlasher(slasher)` SHALL be owner-only and freely re-wireable (not set-once); zero is a valid value and disables the verdict path, since no caller matches a zero slasher. The setter SHALL emit `AuthorizedSlasherSet`. The verdict-slash role is intended to be distinct from the registry role — the review slash and the verdict slash must never share a caller, so the registry's appeal reserve can never refund a proven-malice verdict — but the setter does not reject the registry's address: keeping them distinct is an owner obligation. The verdict takes no sink parameter — proceeds burn inside sWOOD, so there is no destination a caller could name and no allowance against the protocol's WOOD custody to hand out. The role is intended for the challenge game; until it is wired, a verdict is effectively a governance action by the owner-set slasher.
 
 #### Scenario: Verdict path disabled
 - **WHEN** `authorizedSlasher` is zero
 - **THEN** no caller can reach `slashVerdict` — it reverts `NotAuthorizedSlasher`
 
 #### Scenario: Role separation
-- **WHEN** the registry attempts to call `slashVerdict`, or the authorized slasher attempts `slashGuardians`
-- **THEN** each reverts (`NotAuthorizedSlasher` / `NotRegistry`) — the two slash paths never share a caller role
+- **WHEN** the authorized slasher is the challenge game and the registry attempts to call `slashVerdict`, or the authorized slasher attempts `slashGuardians`
+- **THEN** each reverts (`NotAuthorizedSlasher` / `NotRegistry`) — the two slash paths do not share a caller while the roles are wired to different contracts
 
 ### Requirement: Burn resilience
 Slashed WOOD SHALL be burned by transfer to the dead address `0x…dEaD`. A WOOD transfer that reverts or returns false MUST NOT brick the slash: the amount is queued in a pending-burn balance, `PendingBurnRecorded` is emitted, and the permissionless `flushBurn()` retries the transfer atomically (`BurnFlushed` on success; state update and transfer revert together on failure). `pendingBurn()` exposes the queued amount.
@@ -209,7 +229,7 @@ Slashed WOOD SHALL be burned by transfer to the dead address `0x…dEaD`. A WOOD
 - **THEN** the slash accounting stands, the amount is queued, and anyone may later call `flushBurn` to retry
 
 ### Requirement: Staking and slash parameters
-All parameters SHALL be owner-set (the parameter-setter multisig, with an external delay — no on-chain timelock), each setter emitting `ParameterChangeFinalized(paramKey, oldValue, newValue)`. Bounds: `minGuardianStake >= 1e18`; `coolDownPeriod` in `[1 days, 30 days]` AND, once the registry is wired, `>= registry.reviewPeriod()` (revert `CooldownBelowReviewPeriod`) — the cross-contract invariant that closes slash-evasion, so a guardian who voted in an unresolved review cannot claim out before `resolveReview` runs; `minSlashBps <= maxSlashBps` and `maxSlashBps <= 10_000` (a full 100% own-stake ceiling is legal — the own bond is a plain integer subtraction with no share math to brick); `ageFloorBps` in `[1, 10_000]`; `maturationPeriod` in `[7 days, 90 days]`. Violations revert `InvalidParameter`. `initialize` SHALL enforce the same bounds on its seed values and reject zero owner/wood/factory addresses. The registry enforces the same cooldown/review invariant from its side (`setReviewPeriod` rejects a review window exceeding sWOOD's cooldown).
+All parameters SHALL be owner-set (the protocol Safe, with any delay enforced off-chain — no on-chain timelock), each setter emitting `ParameterChangeFinalized(paramKey, oldValue, newValue)`. Setter bounds: `minGuardianStake >= 1e18`; `coolDownPeriod` in `[1 days, 30 days]` AND, once the registry is wired, `>= registry.reviewPeriod()` (revert `CooldownBelowReviewPeriod`) — the cross-contract invariant that closes slash-evasion, so a guardian who voted in an unresolved review cannot claim out before `resolveReview` runs; `minOwnerStake` either 0 (open onboarding) or at least `MIN_OWNER_BOND_FLOOR` (1,000 WOOD); `minSlashBps <= maxSlashBps` and `maxSlashBps <= 10_000` (a full 100% own-stake ceiling is legal — the own bond is a plain integer subtraction with no share math to brick); `ageFloorBps` in `[1, 10_000]`; `maturationPeriod` in `[7 days, 90 days]`. Violations revert `InvalidParameter`. `initialize` SHALL reject zero owner/wood/factory addresses (`ZeroAddress`) and enforce the `minOwnerStake`, slash-envelope, `ageFloorBps` and `maturationPeriod` bounds on its seed values; it does not bound `minGuardianStake` or `coolDownPeriod`, so a deployment must seed them within the setter bounds. The registry enforces the same cooldown/review invariant from its side (`setReviewPeriod` rejects a review window exceeding sWOOD's cooldown).
 
 #### Scenario: Cooldown below the review window
 - **WHEN** the owner attempts to set `coolDownPeriod` below the wired registry's `reviewPeriod`
@@ -235,17 +255,83 @@ All parameters SHALL be owner-set (the parameter-setter multisig, with an extern
 - **THEN** the pointer clears and `claimUnstakeGuardian` reverts to ungated (cooldown-only) behavior
 
 ### Requirement: Coverage-freezer interaction surface
-The coverage freezer is a role on the exposure ledger (`coverageFreezer`, held by the challenge game), not on sWOOD; its effect on staking SHALL flow exclusively through the ledger reads sWOOD consumes at claim time (`openExposureUsd`, `hasFrozenCoverage`). A freeze pins one proposal's committed coverage — never the guardian's whole stake — and while any coverage naming the guardian is frozen, the guardian's `claimUnstakeGuardian` SHALL revert `CoverageStillOpen`. A freeze MUST NOT block `requestUnstakeGuardian`, `cancelUnstakeGuardian`, or review voting eligibility (those depend only on sWOOD-local state); it binds only the moment stake would actually leave custody. Open exposure ages out on the ledger's clock, but a freeze does not — it holds until the freezer unfreezes, so an accused approver cannot wait out a challenge on wall-clock alone.
+The coverage freezer is a role on the exposure ledger (`coverageFreezer`, held by the challenge game), not on sWOOD; its effect on staking SHALL flow exclusively through the ledger reads sWOOD consumes at claim time (`openExposure`, `hasFrozenCoverage`). A freeze pins one proposal's committed coverage — never the guardian's whole stake — and while any coverage naming the guardian is frozen, or a pin set by a re-armed challenge window is in force (through its deadline, inclusive), the guardian's `claimUnstakeGuardian` SHALL revert `CoverageStillOpen`. A freeze MUST NOT block `requestUnstakeGuardian`, `cancelUnstakeGuardian`, or review voting eligibility (those depend only on sWOOD-local state); it binds only the moment stake would actually leave custody. Open exposure ages out on the ledger's clock, but a freeze does not — it holds until the freezer unfreezes, so an accused approver cannot wait out a challenge on wall-clock alone.
 
 #### Scenario: Frozen guardian can still request but not claim
 - **WHEN** a guardian's coverage is frozen by the challenge game
 - **THEN** the guardian may request unstake (going inactive and taking no new commitments) but its claim reverts `CoverageStillOpen` until the freeze is lifted
 
 #### Scenario: Freeze lifted, exposure clear
-- **WHEN** the freezer unfreezes the guardian's last frozen coverage and its open exposure has run down to zero
+- **WHEN** the freezer unfreezes the guardian's last frozen coverage, no pin on the guardian is in force, and its open exposure has run down to zero
 - **THEN** a claim after the frozen cooldown succeeds
 
-### Requirement: Incoming-owner consent for owner-stake slot transfer
+### Requirement: Owner-bond liveness predicate
+`StakedWood` SHALL expose `ownerBondLive(address vault)` returning true iff the vault's owner-stake slot is bound and not exiting — `owner != address(0) && unstakeRequestedAt == 0`. The first clause SHALL test slot EXISTENCE and NOT `stakedAmount != 0`, because the documented `minOwnerStake == 0` open-onboarding sentinel binds a slot with a real owner and a zero amount; both routes that empty a funded slot (`claimUnstakeOwner`, `slashOwnerBond`) `delete` the record and so zero the owner as well. The predicate SHALL NOT compare against `requiredOwnerBond`: that threshold is governance-mutable and there is no top-up path on a live vault, so a raised floor would permanently brick every vault correctly bonded under the old one. `GuardianRegistry` SHALL expose the same view as a passthrough, since consumers hold a registry handle rather than an sWOOD one.
+
+#### Scenario: A freshly bound slot is live
+- **WHEN** the factory binds a prepared owner stake to a vault
+- **THEN** `ownerBondLive(vault)` SHALL return true
+
+#### Scenario: An exit in flight is not a live bond
+- **WHEN** the owner calls `requestUnstakeOwner` and the cooldown has not yet elapsed
+- **THEN** `ownerBondLive(vault)` SHALL return false, even though the WOOD is still escrowed and `ownerStake(vault)` is unchanged
+
+#### Scenario: An emptied slot is not a live bond
+- **WHEN** the slot is emptied by `claimUnstakeOwner` or by `slashOwnerBond`
+- **THEN** `ownerBondLive(vault)` SHALL return false, because both delete the record
+
+#### Scenario: A zero-bond onboarding vault stays live
+- **GIVEN** `minOwnerStake == 0` and the factory bound a slot with a real owner and a zero amount
+- **THEN** `ownerBondLive(vault)` SHALL return true, so the vault that was never asked for a bond keeps its proposal lane
+
+#### Scenario: The registry passthrough is not its own opinion
+- **WHEN** the sWOOD predicate changes for a vault
+- **THEN** `GuardianRegistry.ownerBondLive(vault)` SHALL report the same value across that change
+
+### Requirement: Owner unstake cancel
+`StakedWood` SHALL expose `cancelUnstakeOwner(address vault)`, callable only by the recorded owner of a slot with a non-zero `stakedAmount` and a pending request, clearing `unstakeRequestedAt` and `cooldownAtRequest` and emitting `OwnerUnstakeCancelled`. Without it, one exploratory `requestUnstakeOwner` would shut a live vault's proposal lane for the whole cooldown with no way back short of claiming the bond and running a two-transaction `rotateOwner` -> `transferOwnerStakeSlot`. Clearing `cooldownAtRequest` alongside the stamp SHALL mean a later re-request buys the full wait again rather than inheriting time already served. A slot already emptied by `slashOwnerBond` SHALL NOT be recoverable through this path.
+
+#### Scenario: Cancel restores the live bond
+- **WHEN** the recorded owner cancels a pending owner-bond unstake request
+- **THEN** `ownerBondLive(vault)` SHALL return true again and the escrowed WOOD SHALL be unchanged
+
+#### Scenario: Cancel then re-request restarts the cooldown
+- **WHEN** an owner cancels a request one second short of the cooldown and immediately re-requests
+- **THEN** `claimUnstakeOwner` SHALL revert with `CooldownNotElapsed` until a FULL fresh cooldown has elapsed
+
+#### Scenario: Only the recorded owner, only against a real request
+- **WHEN** a stranger calls `cancelUnstakeOwner`, or the recorded owner calls it with no request pending
+- **THEN** the call SHALL revert with `NoActiveStake` or `UnstakeNotRequested` respectively
+
+#### Scenario: A slashed slot cannot be cancelled back to life
+- **GIVEN** the bond was slashed after the unstake request was made
+- **WHEN** the former owner calls `cancelUnstakeOwner`
+- **THEN** the call SHALL revert with `NoActiveStake`, because `slashOwnerBond` deleted the record
+
+### Requirement: Anchored slashable-stake view
+The staking contract SHALL expose `slashableStakeAt(guardian, anchor)`, a guardian's slashable stake as of a past anchor timestamp: the greater of the liability checkpoint and the votable-stake checkpoint looked up at `anchor - 1`, clamped to the guardian's current live stake — `min(max(liability@(anchor-1), votableStake@(anchor-1)), liveStake)`. The lookup sits one second before the anchor so a top-up landing in the anchor's own block is excluded. The view SHALL revert `VerdictNotPast` for an anchor in the future, and `anchor == 0` SHALL read the zero instant. This is the sizing basis the verdict slash applies per approver, and the view and the slash SHALL derive it from one shared implementation so the number a coverage reader books and the number a conviction recovers cannot drift. The view SHALL be read-only and add no storage.
+
+#### Scenario: View agrees with the verdict slash
+
+- **WHEN** a verdict slash at 100% severity executes against an approver, anchored at a proposal's execution timestamp
+- **THEN** the WOOD recovered equals what the anchored view returned for that approver and anchor immediately before the slash
+
+#### Scenario: Post-anchor top-up excluded
+
+- **WHEN** a guardian tops up its stake at or after the anchor timestamp and the view is queried at that anchor
+- **THEN** the returned value reflects only the stake checkpointed before the anchor (clamped to live), excluding the top-up
+
+#### Scenario: Unstake request does not zero the basis
+
+- **WHEN** a guardian requested unstake after the anchor (which zeroes its votable checkpoint but not its liability trace) and the view is queried at that anchor
+- **THEN** the returned value still reflects the at-anchor stake, because the liability trace survives the request
+
+#### Scenario: Future anchor refused
+
+- **WHEN** the view is queried with an anchor later than the current block timestamp
+- **THEN** it reverts `VerdictNotPast`
+
+### Requirement: The incoming owner consents to an owner-stake slot transfer
 Binding a prepared owner stake to a vault through the slot-transfer path (the factory's owner-rotation flow) SHALL require the incoming owner's prior, vault-specific consent, recorded on sWOOD by the incoming owner themselves. Adversary: a current vault owner who "gifts" a vault to a victim to spend the victim's escrowed prepared stake — locking it behind the owner-unstake cooldown and exposing it to an emergency-review owner-bond slash — must be unable to do so without the victim's opt-in.
 
 `approveOwnerStakeBinding(vault)` SHALL record `vault` as the single vault the caller consents to have their prepared stake bound to via slot transfer; it SHALL reject the zero vault. Calling it again SHALL overwrite the previous approval (at most one approved vault per address). `revokeOwnerStakeBinding()` SHALL clear the caller's approval. Both SHALL emit events naming the approver and the vault.
@@ -256,7 +342,7 @@ Consent SHALL be scoped to a single escrow lifetime and never replayable against
 
 The creation-time bind (`bindOwnerStake`, reached only from the factory's `createSyndicate`) SHALL NOT require an approval: the bound stake there belongs to the creator who initiated the call, so consent is structural.
 
-#### Scenario: Non-consensual rotation cannot spend a third party's escrow (issue #98 trace)
+#### Scenario: Non-consensual rotation cannot spend a third party's escrow
 - **WHEN** Alice has a prepared, unbound stake at or above the floor and has never called `approveOwnerStakeBinding`, and the owner of a vault with an empty bond slot and no open proposals attempts the factory owner-rotation naming Alice as the new owner
 - **THEN** the slot transfer SHALL revert with `BindingNotApproved`, Alice's prepared stake SHALL remain unbound, `cancelPreparedStake` SHALL still refund it, and Alice's own vault creation SHALL remain possible
 

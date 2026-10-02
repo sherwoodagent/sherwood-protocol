@@ -81,8 +81,11 @@ Nothing is read from the environment. Every number comes from
    reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
-6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
-   address from the book's `CREATE3_FACTORY` and fails on any disagreement, and
+6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it derives the
+   `Create3Factory` address from the compiled `Create3Factory` initcode and the book's
+   `DEPLOYER` (never from the book's `CREATE3_FACTORY`, which it only checks against the
+   derivation), derives every protocol address from that factory, fails on any book
+   value that disagrees, and
    checks that every live governor carries the factory's ledger, escrow and tier
    registry.
 
@@ -100,12 +103,13 @@ Verify with `./script/verify-robinhood.sh 9994663`.
 `0xf8bc08092c06db6148114dcf82af881f1085f92b`, and `DeployWood` now refuses chain
 4663 outright.
 
-**A comment moves every address.** The Create3Factory initcode hash is pinned in
-`script/DeploySalts.sol`. solc's CBOR metadata hashes the source and
-`foundry.toml` pins no `bytecode_hash`, so editing `script/utils/Create3.sol` or
-`Create3Factory.sol` — comments included — changes the hash, moves the whole
-address table, and trips the `Create3Factory initcode hash drift` pre-flight.
-Re-record the constant deliberately; never to get a build green.
+**A bytecode change moves every address.** The Create3Factory initcode hash is pinned
+in `script/DeploySalts.sol`. `foundry.toml` turns metadata off (`bytecode_hash = "none"`,
+`cbor_metadata = false`), so a comment-only edit does not move it; a change to the
+compiled bytecode of `script/utils/Create3.sol` or `Create3Factory.sol`, or a compiler
+or optimizer change, does — it moves the whole address table and trips the
+`Create3Factory initcode hash drift` pre-flight. Re-record the constant deliberately;
+never to get a build green.
 
 ---
 
@@ -193,7 +197,12 @@ Not one-time steps. Nothing below is enforced on-chain.
   forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
   ```
 
-- **Allowlisting a Morpho market before a strategy uses it.** Before a
+- **Allowlisting a Morpho market before a strategy uses it.** Not a launch step:
+  `MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy` are out of the audit
+  scope and disabled at launch. After the ceremony the Safe un-approves both
+  templates with `StrategyFactory.setTemplateApproval(template, false)`, and they
+  are not re-approved until audited separately, so no market is granted at launch.
+  When they are re-enabled: before a
   `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy` clone is
   initialised, the `TierRegistry` owner allowlists that market BY ID:
   `setMorphoMarketAllowed(<marketId>, true)`. The id is Morpho's

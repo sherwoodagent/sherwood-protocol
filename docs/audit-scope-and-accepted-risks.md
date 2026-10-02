@@ -6,7 +6,42 @@ branch; file and function are cited so each can be checked.
 ## 1. Scope and branches
 
 - **Audit scope:** the `post-audit-v2` commit named in the handover to the auditor; this file is part
-  of that commit. In scope: the contracts under `src/`.
+  of that commit. The list below was decided by the owner on 2 October 2026.
+- **In scope** (paths under `src/`):
+  - `SyndicateGovernor.sol`
+  - `GovernorParameters.sol`
+  - `GovernorEmergency.sol`
+  - `ProposalLifecycle.sol`
+  - `GovernorBeacon.sol`
+  - `SyndicateVault.sol`
+  - `SyndicateVaultAdminLib.sol`
+  - `queue/VaultWithdrawalQueue.sol`
+  - `BatchExecutorLib.sol`
+  - `AssetCallRules.sol`
+  - `SyndicateFactory.sol`
+  - `ProtocolConfig.sol`
+  - `FeeConstants.sol`
+  - `GuardianRegistry.sol`
+  - `StakedWood.sol`
+  - `ExposureLedger.sol`
+  - `ProposerBondEscrow.sol`
+  - `ChallengeGame.sol`
+  - `TierRegistry.sol`
+  - `StrategyFactory.sol`
+  - `strategies/BaseStrategy.sol`
+  - `strategies/PortfolioStrategy.sol`
+  - `adapters/UniswapSwapAdapter.sol`
+  - `pricing/WoodPoolFeed.sol`
+- **Out of scope:**
+  - `src/strategies/ConcentratedLiquidityStrategy.sol` and `src/strategies/MorphoSupplyStrategy.sol`:
+    not enabled at launch. The Safe un-approves both templates with
+    `StrategyFactory.setTemplateApproval(template, false)` after the ceremony, and they are not
+    re-approved until audited separately.
+  - `src/vendor/**`: third-party code, checked against its upstream by
+    `script/check-vendor-provenance.sh`.
+  - `src/vesting/**`: standalone, not deployed by the ceremony.
+  - `src/interfaces/**`: declarations, provided as reference.
+  - `script/` and `test/`: provided as reference.
 - **`v1-deploy`** at `1d38a28701cf7949f1a420b1bedb4ce36447620c` is an ancestor of the scope. It is the
   code deployed first on Robinhood Chain (chain id 4663). Mainnet later moves to the audited code per
   [upgrade-v1-to-v2-runbook.md](upgrade-v1-to-v2-runbook.md): governors and the guardian registry are
@@ -162,7 +197,7 @@ be as short as 300 s (`MIN_TWAP_WINDOW`); both are proposer-chosen. The 10% pool
 Liquidity added in the same block passes the 10% cap; it is a measurement at one instant. `rerange` is
 permissionless within its trigger, `minInterval` (which may be 0) and `maxReranges` (≤ 20). LP mint
 and withdraw pass `amount0Min = amount1Min = 0` (`_mintPosition`, `_closePosition`). At settle the LP
-withdrawal (zero mins) runs before the TWAP check, which runs only if an `otherToken` balance remains.
+withdrawal (zero mins) runs before the TWAP check, which runs only if an `otherToken` balance remains. The strategy is out of the audit scope and disabled at launch: the Safe un-approves its template (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony.
 
 **5.7 Strategy registration proves shape only.** `StrategyFactory.registerStrategy` is permissionless
 and checks that `vault()`, `proposer()` and `executed()` answer. A batch may call the vault asset or
@@ -221,7 +256,7 @@ ledger prices within `PEG_TOLERANCE_BPS` (1%) of $1, at init and execute
 (`PortfolioStrategy._requireUsdPegged`). Morpho markets are admitted by market id
 (`TierRegistry.isMorphoMarketAllowed`, checked by `MorphoSupplyStrategy` and the CL strategy). A
 non-asset token in a vault can only be sent to a strategy clone of that vault
-(`SyndicateVault.rescueERC20`); one that no clone can sell stays in the vault, outside the share price.
+(`SyndicateVault.rescueERC20`); one that no clone can sell stays in the vault, outside the share price. The Morpho supply and CL strategies, the only consumers of the market-id allowlist, are out of the audit scope and disabled at launch: the Safe un-approves their templates after the ceremony.
 
 **5.13 Share transfers are not gated.** `SyndicateVault._update` applies no depositor check, so a
 whitelisted holder can transfer shares to any address while `depositsRestricted` is on.
@@ -260,7 +295,7 @@ and the settler chooses the block. Portfolio sells each token at the Chainlink v
 `maxSlippageBps` (0.5–10%), with feeds up to 26 h old, treating one asset unit as $1
 (`PortfolioStrategy._sellFloor`, `_feedPrice`). CL settle floors on pool spot within
 `maxTwapDeviationBps` ticks (≤ about 10.5%) of a TWAP that may be 300 s long (`_swapToAsset`). Each
-settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor.
+settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The CL strategy is out of the audit scope and disabled at launch: the Safe un-approves its template after the ceremony.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
 reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at
@@ -269,7 +304,7 @@ relief before settle, so interest
 can push it into Morpho liquidation; if proceeds do not cover the debt, settle reverts until someone
 transfers the asset to the clone (`_repayAndWithdraw`, `_deleverage`). The market-id allowlist is the
 only check. Before allowing an id the Safe must review collateral token, oracle, lltv, irm and
-liquidity.
+liquidity. Both strategies in this item are out of the audit scope and disabled at launch: the Safe un-approves their templates (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony, so no market id needs to be allowed at launch.
 
 **5.20 Portfolio after execute.** The ±1% peg is checked only at init and execute, never at
 `rebalanceDelta` or settle. A depeg loosens the floors, or makes them unreachable and settle revert.
@@ -278,30 +313,32 @@ parameters, each swap floored at feed − `maxSlippageBps`.
 
 **5.21 CL TWAP grief.** On a low-cardinality pool, anyone can make execute, rerange or settle revert
 `TwapUnavailable` with a few small swaps in separate blocks (`_tryTwapTick`). The permissionless remedy
-is `increaseObservationCardinalityNext` on the pool.
+is `increaseObservationCardinalityNext` on the pool. The strategy is out of the audit scope and disabled at launch: the Safe un-approves its template (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony.
 
 ## 6. Documents
 
 `docs/` describes the code on this branch. `docs/papers/` is design rationale; where it differs from
-the code, the code and `docs/` govern. `openspec/specs/` is the archived baseline;
-`openspec/changes/*/specs/` hold deltas not yet archived, and where they differ the delta is
-current. Some open changes still carry older text for requirements a later change also modifies;
-prefer the later change:
+the code, the code and `docs/` govern.
 
-- `per-call-capital-declarations`: "Governance parameter management" (older bounds); superseded by
-  `audit-1002-docs-alignment`.
-- `declared-coverage-locks`: "Execute-time approve quorum", "Booking failures never fail the approve
-  vote", the review-path slash and "Approval recording books a guardian-declared WOOD lock" are
-  superseded by `audit-1002-docs-alignment`; "Challenger bond sized to the coverage the filing
-  freezes" is superseded by `audit-1002-v2-challenge-game-docs`.
-- `proportional-quorum-sizing`: "Execute-time approve quorum" (reservation wording); superseded by
-  `audit-1002-docs-alignment`.
-- `anchor-coverage-at-execution`: allocation and settlement requirements written against a
-  reservation model the code no longer has; its `design.md` also describes `TokenCourt` mechanics,
-  which are `v1-deploy` history.
-- `frozen-lock-rebucketing`: its delta now names the v2 freeze end (`filedAt + voteWindowAtFiling`);
-  its design, proposal and tasks text about dispute timeouts, `rule` and `TokenCourt` is `v1-deploy`
-  history.
+`openspec/specs/` is current with the code as of this commit: every change whose behaviour is
+implemented here has been archived into it (`openspec/changes/archive/2026-10-02-*`), with its deltas
+corrected against the code first, and `openspec-sync-corrections` fixed the remaining requirements no
+change had touched. The archive folders are history; their `design.md`, `proposal.md` and `tasks.md`
+files (some of which describe `TokenCourt` and other `v1-deploy` mechanisms) are not normative. Two
+archived changes, `wood-price-twap-ceiling` and `propose-time-target-validation`, were archived without
+applying their deltas because their behaviour shipped in a different shape; each proposal says where
+the normative text lives.
 
-The reasoning is in `openspec/changes/audit-1002-docs-alignment/proposal.md` and
-`openspec/changes/audit-1002-v2-challenge-game-docs/proposal.md`.
+Two change folders remain open under `openspec/changes/`, and neither describes code on this branch:
+
+- `permissionless-tier2-sandbox`: a per-proposal sandbox for arbitrary tier-2 calls. Not
+  implemented; no sandbox contract exists.
+- `target-based-batch-gating`: an adapter-allowlist callee gate for governor batches. Not
+  implemented; superseded by the registered-strategy batch rule (`SyndicateVault._guardBatchCalls`).
+
+Known limits of the specs:
+
+- `guardian-agent` and `guardian-fleet` specify an off-chain daemon that is not in this repository;
+  only the on-chain facts they cite were checked.
+- `operator-docs` requires an onboarding checklist that `docs/adapter-onboarding-checklist.md` does
+  not yet meet; that document is marked stale at its top.

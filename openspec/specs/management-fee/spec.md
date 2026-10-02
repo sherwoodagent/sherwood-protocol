@@ -7,9 +7,7 @@ while a proposal is Executed (not only the capital it deploys) that
 is owed whether the fund made money, lost money, or went nowhere, so that the parties
 doing continuous work — the agent managing the book and the guardian network reviewing
 every proposal — are funded in flat months.
-
 ## Requirements
-
 ### Requirement: The management fee is charged on every settlement regardless of profit or loss
 
 A settlement SHALL charge the management fee whether the proposal's realized profit is
@@ -32,28 +30,6 @@ positive, zero, or negative. The management fee MUST NOT be gated on profit.
 - **WHEN** a proposal settles with positive realized profit above the high-water mark
 - **THEN** the management fee is charged first and the performance fee is computed
   against assets already reduced by it
-
-### Requirement: The management fee base is time-weighted over deployed capital
-
-The fee owed SHALL be proportional to the integral of deployed capital over time —
-the product of capital and the duration it was deployed — annualized at the
-configured rate. Capital that was deployed for a shorter time MUST owe
-proportionally less than the same capital deployed for the full proposal. Within a
-single proposal the base is fixed at execution: deposits are locked while a proposal
-is open and exits route through the settlement queue, so no flow can change the
-deployed base mid-proposal.
-
-#### Scenario: Half the duration owes half the fee
-
-- **WHEN** one proposal deploys a given capital base for 30 days and an otherwise
-  identical proposal deploys the same base for 15 days
-- **THEN** the second proposal's management fee is half the first's
-
-#### Scenario: Queued mid-proposal exits do not change the accrual base
-
-- **WHEN** a holder requests a redemption through the queue while a proposal is live
-- **THEN** the shares sit in queue escrow, the deployed base and its accrual are
-  unchanged for the remainder of the proposal, and the exit is priced at settlement
 
 ### Requirement: Accrual is consumed and reset at settlement
 
@@ -86,19 +62,6 @@ and redemptions are unlocked so depositors may leave freely.
 - **WHEN** an agent stops proposing entirely while depositors remain in the vault
 - **THEN** no management fee accrues for as long as no proposal is live
 
-### Requirement: Strategies that self-manage their fees still pay the management fee
-
-The existing exemption for strategies that collect their own fees SHALL apply to the
-performance leg only. Because the management fee is computed from deployed capital and
-time rather than from realized profit, the profit-measurement problem that motivates the
-exemption does not apply to it.
-
-#### Scenario: A self-managing strategy pays management but not performance
-
-- **WHEN** a proposal whose strategy self-manages fees settles profitably
-- **THEN** the management fee is charged and distributed by the recorded management split,
-  and the governor charges no performance fee
-
 ### Requirement: A recipient that cannot receive payment does not block settlement
 
 If a management-fee recipient reverts or otherwise cannot be paid, settlement SHALL
@@ -110,3 +73,43 @@ escrow behaviour the protocol already applies to fee payment.
 - **WHEN** the guardian-network recipient reverts on receipt during a settlement
 - **THEN** the settlement completes, the agent and protocol shares are paid, and the
   unpayable share is escrowed or recorded rather than reverting the transaction
+
+### Requirement: The management fee base is the whole fund, time-weighted while a proposal is Executed
+
+The fee owed SHALL be proportional to the integral of the base over time — the
+product of the base and the duration the proposal was Executed — annualized at the
+configured rate. The base is the WHOLE FUND's assets (`totalAssets()`), stamped at
+execute, not the capital the proposal moves: a proposal that deploys nothing, or a
+small fraction of the fund, accrues on the whole fund for as long as it stays
+Executed. A proposal Executed for a shorter time MUST owe proportionally less than
+the same fund Executed for the full proposal. Within a single proposal the base is
+fixed at execution: deposits are locked while a proposal is open and exits route
+through the settlement queue, so no flow can change the base mid-proposal.
+
+#### Scenario: Half the duration owes half the fee
+
+- **WHEN** one proposal stays Executed for 30 days on a given fund and an otherwise
+  identical proposal stays Executed for 15 days on the same fund
+- **THEN** the second proposal's management fee is half the first's
+
+#### Scenario: Queued mid-proposal exits do not change the accrual base
+
+- **WHEN** a holder requests a redemption through the queue while a proposal is live
+- **THEN** the shares sit in queue escrow, the base and its accrual are
+  unchanged for the remainder of the proposal, and the exit is priced at settlement
+
+#### Scenario: A proposal that deploys nothing still accrues on the whole fund
+
+- **WHEN** a proposal whose execute batch moves no capital is executed and later settles
+- **THEN** its management fee is the whole fund's assets at execute times the time it was
+  Executed, at the configured rate
+
+### Requirement: No proposal is exempt from either fee
+
+Every settlement SHALL charge the management fee and compute the performance fee the same way, whatever the proposal's strategy reports about itself. No strategy can opt out of either leg.
+
+#### Scenario: Every proposal pays management
+
+- **WHEN** any proposal settles
+- **THEN** the management fee is charged and distributed by the recorded management split, and the performance fee is computed from the high-water mark and the realized profit
+

@@ -1,33 +1,37 @@
 # Syndicate Vault Specification
 
 ## Purpose
-Define the observable behavior of the SyndicateVault: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault that custodies a syndicate's assets, prices shares against float-only NAV, routes all mid-proposal LP flow through a per-vault async request queue (Lane B, the only mid-proposal path), enforces an instant-withdrawal liquidity buffer and queue-reserve seniority against governor strategy batches, and confines all privileged surfaces to owner, factory, governor, and queue roles. Instant entry and exit exist only outside a proposal; Lane A (mid-proposal instant flow at router-priced live NAV) was retired from v1 with issue #54.
+
+Defines the observable behavior of `SyndicateVault`: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault (upgradeable only through its factory) that custodies a syndicate's assets and prices shares against float-only NAV. Instant deposit and exit exist only while no proposal is open; from Draft creation until a proposal ends, all LP flow goes through the vault's async request queue. Governor strategy batches are bounded by structural call rules, per-call caps, a net-outflow budget, queue-reserve seniority and an idle-liquidity buffer, and every privileged surface is confined to the owner, factory, governor and queue roles.
 ## Requirements
 ### Requirement: ERC-4626 share accounting and NAV
 
 The vault SHALL be an ERC-4626 vault over a single underlying asset fixed at
 initialization. `totalAssets()` SHALL equal the vault's idle balance of the
 underlying asset minus the queue's reserved (stamped-but-unclaimed) redemption
-assets, floored at zero. The vault SHALL NOT consult any strategy or external
-pricing source for NAV: strategy value is recognized only when a settlement returns
-assets to the vault's idle balance. The ERC-4626 virtual-shares decimals offset
-SHALL equal the asset's `decimals()`, cached once at initialization.
+assets and minus the governor's escrowed fee liability for the vault
+(`outstandingEscrow`), floored at zero. Share conversions SHALL divide by the pricing
+supply: `totalSupply()` minus the queue's stamped-but-unclaimed redemption shares. The
+vault SHALL NOT consult any strategy or external pricing source for NAV: strategy
+value is recognized only when a settlement returns assets to the vault's idle
+balance. The ERC-4626 virtual-shares decimals offset SHALL equal the asset's
+`decimals()`, cached once at initialization.
 
 #### Scenario: NAV outside any proposal
 
 - **WHEN** no proposal is active
 - **THEN** `totalAssets()` equals the vault's idle balance of the underlying asset
-  minus `reservedQueueAssets()`
+  minus `reservedQueueAssets()` and any escrowed fee liability
 
 #### Scenario: NAV during a proposal is float-only
 
 - **WHEN** a proposal is active with capital deployed into a strategy
-- **THEN** `totalAssets()` reflects only the idle balance (net of the queue reserve);
-  no live valuation of the deployed position is added
+- **THEN** `totalAssets()` reflects only the idle balance (net of the queue reserve
+  and escrowed fees); no live valuation of the deployed position is added
 
 #### Scenario: Reserve exceeding float floors at zero
 
-- **WHEN** the queue reserve exceeds the vault's idle balance
+- **WHEN** the queue reserve plus the escrowed fee liability exceeds the vault's idle balance
 - **THEN** `totalAssets()` returns 0 rather than reverting
 
 #### Scenario: Inflation-attack mitigation
@@ -36,7 +40,8 @@ SHALL equal the asset's `decimals()`, cached once at initialization.
 - **THEN** the virtual-shares offset is 6, yielding 12-decimal shares
 
 ### Requirement: Vote checkpointing and auto-delegation
-The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder.
+
+The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder. Voting power SHALL NOT be delegated away from the holder: `delegate` and `delegateBySig` SHALL revert `DelegationDisabled` for any delegatee other than the account itself (including `address(0)`), so every share in the veto denominator is castable by its holder and the recorded electorate equals the castable weight at the snapshot.
 
 #### Scenario: Recipient auto-delegates on receipt
 - **WHEN** shares are transferred or minted to an address that is not delegated to itself
@@ -47,9 +52,12 @@ The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
 #### Scenario: Delegation away from the holder is refused
-- **WHEN** any caller invokes `delegate` or `delegateBySig` naming a delegatee other than itself
-- **THEN** the call reverts `DelegationDisabled`, so every holder's checkpointed votes
-  equal its own balance; `delegate(self)` succeeds as a no-op
+- **WHEN** a holder calls `delegate` or `delegateBySig` with a delegatee that is not itself (another holder, the queue, or `address(0)`)
+- **THEN** the call reverts `DelegationDisabled` and the holder's shares keep voting for the holder
+
+#### Scenario: Self-delegation is a no-op
+- **WHEN** a holder calls `delegate(self)`
+- **THEN** the call succeeds and `delegates(holder) == holder`
 
 ### Requirement: Instant deposit flow
 
@@ -67,7 +75,7 @@ so pay-on-behalf funding is permitted.
 
 #### Scenario: Mid-proposal deposit is locked
 
-- **WHEN** any proposal is open (Pending through Executed)
+- **WHEN** any proposal is open (Draft through Executed)
 - **THEN** `deposit`/`mint` revert `DepositsLocked` and the depositor's path is
   `requestDeposit`
 
@@ -85,7 +93,7 @@ so pay-on-behalf funding is permitted.
   return `type(uint256).max`
 
 ### Requirement: Depositor access control
-The vault owner SHALL control deposit access via an open/closed mode flag (`setOpenDeposits`) and an approved-depositor whitelist (`approveDepositor`, `approveDepositors`, `removeDepositor`), all owner-only. Approving the zero address SHALL revert `InvalidDepositor`; re-approving via the single-address path SHALL revert `DepositorAlreadyApproved`; removing an unapproved depositor SHALL revert `DepositorNotApproved`. Whitelist membership SHALL be readable via `isApprovedDepositor` and paginated via `approvedDepositorsPaginated`, with page size hard-clamped to `MAX_PAGE_LIMIT` (100).
+The vault owner SHALL control deposit access via an open/closed mode flag (`setOpenDeposits`) and an approved-depositor whitelist (`approveDepositor`, `approveDepositors`, `removeDepositor`), all owner-only. Approving the zero address SHALL revert `InvalidDepositor`; re-approving via the single-address path SHALL revert `DepositorAlreadyApproved`; removing an unapproved depositor SHALL revert `DepositorNotApproved`. Whitelist membership SHALL be readable via `isApprovedDepositor` and paginated via `approvedDepositorsPaginated`, with page size hard-clamped to `MAX_PAGE_LIMIT` (100). The whitelist rule SHALL apply to the receiver of `deposit`, `mint`, `requestDeposit` and of every queued-deposit claim (`settleDeposit`), read live at each call, so a receiver removed after queueing cannot claim (`NotApprovedDepositor`) and recovers the assets with the queue's `cancel`.
 
 #### Scenario: Batch approval is idempotent
 - **WHEN** the owner calls `approveDepositors` with an already-approved address
@@ -97,42 +105,55 @@ The vault owner SHALL control deposit access via an open/closed mode flag (`setO
 
 #### Scenario: Factory-wide deposit restriction
 - **WHEN** the factory owner has set `depositsRestricted` via `setDepositsRestricted(true)`
-- **THEN** every vault the factory created accepts `deposit`, `mint` and `requestDeposit` only for approved depositors, as in closed mode, whatever its own `openDeposits`
-- **AND** withdrawals, redemptions, redeem requests and claims of already-queued deposits are unaffected, and `setDepositsRestricted(false)` restores each vault's own setting
+- **THEN** every vault the factory created accepts `deposit`, `mint`, `requestDeposit` and claims of queued deposits only for approved receivers, as in closed mode, whatever its own `openDeposits`
+- **AND** withdrawals, redemptions, redeem requests and redeem claims are unaffected, and `setDepositsRestricted(false)` restores each vault's own setting
+
+#### Scenario: Removed receiver cannot claim a queued deposit
+- **WHEN** deposits are closed and the owner removes a receiver from the whitelist after it queued a deposit
+- **THEN** `claim` of that deposit reverts `NotApprovedDepositor` and the receiver's `cancel` returns the escrowed assets
 
 ### Requirement: Instant withdrawal flow and capacity
 
-While no proposal is active, instant `withdraw`/`redeem` SHALL be available up to the
+While no proposal is open, instant `withdraw`/`redeem` SHALL be available up to the
 holder's balance, capped by instant capacity = available float (idle balance minus
-the queue's reserved assets). While a proposal is active, `maxWithdraw`/`maxRedeem`
-SHALL return 0 for every holder except the bound withdrawal queue, and exits route
-through the async queue — mid-proposal exits route to the queue, full stop. A
-requested exit whose assets plus the queue reserve exceed the idle balance SHALL
-revert `QueueReserveBreached`; the vault SHALL NOT pull capital from a strategy to
-serve an exit.
+the queue's reserved assets). From Draft creation until the proposal reaches a
+terminal state (settled, cancelled, rejected or expired, as committed on-chain),
+`maxWithdraw`/`maxRedeem` SHALL return 0 for every holder except the bound withdrawal
+queue, and exits route through the async queue — full stop. The lock starts at Draft
+creation, ahead of the vote snapshot and the electorate stamp, so no instant exit can
+land on either side of the stamp. Because the exit views cap every holder at the
+available float, an over-float `withdraw`/`redeem` SHALL revert in the ERC-4626 max
+check (`ERC4626ExceededMaxWithdraw` / `ERC4626ExceededMaxRedeem`); the vault SHALL
+NOT pull capital from a strategy to serve an exit.
 
 #### Scenario: Exit served from float
 
-- **WHEN** no proposal is active and a holder withdraws no more than the available
+- **WHEN** no proposal is open and a holder withdraws no more than the available
   float
-- **THEN** assets transfer out with no strategy interaction
+- **THEN** the withdrawal is served instantly from the vault's idle balance
 
 #### Scenario: Exit beyond available float reverts
 
-- **WHEN** a withdrawal's assets plus the queue reserve exceed the vault's idle
-  balance
-- **THEN** the withdrawal reverts `QueueReserveBreached`
+- **WHEN** a withdrawal's assets exceed the available float (idle balance minus the
+  queue reserve)
+- **THEN** the withdrawal reverts `ERC4626ExceededMaxWithdraw` (a redeem,
+  `ERC4626ExceededMaxRedeem`)
 
 #### Scenario: Active proposal means queue-only
 
-- **WHEN** a proposal is active
+- **WHEN** a proposal is open, Draft included
 - **THEN** `maxWithdraw` and `maxRedeem` return 0 for every holder except the bound
   withdrawal queue
+
+#### Scenario: Exit during a collaborative Draft
+
+- **WHEN** a proposal is in Draft and a holder tries an instant redeem
+- **THEN** it reverts (`maxRedeem` is 0), and the holder's path is `requestRedeem`
 
 #### Scenario: Queue bypasses caps it owns
 
 - **WHEN** the bound withdrawal queue is the caller/owner of a withdrawal
-- **THEN** the reserve cap and the active-proposal gate do not apply (the reserved
+- **THEN** the reserve cap and the open-proposal gate do not apply (the reserved
   float belongs to the queue)
 
 #### Scenario: maxRedeem excludes queued shares
@@ -149,19 +170,24 @@ serve an exit.
 
 #### Scenario: Missing governor fails closed in exit views
 
-- **WHEN** the factory resolves a zero governor for the vault
+- **WHEN** the factory resolves a zero governor for an unpaused vault and the owner is
+  not the withdrawal queue
 - **THEN** `maxWithdraw`/`maxRedeem` revert `GovernorNotSet` (via
   `redemptionsLocked()`) rather than reporting instant capacity
 
 ### Requirement: Async redemption requests (Lane B)
 
-`requestRedeem(shares, owner)` SHALL be callable only while `redemptionsLocked()` is
-true, the vault is not paused, and a withdrawal queue is bound; zero shares SHALL
-revert `InsufficientShares`, an unset queue `WithdrawalQueueNotSet`, and an unlocked
-vault `RedemptionsNotLocked`. A caller other than the share owner SHALL spend ERC-20
-allowance. The shares SHALL be transferred (not burned) into queue custody, tagged
-with the active proposal id, and a request id strictly greater than 0 SHALL be
-returned with `RedeemRequested` emitted.
+`requestRedeem(shares, owner)` SHALL be callable only while the vault is not paused,
+a withdrawal queue is bound, and `redemptionsLocked()` is true (any proposal open,
+Draft included), checked in that order: a paused vault reverts `EnforcedPause`, an
+unset queue `WithdrawalQueueNotSet`, an unlocked vault `RedemptionsNotLocked`, and
+zero shares `InsufficientShares`. A caller other than the share owner SHALL spend
+ERC-20 allowance. The shares SHALL be transferred (not burned) into queue custody,
+tagged with the executing proposal's id, or while none is executing with the latest
+proposal id (`proposalCount()`), and a request id strictly greater than 0 SHALL be
+returned with `RedeemRequested` emitted. A request is priced only by its proposal's
+settle stamp: a request tagged to a proposal that ends without settling is never
+stamped, and its only exit is the queue's `cancel`.
 
 #### Scenario: Queued exit escrows shares
 
@@ -171,12 +197,17 @@ returned with `RedeemRequested` emitted.
 
 #### Scenario: Request outside the lock window
 
-- **WHEN** no proposal is active
+- **WHEN** no proposal is open
 - **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the
   correct path)
 
+#### Scenario: Request tagged to a proposal that never settles
+
+- **WHEN** a holder queues a redemption during a Draft or a vote and that proposal is then cancelled, rejected or expires
+- **THEN** the request is never stamped, `claim` keeps reverting, and `cancel` returns the shares
+
 ### Requirement: Async deposit requests (Lane B)
-`requestDeposit(assets, receiver)` SHALL be callable only while `redemptionsLocked()` is true, the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted.
+`requestDeposit(assets, receiver)` SHALL be callable only while the vault is not paused, a queue is bound (`WithdrawalQueueNotSet`), and the governor reports an open proposal (`openProposalCount() != 0`, else `NoOpenProposal`) — the predicate instant deposit closes on, so exactly one deposit path is open at a time; zero assets SHALL revert `ZeroAssets`, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the executing proposal's id, or while none is executing with the latest proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted.
 
 #### Scenario: Escrowed deposit does not inflate NAV
 - **WHEN** assets are escrowed via `requestDeposit` during a proposal
@@ -186,16 +217,18 @@ returned with `RedeemRequested` emitted.
 
 When the governor notifies settlement via `onProposalSettled(pid)` (governor-only),
 the vault SHALL stamp one frozen settle price into the queue: `num = totalAssets() +
-1`, `den = totalSupply() + 10^decimalsOffset`, reproducing ERC-4626 conversion
-rounding exactly; on a queueless vault the call SHALL be a no-op. The queue SHALL
-accept at most one stamp per proposal id (`AlreadySettled` on re-stamp) and SHALL, at
-stamp time, reserve `mulDiv(queuedRedeemShares(pid), num, den)` assets for that
-proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
+1`, `den = _pricingSupply() + 10^decimalsOffset`, where `_pricingSupply()` is
+`totalSupply()` minus the shares of earlier stamped-but-unclaimed redeems (whose
+assets `totalAssets()` already excludes); on a queueless vault the call SHALL be a
+no-op. The queue SHALL accept at most one stamp per proposal id (`AlreadySettled` on
+re-stamp, `StampOutOfOrder` for a proposal id below the last stamped one) and SHALL, at stamp time, reserve `mulDiv(queuedRedeemShares(pid), num,
+den)` assets for that proposal's queued redemptions, adding it to the aggregate
+`reservedAssets`.
 
 #### Scenario: One frozen price per proposal
 
 - **WHEN** a proposal settles with queued requests tagged to it
-- **THEN** every request tagged to that proposal claims against a single stamped
+- **THEN** every redeem request tagged to that proposal claims against a single stamped
   `num/den`, and a second stamp for the same pid reverts
 
 #### Scenario: Reserve created at stamp
@@ -203,21 +236,6 @@ proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
 - **WHEN** a proposal with queued redeem shares is stamped
 - **THEN** `reservedAssets` increases by the aggregate asset value of those shares at
   the stamped price
-
-### Requirement: Claiming settled requests
-`claim(requestId)` SHALL be permissionless, SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and the vault to be unlocked (`VaultLocked` while a proposal is active), and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim SHALL mint `mulDiv(assets, den, num)` shares priced at the LATEST stamped settlement (not the request's own pid), pushing the escrowed assets into the vault immediately before the queue-only `settleDeposit` mint — pricing at the request's own pid would grant depositors a free look-back option across later settlements.
-
-#### Scenario: Redeem claim at frozen price
-- **WHEN** a settled redeem request is claimed
-- **THEN** the escrowed shares are burned, the owner receives assets at the request's own stamped price, and `RequestClaimed` is emitted
-
-#### Scenario: Deposit claim priced at latest stamp
-- **WHEN** a deposit request tagged to proposal N is claimed after proposal N+1 has also stamped
-- **THEN** shares are minted at proposal N+1's (latest) stamped price
-
-#### Scenario: No claims mid-proposal
-- **WHEN** a later proposal is active at claim time
-- **THEN** `claim` reverts `VaultLocked`
 
 ### Requirement: Reserve release and remainder path
 Each redeem claim SHALL release reserve: partial claims release exactly their floored payout, and the claim that empties a proposal's remaining queued shares SHALL release that proposal's entire remaining reservation — including the `floor(Σ) − Σfloor` rounding remainder — so aggregate `reservedAssets` never accumulates phantom dust that would over-restrict withdrawals or brick governor batches.
@@ -227,18 +245,22 @@ Each redeem claim SHALL release reserve: partial claims release exactly their fl
 - **THEN** the proposal's per-pid reservation drops to 0 and `reservedAssets` decreases by the full remaining reservation, not merely the final payout
 
 ### Requirement: Request cancellation
-`cancel(requestId)` SHALL be callable only by the request owner and only before the request's proposal is stamped; after stamping it SHALL revert `AlreadySettled` (a post-settle cancel would be a free look-back option). Cancellation SHALL return the escrowed shares (redeem) or assets (deposit) to the owner, mark the request cancelled, and emit `RequestCancelled`. Cancellation SHALL remain available while the vault is paused.
+`cancel(requestId)` SHALL be callable only by the request owner, before the request is claimed. A redeem request SHALL be cancellable only before its proposal is stamped; after stamping it SHALL revert `AlreadySettled` (a post-settle cancel would be a free look-back option on a fixed payout). A deposit request has no fixed price and SHALL stay cancellable until claimed, so a receiver refused at claim always has a way out. Cancellation SHALL return the escrowed shares (redeem) or assets (deposit) to the owner, mark the request cancelled, and emit `RequestCancelled`. Cancellation SHALL remain available while the vault is paused.
 
 #### Scenario: Pre-stamp cancel returns escrow
 - **WHEN** an owner cancels an unstamped redeem request
 - **THEN** the escrowed shares transfer back and pending counters decrease
 
 #### Scenario: Post-stamp cancel is forbidden
-- **WHEN** the request's proposal has been stamped
+- **WHEN** a redeem request's proposal has been stamped
 - **THEN** `cancel` reverts `AlreadySettled` and the request must be claimed
 
+#### Scenario: Deposit request cancellable after settle
+- **WHEN** the owner of an unclaimed deposit request cancels after its proposal settled
+- **THEN** the escrowed assets transfer back to the owner
+
 #### Scenario: Paused vault does not trap queued LPs
-- **WHEN** the vault is paused with unstamped requests outstanding
+- **WHEN** the vault is paused with requests outstanding that `cancel` admits
 - **THEN** owners can still `cancel` and recover their escrow
 
 ### Requirement: Queue-reserve seniority
@@ -249,10 +271,10 @@ Assets reserved for stamped-but-unclaimed redemptions (`reservedQueueAssets`) SH
 - **THEN** `executeGovernorBatch` reverts `QueueReserveBreached`
 
 ### Requirement: Idle-liquidity buffer
-The vault owner SHALL be able to set an idle-liquidity floor `minBufferBps` (basis points, at most 5,000 = 50%, `BufferTooHigh` above; 0 disables), emitting `MinBufferUpdated`. `executeGovernorBatch` SHALL revert `BufferBreached` if the post-batch idle balance is below the queue reserve plus `minBufferBps` of the PRE-batch idle balance — a batch may deploy at most `(1 − minBufferBps)` of the pre-batch float. Net-inflow (settlement) batches pass trivially. The buffer is a deployment-time constraint only: withdrawals may spend it between batches.
+The vault owner SHALL be able to set an idle-liquidity floor `minBufferBps` (basis points, at most 5,000 = 50%, `BufferTooHigh` above; 0 disables), emitting `MinBufferUpdated`. `executeGovernorBatch` SHALL revert `BufferBreached` if the post-batch idle balance is below the queue reserve plus `minBufferBps` of the PRE-batch idle balance — a batch may deploy at most `(1 − minBufferBps) × preBatchBalance − reservedQueueAssets()`. A settlement batch passes the buffer check whenever `minBufferBps` is unchanged since execute; `setMinBufferBps` has no open-proposal lock, so an owner raise mid-proposal can make even a net-inflow settle or `unstick` revert `BufferBreached`. The buffer is a deployment-time constraint only: withdrawals may spend it between batches.
 
 #### Scenario: Batch bounded by the buffer
-- **WHEN** `minBufferBps = 1000` and a batch attempts to deploy more than 90% of the pre-batch float (net of reserve)
+- **WHEN** `minBufferBps = 1000` and a batch would leave the post-batch balance below the queue reserve plus 10% of the pre-batch balance
 - **THEN** the batch reverts `BufferBreached`
 
 #### Scenario: Setter bound
@@ -260,66 +282,30 @@ The vault owner SHALL be able to set an idle-liquidity floor `minBufferBps` (bas
 - **THEN** the call reverts `BufferTooHigh`
 
 ### Requirement: Governor batch execution
-`executeGovernorBatch(calls, maxNetOutflow)` SHALL be callable only by the governor resolved live from the factory, only while unpaused, and non-reentrantly. Before executing, the vault SHALL verify the shared executor library's bytecode still matches the codehash stamped at initialization (`ExecutorCodehashMismatch` on drift), then delegatecall the batch, bubbling any failure's revert data. After success it SHALL emit `GovernorBatchExecuted(governor, callCount)` and enforce, in order: net asset outflow of the batch not exceeding `maxNetOutflow` (`MaxNetOutflowExceeded`), idle balance not below the queue reserve (`QueueReserveBreached`), and the idle-liquidity buffer (`BufferBreached`).
+`executeGovernorBatch(calls, callCaps, maxNetOutflow)` SHALL be callable only by the governor resolved live from the factory, only while unpaused, and non-reentrantly. Before executing, the vault SHALL verify the shared executor library's bytecode still matches the expected codehash, stamped at initialization and re-stamped by the factory-only `setExecutorImpl` re-point (`ExecutorCodehashMismatch` on drift), run the structural batch guard (registered-strategy targets; on the asset, the named selector set with `transferFrom` from the vault only), then delegatecall the library's `executeBatch(calls, asset(), callCaps)`, which meters each call's gross outflow against its cap when `callCaps` is non-empty, bubbling any failure's revert data. After success it SHALL reset every allowance the batch granted on `asset()` to zero, emit `GovernorBatchExecuted(governor, callCount)`, and enforce, in order: net asset outflow of the batch not exceeding `maxNetOutflow` (`MaxNetOutflowExceeded`), idle balance not below the queue reserve (`QueueReserveBreached`), and the idle-liquidity buffer (`BufferBreached`).
 
 #### Scenario: Non-governor caller rejected
 - **WHEN** any address other than the factory-resolved governor calls `executeGovernorBatch`
 - **THEN** the call reverts `NotGovernor`
 
 #### Scenario: Swapped executor bytecode rejected
-- **WHEN** the code at the executor implementation address no longer matches the initialization-time codehash
+- **WHEN** the code at the executor implementation address no longer matches the expected codehash
 - **THEN** the batch reverts `ExecutorCodehashMismatch` before any call executes
 
 #### Scenario: Net-outflow ceiling
 - **WHEN** a batch moves more of the vault asset out of custody than `maxNetOutflow`
 - **THEN** the batch reverts `MaxNetOutflowExceeded(netOutflow, cap)`
 
-### Requirement: Value-moving selector guard on batches
-
-When the calling governor exposes a nonzero TierRegistry, every batch call carrying one of the guarded value-moving selectors — legacy `approve`, `increaseAllowance`, `transfer`, `transferFrom`, plus Permit2 `AllowanceTransfer.approve(address,address,uint160,uint48)` (`0x87517c45`), Permit2 `AllowanceTransfer.transferFrom` (`0x36c78516`), and DSToken `move` (`0xbb35783b`) — SHALL have its spender/recipient (arg 1, calldata bytes 4..36, for legacy `approve`/`increaseAllowance`/`transfer`; arg 2, calldata bytes 36..68, for legacy `transferFrom`, Permit2 `transferFrom`'s `to`, Permit2 `approve`'s `spender`, and DSToken `move`'s `dst`) be either the vault itself or an adapter allowlisted in the TierRegistry; otherwise the batch SHALL revert `DisallowedTransferTarget`. Guarded-selector calldata too short to hold the guarded argument SHALL revert `MalformedCall`. The guard SHALL run on every governor batch (execute, settlement, and emergency paths). When the governor has no tier registry wired (getter missing or returning zero), this destination guard SHALL be skipped by design; the transferFrom **source** guard is unconditional and is specified separately.
-
-The self-transfer fast-path (destination decodes to the vault itself) SHALL apply **only** when the call's target is `asset()` — the one token whose balance the outer net-outflow meter in `executeGovernorBatch` independently verifies via a balance diff. For every other token the vault holds (e.g. a strategy position), a destination that decodes to the vault SHALL still be routed through the TierRegistry check like any other destination; a non-standard token could otherwise execute arbitrary logic under a vault-to-vault call shape with zero verification anywhere in the pipeline.
-
-#### Scenario: Balance-invisible exfiltration blocked
-
-- **WHEN** a batch call is `token.approve(attacker, max)` and `attacker` is not the vault or an allowlisted adapter
-- **THEN** the batch reverts `DisallowedTransferTarget` even though the call itself moves no balance
-
-#### Scenario: Registry-less governor degrades open
-
-- **WHEN** the governor's tier registry is unset
-- **THEN** the destination guard does not run and the batch proceeds under the transferFrom source guard, the privileged-target guard, and the outflow/reserve/buffer checks only
-
-#### Scenario: Pull into the vault always passes
-
-- **WHEN** a batch call is `transferFrom(x, vault, amount)`
-- **THEN** the destination guard passes it as an inflow — this requirement governs only the destination check; a non-vault `x` is separately rejected by the transferFrom source guard specified above before the batch can succeed
-
-#### Scenario: Permit2 approve to a non-allowlisted spender is rejected
-
-- **WHEN** a governor batch contains `Permit2.approve(token, attacker, amount, expiration)` and `attacker` is not the vault or an allowlisted adapter
-- **THEN** the batch reverts `DisallowedTransferTarget(permit2, PERMIT2_APPROVE_SELECTOR, attacker)`, closing the two-transaction poison-then-drain route through Permit2 identically to the legacy `approve` guard
-
-#### Scenario: Self-transfer fast-path does not exempt non-asset() tokens
-
-- **WHEN** a governor batch contains `EvilToken.transferFrom(vault, vault, amount)` where `EvilToken` is not `asset()` and is not allowlisted in the TierRegistry
-- **THEN** the batch reverts `DisallowedTransferTarget(EvilToken, TRANSFER_FROM_SELECTOR, vault)` — the destination decoding to the vault no longer skips the registry check for any token other than `asset()`
-
-#### Scenario: Self-transfer fast-path still exempts asset()
-
-- **WHEN** a governor batch contains `asset().transferFrom(vault, vault, amount)` (a self-approve/self-transfer of the vault's own underlying asset)
-- **THEN** the destination guard's fast-path exempts it exactly as before, since `asset()` is the token the outer net-outflow meter independently verifies
-
 ### Requirement: Fee parameters
-The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 bps, 20%) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (2500 bps, 25% — an alias of the protocol performance-fee ceiling `FeeConstants.MAX_PERFORMANCE_FEE_BPS`; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is snapshotted onto a proposal at propose time and clamped to the governor's configured maximum at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient, and to at most the vault's balance (`AmountExceedsBalance`).
+The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 bps, 20%) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (2500 bps, 25% — an alias of the protocol performance-fee ceiling `FeeConstants.MAX_PERFORMANCE_FEE_BPS`; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is clamped to the governor's configured maximum and snapshotted onto a proposal at propose time, and re-clamped to the maximum then in force at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient (`ZeroAddress`), and to at most the balance net of the queue reserve and the escrowed fee liability (`AmountExceedsBalance`).
 
 #### Scenario: Default agent fee
 - **WHEN** the owner has never called `setAgentFeeBps`
-- **THEN** `agentFeeBps()` returns 500
+- **THEN** `agentFeeBps()` returns 2000
 
 #### Scenario: Explicit zero survives
 - **WHEN** the owner sets the agent fee to 0
-- **THEN** `agentFeeBps()` returns 0, not the 5% default
+- **THEN** `agentFeeBps()` returns 0, not the 20% default
 
 ### Requirement: Agent registration and removal
 The owner SHALL manage the registered-agent set: `registerAgent(agentId, agentAddress)` SHALL reject the zero address, an already-active agent (`AgentAlreadyRegistered`), and any registration that would exceed `MAX_AGENTS_PER_VAULT` (32; `AgentCapExceeded`). The registry SHALL be the factory's current `agentRegistry()`, read live at each registration (the vault's init-time snapshot is not consulted), so a factory re-point or disable applies to existing vaults. When that registry is non-zero, the `agentId` NFT SHALL be owned by the agent address or the vault owner at registration time (`NotAgentOwner` otherwise); ownership is checked at registration only — later NFT transfers do not revoke vault privileges until `removeAgent`. `removeAgent` SHALL fully delete the agent's config (`AgentNotActive` if inactive) so stale entries cannot be reused. Membership SHALL be readable via `isAgent`, `getAgentCount`, and paginated `agentsPaginated`.
@@ -348,110 +334,207 @@ Direct `transferOwnership` and `renounceOwnership` SHALL always revert (`NotFact
 - **THEN** every agent entry is deleted before the new owner takes over
 
 ### Requirement: Pause and emergency behavior
-Owner-only `pause`/`unpause` SHALL freeze LP flow (`deposit`/`mint`/`withdraw`/`redeem`), strategy execution (`executeGovernorBatch`), and new queue requests (`requestRedeem`/`requestDeposit`), while leaving queue `cancel` available. Owner rescue paths — `rescueEth`, `rescueERC20` (never the vault asset; `CannotRescueAsset`), `rescueERC721` — SHALL remain callable while paused but SHALL revert `RedemptionsLocked` whenever a proposal is active, so the owner cannot siphon strategy-transit assets mid-proposal. The vault SHALL have no `receive`/`fallback` (raw ETH sent directly is rejected). `redemptionsLocked()` SHALL fail closed: a zero governor address SHALL revert `GovernorNotSet` rather than reporting unlocked.
+Owner-only `pause`/`unpause` SHALL freeze LP flow (`deposit`/`mint`/`withdraw`/`redeem`), queued-deposit claims (`settleDeposit`), strategy execution (`executeGovernorBatch`), and new queue requests (`requestRedeem`/`requestDeposit`), while leaving queue `cancel` available. Owner rescue paths — `rescueEth`, `rescueERC20`, `rescueERC721` — SHALL remain callable while paused but SHALL revert `RedemptionsLocked` whenever any proposal is open, Drafts included, so the owner cannot siphon strategy-transit assets mid-proposal. `rescueERC20` SHALL revert `ZeroAddress` for a zero recipient, SHALL never move the vault asset (`CannotRescueAsset`) and SHALL send a non-asset token only to a strategy clone of this vault: the protocol strategy factory's `cloneTemplate(to)` SHALL be non-zero and `IStrategy(to).vault()` SHALL equal the vault, both read fail-closed (an unwired factory, a codeless recipient or one that does not answer reverts `RescueRecipientNotStrategy(to)`). Registration through the permissionless `registerStrategy` SHALL NOT qualify a recipient. A token sent there returns to the vault only through a later proposal's batch. The vault SHALL have no `receive`/`fallback` (raw ETH sent directly is rejected). `redemptionsLocked()` and `depositsLocked()` SHALL fail closed: a zero governor address SHALL revert `GovernorNotSet` rather than reporting unlocked.
 
 #### Scenario: Pause freezes flow and execution
 - **WHEN** the owner pauses the vault
-- **THEN** deposits, withdrawals, queue requests, and governor batches all revert until unpause
+- **THEN** deposits, withdrawals, queue requests, queued-deposit claims, and governor batches all revert until unpause
 
 #### Scenario: Rescue blocked mid-proposal
-- **WHEN** a proposal is active
+- **WHEN** any proposal is open, including a Draft
 - **THEN** all three rescue functions revert `RedemptionsLocked` regardless of pause state
+
+#### Scenario: Rescued token goes only to a clone of the vault
+- **WHEN** the owner calls `rescueERC20` for a non-asset token with a recipient that is the owner, an arbitrary address, a hand-registered strategy, or a factory clone bound to another vault
+- **THEN** the call reverts `RescueRecipientNotStrategy(to)`
+- **AND** the same rescue to a factory clone bound to this vault succeeds, and a later proposal's batch calling that clone returns the value to the vault
 
 #### Scenario: Missing governor fails closed
 - **WHEN** the factory resolves a zero governor for the vault
 - **THEN** `redemptionsLocked()` (and everything gated on it) reverts `GovernorNotSet` instead of silently unlocking
 
 ### Requirement: Queue authorization boundaries
-The queue SHALL accept `queueRedeem`, `queueDeposit`, and `stampSettlement` only from its immutable bound vault (`NotVault` otherwise); the vault SHALL accept `settleRedeem` and `settleDeposit` only from its bound queue (`NotQueue`) and `onProposalSettled` only from its governor. Request ids SHALL start at 1 (index 0 is a sentinel; out-of-range ids revert `RequestNotFound`). The queue SHALL expose `pendingShares`, `pendingDepositAssets`, `reservedAssets`, per-owner request ids, per-request state (owner, amount, pid, kind, claimed/cancelled, custody interval `queuedAt`/`closedAt`), and stamped settle prices.
+The queue SHALL accept `queueRedeem`, `queueDeposit`, and `stampSettlement` only from its immutable bound vault (`NotVault` otherwise); the vault SHALL accept `settleRedeem` and `settleDeposit` only from its bound queue (`NotQueue`) and `onProposalSettled` only from its governor. Request ids SHALL start at 1 (index 0 is a sentinel; `claim` and `cancel` on id 0 or an out-of-range id revert `RequestNotFound`). The queue SHALL expose `pendingShares`, `pendingDepositAssets`, `reservedAssets`, per-owner request ids, per-request state (owner, amount, pid, kind, claimed/cancelled, custody interval `queuedAt`/`closedAt`), and stamped settle prices.
 
 #### Scenario: Third party cannot mint via queue surface
 - **WHEN** any address other than the bound queue calls `settleDeposit` or `settleRedeem` on the vault
 - **THEN** the call reverts `NotQueue`
 
-### Requirement: Privileged-target guard on batches
-
-`_guardBatchCalls` SHALL reject any governor batch containing a call whose `target` is the vault itself or the vault's bound withdrawal queue, reverting `DisallowedBatchTarget(target)`. This target check SHALL be enforced **unconditionally on every call in the batch, before the value-moving-selector switch and independently of whether a TierRegistry is wired** — it SHALL NOT be skipped by the `registry == address(0)` degrade-open path that gates the selector guard. Because `_guardBatchCalls` runs inside `executeGovernorBatch`, the guard SHALL apply on the execute, settlement, and both emergency batch paths alike.
-
-The adversary is a governor batch that carries `msg.sender == vault` into a vault-only entrypoint: because batches execute via `delegatecall`, calling the withdrawal queue's `onlyVault` functions (`queueRedeem`, `queueDeposit`, `stampSettlement`) satisfies its `onlyVault` gate while moving zero vault `asset()` balance in the same transaction — so the net-outflow meter, the queue-reserve check, and the tier-2 coverage price all read it as harmless. Blocking the vault and the queue as batch targets is the complete boundary: no legitimate strategy batch targets either address (they target strategy adapters, the asset token, or external protocols).
-
-#### Scenario: Queue-targeting batch call is rejected
-
-- **WHEN** a governor batch contains a call whose `target` is the bound withdrawal queue (e.g. `queueRedeem(attacker, victimShares, pid)`)
-- **THEN** `executeGovernorBatch` reverts `DisallowedBatchTarget(withdrawalQueue)` before any call executes, even though the call moves no vault `asset()` balance and would otherwise clear the outflow meter and tier-2 coverage
-
-#### Scenario: Vault self-targeting batch call is rejected
-
-- **WHEN** a governor batch contains a call whose `target` is the vault itself (`address(this)`)
-- **THEN** `executeGovernorBatch` reverts `DisallowedBatchTarget(vault)`
-
-#### Scenario: Guard fires even without a wired TierRegistry
-
-- **WHEN** the calling governor exposes no TierRegistry (getter missing or returning `address(0)`) and a batch targets the withdrawal queue
-- **THEN** the batch still reverts `DisallowedBatchTarget` — the target guard runs outside the registry-less degrade-open path that skips the selector guard
-
-#### Scenario: Emergency path is covered
-
-- **WHEN** the vault owner drives `emergencySettleWithCalls` / `finalizeEmergencySettle` (or `unstick`) with owner-supplied calls that target the withdrawal queue, bypassing the LP vote and coverage quorum
-- **THEN** the batch reverts `DisallowedBatchTarget` because `_guardBatchCalls` runs on every `executeGovernorBatch` invocation regardless of entrypoint
-
-#### Scenario: Honest strategy batch is unaffected
-
-- **WHEN** a governor batch targets only strategy adapters, the vault's underlying asset token, or external protocol contracts (never the vault or its queue)
-- **THEN** the target guard passes every call and the batch proceeds under the existing selector, outflow, reserve, and buffer checks
-
-### Requirement: transferFrom source guard on batches
-
-Every governor batch call carrying the `transferFrom(address,address,uint256)` selector, OR one of the alternate-signature "pull tokens via delegated allowance" selectors this guard recognizes — Permit2 `AllowanceTransfer.transferFrom(address,address,uint160,address)` (`0x36c78516`), DSToken `pull(address,uint256)` (`0xf2d5d56b`), and DSToken `move(address,address,uint256)` (`0xbb35783b`) — SHALL have its source address (`from`/`usr`/`src`, calldata bytes 4..36 in every recognized case) equal to the vault itself; otherwise the batch SHALL revert `DisallowedTransferFromSource(target, from)`. Calldata for any of these selectors too short to hold both address arguments (fewer than 68 bytes) SHALL revert `MalformedCall`. Both checks SHALL be enforced **unconditionally on every call in the batch, independently of whether a TierRegistry is wired** — they SHALL NOT be skipped by the degrade-open path that gates the value-moving selector guard. Because the guard runs inside `executeGovernorBatch`, it SHALL apply on the execute, settlement, and both emergency batch paths alike.
-
-A post-merge security review (Pashov 12-agent audit of PR #157, confidence 90, 3-agent independent convergence) found that limiting recognition to the single legacy `transferFrom` selector left the identical "pull via delegated allowance" capability, exposed under a different selector by Permit2 or DSToken, completely unguarded — reproducing the exact confiscation primitive this requirement exists to close, just routed through a different target. The guard is extended selector-by-selector (documented follow-up: a target-based redesign, gating every batch call regardless of selector, was assessed as more durable but was deferred because it would require re-plumbing the tier-pricing/TierRegistry relationship for every non-value-moving adapter call, outside this change's footprint).
-
-The adversary is a governor batch that spends a third party's ERC-20 allowance: batches execute via `delegatecall`, so every sub-call carries `msg.sender == vault`, and `token.transferFrom(victim, vault, victimBalance)` spends `allowance[victim][vault]` — the standing (routinely unlimited) allowance every LP grants in order to deposit. No other meter sees it: the vault's balance rises so net-outflow reads 0, tier coverage prices only vault capital (`maxCapital`) and never third-party wallets, and the privileged-target denylist does not fire because the call target is the token. Confiscation is not a priced capability but a refused one, which is why the check is unconditional — the same posture as the privileged-target guard.
-
-The permitted source is exactly the vault itself, NOT the TierRegistry adapter allowlist. `isAdapterAllowed` encodes destination consent — an address the vault may *send* funds to — and an entry there is no consent to having its own allowances seized. No honest batch pulls from any third party: capital deploys via a guarded `approve` to an adapter that pulls in its own code, and returns are pushes from the adapter.
-
-#### Scenario: LP-allowance confiscation is rejected
-
-- **WHEN** a governor batch contains `token.transferFrom(victim, vault, amount)` where `victim` is any address other than the vault (e.g. an LP holding a `type(uint256).max` deposit allowance to the vault)
-- **THEN** `executeGovernorBatch` reverts `DisallowedTransferFromSource(token, victim)`, even though the destination is the vault and the vault's balance would have risen
-
-#### Scenario: Allowlisted adapter is not a permitted source
-
-- **WHEN** a governor batch contains `token.transferFrom(adapter, vault, amount)` where `adapter` is allowlisted in the TierRegistry
-- **THEN** the batch reverts `DisallowedTransferFromSource(token, adapter)` — destination consent does not confer source consent
-
-#### Scenario: Guard fires even without a wired TierRegistry
-
-- **WHEN** the calling governor exposes no TierRegistry (getter missing or returning `address(0)`) and a batch contains `transferFrom` with a non-vault source
-- **THEN** the batch still reverts `DisallowedTransferFromSource` — the source guard runs outside the registry-less degrade-open path that skips the selector guard
-
-#### Scenario: Vault-sourced transferFrom still flows through the destination guard
-
-- **WHEN** a governor batch contains `token.transferFrom(vault, x, amount)`
-- **THEN** the source guard passes it, and `x` remains subject to the value-moving selector guard (vault or allowlisted adapter, else `DisallowedTransferTarget`) and the batch to the net-outflow meter — exactly as if the call were `transfer(x, amount)`
-
-#### Scenario: Short transferFrom calldata is rejected unconditionally
-
-- **WHEN** a governor batch contains a call whose selector is `transferFrom` but whose calldata cannot hold both address arguments (length below 68 bytes), and no TierRegistry is wired
-- **THEN** the batch reverts `MalformedCall` — the source guard's calldata bound does not degrade open with the registry
-
-#### Scenario: Permit2-routed confiscation is rejected identically to legacy transferFrom
-
-- **WHEN** a governor batch contains `Permit2.transferFrom(victim, attacker, amount, token)` where `victim` is any address other than the vault and `victim` has a standing Permit2 allowance recorded for `token`
-- **THEN** `executeGovernorBatch` reverts `DisallowedTransferFromSource(permit2, victim)`, exactly as it would for the equivalent legacy `token.transferFrom(victim, attacker, amount)` call
-
-#### Scenario: DSToken pull/move from a non-vault source is rejected
-
-- **WHEN** a governor batch contains `DSToken.pull(victim, amount)` or `DSToken.move(victim, attacker, amount)` where `victim` is not the vault
-- **THEN** the batch reverts `DisallowedTransferFromSource(dstoken, victim)`
-
-
 ### Requirement: Deposits are not charged a fee
 
-The vault SHALL charge nothing on entry. (Relocated verbatim from the retired
-`instant-exit-fees` capability — it was never Lane-A-specific.)
+The vault SHALL charge nothing on entry.
 
 #### Scenario: A deposit incurs no fee
 
 - **WHEN** a depositor deposits into the vault
 - **THEN** the shares issued reflect the full deposited amount, less no fee
+
+### Requirement: Storage layout is pinned and CI-enforced
+
+The vault's linear storage layout SHALL be pinned at two independent layers,
+mirroring the protocol's existing golden-layout guard for the other
+proxy-upgraded contracts:
+
+1. A committed golden snapshot (`script/syndicate-vault-layout.golden.json`)
+   in the canonical format emitted by `script/check-layout-goldens.sh` —
+   every top-level state variable's label, slot, offset, and normalized type
+   in declaration order (AST ids stripped, array lengths preserved), plus the
+   internal member layout of every struct transitively reachable from
+   storage. `check-layout-goldens.sh` SHALL compare the compiler-emitted
+   layout of `SyndicateVault` against this golden via the same
+   `check_contract` convention as the other pinned contracts, and CI SHALL
+   run it (the `storage-layout` job runs the whole script).
+2. A raw-slot pin test (`test/VaultLayoutPins.t.sol`) following the structure
+   and assertion style of the existing layout-pin tests: sentinel values
+   written through real entry points (or, for fields writable only deep in
+   the proposal lifecycle, `vm.store` reverse-pinned through their public
+   getters) and asserted at frozen slot indices with `vm.load`, so a
+   reorder/insert/retype fails under plain `forge test` even when the shell
+   script is not run.
+
+The pinned baseline is the layout at the time this change lands. Because the
+vault is a UUPS proxy whose upgrades are factory-gated, once any vault proxy
+is live the layout SHALL evolve append-only: new fields are carved from the
+FRONT of `__gap` (shrinking it), pins are added but never edited, and the
+golden is regenerated with `./script/check-layout-goldens.sh --update-golden`
+in the same PR as the storage change. Before any vault proxy is live, a
+deliberate layout break MAY re-baseline the golden and the pin test in the
+same PR — the diff makes the break reviewed and conscious, which is the
+gate's purpose.
+
+#### Scenario: Layout drift fails CI
+
+- **WHEN** a change reorders, inserts, deletes, or retypes any
+  `SyndicateVault` state variable, or resizes `__gap` without a matching
+  field change, without regenerating the golden
+- **THEN** `script/check-layout-goldens.sh` exits non-zero and the CI layout
+  step fails
+
+#### Scenario: Slot move fails under plain forge test
+
+- **WHEN** a `SyndicateVault` state variable moves to a different slot or
+  intra-slot offset and the test suite runs without the shell script
+- **THEN** at least one assertion in `test/VaultLayoutPins.t.sol` fails
+
+#### Scenario: Append-only evolution passes
+
+- **WHEN** a new field is appended by carving it from the front of `__gap`
+  (gap length decremented accordingly), the golden is regenerated in the same
+  PR, and a pin for the new field is added without editing existing pins
+- **THEN** both the golden check and the pin test pass
+
+#### Scenario: Empty or misresolved layout is refused
+
+- **WHEN** the checker's `forge inspect` read for `SyndicateVault` resolves
+  to an empty storage layout (e.g. the contract is renamed and the name now
+  matches an interface or library)
+- **THEN** `script/check-layout-goldens.sh` hard-fails rather than comparing
+  or baking a layout that pins nothing
+
+### Requirement: Per-call gross-outflow metering in the batch executor
+The shared batch executor library's `executeBatch(calls, asset, caps)` SHALL, when `caps` is non-empty, meter every call: `outflow_i = max(0, assetBalanceBefore_i − assetBalanceAfter_i)` measured on the executing vault's balance of `asset` (the library runs under delegatecall, so `address(this)` is the vault), and SHALL revert the entire batch with `CallCapExceeded(i, outflow_i, caps[i])` when any call's gross outflow exceeds its declared cap — fail-closed on money; there is no mode that lets the spend proceed while only the accounting objects. Metering SHALL be GROSS across calls: an inflow during call *j* SHALL NOT increase any other call's remaining budget (each call is judged against its own cap from its own pre-call snapshot; netting within one atomic call is inherent and permitted). A non-empty `caps` array whose length differs from `calls` SHALL revert `CapsLengthMismatch`. An empty `caps` array SHALL skip per-call metering entirely — reserved for callers with no propose-time declaration (the guardian-reviewed emergency path), which remain bounded by the vault's batch-level checks. The library SHALL remain stateless and access-control-free (the calling vault enforces authorization and custody limits), SHALL bubble sub-call revert data unchanged, and SHALL NOT retain the previous unmetered `executeBatch(calls)` selector — a mis-wired vault must fail closed, never fall back to unmetered execution. The library's `simulateBatch(calls, asset, caps)` SHALL accept the same inputs and report each call's success, return data, and measured gross outflow on `address(this)`, so a proposer can size caps from a dry-run executed in the vault's context (an `eth_call` with a state override placing the library at the vault); the vault exposes no simulation entrypoint of its own.
+
+#### Scenario: Refund does not refill an earlier budget
+- **GIVEN** caps `[100, 0]` where call 1 sends 100 of the asset out and call 2 receives 150 back
+- **WHEN** the batch executes
+- **THEN** it succeeds (call 1 outflow 100 ≤ 100; call 2 outflow 0 ≤ 0) — and reordering the inflow FIRST would not license call 2 to overspend: with caps `[0, 100]` and the outflow second, the outflow call is still judged only against its own cap
+
+#### Scenario: Breach reverts the whole batch
+- **WHEN** call 3 of a five-call batch exceeds its cap
+- **THEN** the entire batch reverts `CallCapExceeded(2, outflow, cap)` — calls 1-2's effects are rolled back and calls 4-5 never run
+
+#### Scenario: Zero cap enforces zero outflow
+- **WHEN** a call with cap 0 moves any nonzero amount of the vault asset out of custody
+- **THEN** the batch reverts `CallCapExceeded` — a zero cap is a binding declaration, not an unmetered call
+
+#### Scenario: Length mismatch fails fast
+- **WHEN** `executeBatch` receives three calls and two caps
+- **THEN** it reverts `CapsLengthMismatch` before executing any call
+
+#### Scenario: Simulation reports per-call outflows
+- **WHEN** a proposer dry-runs a batch through `simulateBatch` in the vault's context with candidate caps
+- **THEN** the result reports each call's gross outflow so caps can be sized to observed behavior, and simulation never enforces authorization (eth_call usage, matching today's `simulateBatch` contract)
+
+### Requirement: Every non-asset batch target is a registered strategy
+
+For every governor-batch call whose `target` is not the vault's underlying `asset()`, the guard SHALL require that the protocol's `StrategyFactory` holds `target` as a registered strategy whose code is unchanged since registration, and SHALL revert `NotARegisteredStrategy(target)` otherwise. The vault SHALL resolve the factory live through `governor → tierRegistry() → strategyFactory()` and read `isRegisteredStrategy(target)` on it; every hop SHALL be fail-closed — a governor or registry that does not answer, an unwired (`address(0)`) factory, or a factory that does not answer the selector with one word SHALL read as "not registered". Admission is not endorsement: the batch's effect on custody is bounded by the outflow meter, the queue reserve and the buffer floor, and its price by the tier snapshotted at propose. The vault SHALL NOT decode recipients, consult any allowlist, or probe a callee's `vault()` inside the guard.
+
+#### Scenario: Unregistered contracts are refused whatever the calldata
+- **WHEN** a batch names Morpho directly, the withdrawal queue, the governor, the vault itself, the tier registry or any contract nobody registered
+- **THEN** `executeGovernorBatch` reverts `NotARegisteredStrategy(target)` before any call executes
+
+#### Scenario: A registered strategy is admitted with any selector
+- **WHEN** a batch approves a registered hand-written strategy and calls it with a selector no registry names, pulling at most `maxNetOutflow` and within each call's cap
+- **THEN** the batch executes
+
+#### Scenario: A code change de-registers
+- **WHEN** a registered strategy's code changes after registration and a batch names it
+- **THEN** the batch reverts `NotARegisteredStrategy(target)`
+
+#### Scenario: Unwired factory refuses every non-asset target
+- **WHEN** the registry's `strategyFactory()` is `address(0)` and a batch names a strategy that was registered elsewhere
+- **THEN** the batch reverts `NotARegisteredStrategy(target)`; asset calls are still admitted under the asset rules
+
+#### Scenario: A factory that does not answer fails closed
+- **WHEN** `isRegisteredStrategy` on the resolved factory reverts or returns other than one word
+- **THEN** the batch reverts `NotARegisteredStrategy(target)`
+
+### Requirement: On the asset, a call is a metered transfer or allowance-shaped, and no allowance survives the batch
+
+For every governor-batch call whose `target` is `asset()`: calldata shorter than 36 bytes SHALL revert `MalformedAssetCall(selector)` before any call executes. `transfer(to, n)` and `transferFrom(vault, to, n)` SHALL be admitted as metered egress; `transferFrom` whose first argument word is not the vault's address SHALL revert `TransferFromNotVault(from)`. The approve family — `approve(address,uint256)`, `increaseAllowance(address,uint256)`, `increaseApproval(address,uint256)`, `decreaseAllowance(address,uint256)` and `decreaseApproval(address,uint256)` — SHALL be admitted as allowance-shaped: the guard SHALL record the first argument word as a spender, and after the batch's delegatecall returns — before the outflow, reserve and buffer checks — the vault SHALL `forceApprove(spender, 0)` on `asset()` for each recorded spender. Every other selector, reads included, SHALL revert `UnrecognizedAssetSelector(selector)` before any call executes: a token's own extensions (Paxos's `transferFromBatch`, for one) can spend allowances held by the vault, so the asset surface is a named set. The governor SHALL apply the same predicate at propose to both batches, so no proposal can reach `Executed` on an asset leg that execute or settle would refuse. The rule SHALL apply on the execute, settlement and emergency batch paths alike.
+
+#### Scenario: transferFrom from an LP is refused
+- **WHEN** a batch contains `asset.transferFrom(lp, x, n)` where `lp` holds a standing deposit allowance to the vault
+- **THEN** the batch reverts `TransferFromNotVault(lp)` before any call executes and the LP's allowance is untouched
+
+#### Scenario: transferFromBatch naming an LP is refused
+- **WHEN** the asset exposes `transferFromBatch(address[],address[],uint256[])` and a batch or a proposal's execute or settlement leg calls it with an LP as `from[0]`
+- **THEN** `executeGovernorBatch` and `propose` revert `UnrecognizedAssetSelector(transferFromBatch.selector)` before any call executes, and the LP's balance and allowance to the vault are untouched
+
+#### Scenario: Reads and unknown grant shapes are refused
+- **WHEN** a batch calls the asset with `balanceOf`, `allowance`, `permit`, `transferAndCall` or any selector outside the admitted set
+- **THEN** the batch reverts `UnrecognizedAssetSelector(selector)` before any call executes
+
+#### Scenario: Short asset calldata is refused
+- **WHEN** a batch contains an asset call of fewer than 36 bytes (empty, `decimals()`, a bare `transferFrom` selector, an `approve` truncated to 35 bytes)
+- **THEN** the batch reverts `MalformedAssetCall(selector)` before any call executes
+
+#### Scenario: A Paxos-shaped asset's increaseApproval is reset
+- **WHEN** the asset grants through `increaseApproval(address,uint256)` and has no `increaseAllowance` (the launch asset's shape) and a batch grants two spenders through it, one of which pulls inside the batch
+- **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, spender)` is zero for both, and in the next block `transferFrom(vault, attacker, n)` by the idle spender reverts for insufficient allowance
+
+#### Scenario: transferFrom from the vault is admitted and metered
+- **WHEN** a batch approves the vault itself and calls `asset.transferFrom(vault, x, n)` with a call cap of at least `n`, and the reserve and buffer checks pass
+- **THEN** the batch executes iff `n <= maxNetOutflow`, else reverts `MaxNetOutflowExceeded`
+
+#### Scenario: transfer is admitted and metered
+- **WHEN** a batch contains `asset.transfer(x, n)` with a call cap of at least `n`, and the reserve and buffer checks pass
+- **THEN** the batch executes iff `n <= maxNetOutflow`, else reverts `MaxNetOutflowExceeded`
+
+#### Scenario: Every recorded spender reads zero allowance after the batch
+- **WHEN** a batch grants two spenders via `approve` or `increaseAllowance`, one of which pulls inside the batch and one of which does not
+- **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, spender)` is zero for both
+
+#### Scenario: Approve-then-drain in a later block is impossible
+- **WHEN** a batch approves `attacker` for `type(uint256).max` and no call pulls
+- **THEN** in the next block `asset.transferFrom(vault, attacker, 1)` by `attacker` reverts for insufficient allowance
+
+### Requirement: Claiming queued requests
+`claim(requestId)` SHALL be permissionless and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and redemptions to be unlocked (`VaultLocked` while any proposal is open, Draft included), and SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim SHALL require that deposits are unlocked (`VaultLocked` while any proposal is open); it carries no stamped price and SHALL mint `previewDeposit(assets)` shares at the live price read before the escrowed assets are pushed into the vault (`ZeroShares` if that rounds to zero), then the queue-only `settleDeposit` mints them. `settleDeposit` SHALL revert while the vault is paused and when the receiver fails the depositor whitelist rule (`NotApprovedDepositor`); the receiver recovers the assets with `cancel`.
+
+#### Scenario: Redeem claim at frozen price
+- **WHEN** a settled redeem request is claimed
+- **THEN** the escrowed shares are burned, the owner receives assets at the request's own stamped price, and `RequestClaimed` is emitted
+
+#### Scenario: Deposit claim priced live
+- **WHEN** a deposit request is claimed while no proposal is open
+- **THEN** shares are minted at `previewDeposit(assets)` read immediately before the assets reach the vault, whatever proposal the request was tagged to
+
+#### Scenario: No claims mid-proposal
+- **WHEN** a later proposal is open at claim time, Draft included
+- **THEN** `claim` reverts `VaultLocked`
+
+#### Scenario: Deposit claim refused while paused
+- **WHEN** a deposit request is claimed while the vault is paused
+- **THEN** the claim reverts and the receiver can `cancel` the request
+

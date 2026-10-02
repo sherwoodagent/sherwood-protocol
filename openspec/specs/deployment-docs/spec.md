@@ -3,7 +3,6 @@
 ## Purpose
 
 Requirements on the Sherwood deployment process: the mainnet-faithful Robinhood fork environment (Tenderly vnet, chain 9994663), the core deploy ceremony and its wiring order, the guardian-econ layered deployments (Plan B ledger, Plan D challenge game) with their pre-flight checks, and chain-specific constraints. Scenarios are the verification steps an operator runs to prove each requirement held.
-
 ## Requirements
 ### Requirement: Chain targeting and fork identity
 Posture SHALL be derived from `block.chainid` alone: 4663 is Mainnet posture; any other chain carrying a committed `chains/{chainid}.json` with a `DEPLOYER` key is Fork posture; a chain with no such book is refused before anything is broadcast. `ROBINHOOD_FORK_CHAIN_ID` is RETIRED — `chains/9994663.json` is committed, so the fork chain id is a fact about the repo, not an operator input. The fork is mainnet-faithful: USDG stablecoin, official Uniswap v3+v4, Chainlink push feeds, real tokenized-stock liquidity, and the live WOOD token (`0xf8bc08092c06db6148114dcf82af881f1085f92b`, 18-dec, 1B supply, ownership renounced).
@@ -46,7 +45,7 @@ On the fork the deployer (`0x5A00afAecE9CF61A768E2AE2713084C8d354DF94`) SHALL be
 - **THEN** the first broadcast fails for gas; funding via `tenderly_setBalance` then re-running succeeds
 
 ### Requirement: Deploy ceremony order and skip rules
-The ceremony SHALL be ONE script, `script/robinhood-mainnet/DeployAll.s.sol:DeployAll`, whose phases run in a fixed order inside ONE broadcast: Create3Factory bootstrap → core (`deployCore` + `_seatOwnerWrites`, including the TierRegistry launch set) → UniswapSwapAdapter and the Portfolio / MorphoSupply / ConcentratedLiquidity templates → StrategyFactory → the WOOD price source → Plan B → Plan D → handoff.
+The ceremony SHALL be ONE script, `script/robinhood-mainnet/DeployAll.s.sol:DeployAll`, whose phases run in a fixed order inside ONE broadcast: Create3Factory bootstrap → core (`deployCore` + `_seatOwnerWrites`, including the TierRegistry launch set) → UniswapSwapAdapter and the Portfolio / MorphoSupply / ConcentratedLiquidity templates → StrategyFactory → the WOOD price source → Plan B → Plan D → open syndicate creation (`setAgentRegistry`, Mainnet run 2 only) → handoff.
 
 The Fork posture completes in ONE run. The Mainnet posture completes in TWO runs separated by the WOOD feed's warm-up: the first run mints `WoodPoolFeed`, returns `Checkpoint.AwaitingWoodFeed` and performs NO handoff; the operator then calls `WoodPoolFeed.update()` on a keeper until `latestRoundData()` answers (at least one `window`, 24h minimum); the second run finds the feed answering, deploys the coverage stack and hands off. Between the two runs the deployer key still owns every contract — that window is the price of the warm-up and SHALL be stated in the runbook, not discovered.
 
@@ -71,11 +70,13 @@ Addresses flow IN MEMORY between phases (the `Stack` struct); no phase reads ano
 ### Requirement: The Robinhood ceremony seats every owner-gated write before handoff
 `DeployRobinhoodMainnet` is an ABSTRACT phase mixin and `DeployAll` owns `run()`, so every write the canonical run makes between `deployCore` and the multisig handoff SHALL be restated in it. Those writes SHALL be collected in ONE internal method (`_seatOwnerWrites`) rather than scattered inline, so the set can be asserted as a set: each is an `onlyOwner` call on a contract the handoff then transfers, so each has exactly one window in which it is cheap and an eternity afterwards in which it is a multisig chore.
 
-The set is: `setProtocolFeeRecipient`, `setGuardiansFeeRecipient`, and **the TierRegistry launch set** (`_seedTierRegistry`). The two fee recipients are seated ONLY when still zero, so a resumed run never re-points a recipient the Safe has already moved. The launch set was MISSING for the entire life of the script. `deployCore` mints the TierRegistry empty and wires it into the factory; the attestations are separate `onlyOwner` writes. `isCounterpartyAllowed` GATES CLONE-INIT, so an empty registry makes every ConcentratedLiquidity clone revert `CounterpartyNotAllowed` and makes `DeployConcentratedLiquidityStrategy` refuse to run at all.
+The set is: `setProtocolFeeRecipient`, `setGuardiansFeeRecipient`, and **the TierRegistry launch set** (`_seedTierRegistry`). Writes outside it are made by their own phase or inline in `DeployAll.deployAll`: the limited-launch factory writes (`setDepositsRestricted`, `setOwnerOnlyProposals`, `setCreationFee`), the swap-adapter attestation, and the run-2 `setAgentRegistry`. The two fee recipients are seated ONLY when still zero, so a resumed run never re-points a recipient the Safe has already moved. `deployCore` mints the TierRegistry empty and wires it into the factory; the attestations are separate `onlyOwner` writes. `isCounterpartyAllowed` GATES CLONE-INIT for every shipped template, so an empty registry makes every clone revert at init and makes `DeployConcentratedLiquidityStrategy` refuse to run at all.
+
+The launch set is ONE axis: every venue a template binds — the Uniswap v3 factory and position manager, the Morpho Blue singleton, each Chainlink aggregator — is seeded with `setCounterpartyAllowed(x, true)`, and each aggregator whose token is on the chain is additionally paired to its token with `setPriceSourceForToken`. No deploy script SHALL call any adapter or callee allowlist setter; none exists. The addresses this deploy MINTS (the swap adapter) are attested as counterparties by their own phase (`DeployPortfolioStrategy._attestAdapter`) inside the deployer-owned window. The attestation is REQUIRED, not best-effort: a registry the deployer no longer owns refuses the run ("PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - attest the swap adapter before the Safe accepts") rather than printing a runbook line and shipping an adapter no clone can bind.
 
 #### Scenario: Launch set lands before the handoff
 - **WHEN** the Robinhood ceremony completes
-- **THEN** the TierRegistry attests `UNISWAP_V3_FACTORY`, `UNISWAP_V3_POSITION_MANAGER` and `MORPHO_BLUE` as counterparties, and `MORPHO_BLUE` on the adapter axis as well
+- **THEN** the TierRegistry answers `isCounterpartyAllowed == true` for `UNISWAP_V3_FACTORY`, `UNISWAP_V3_POSITION_MANAGER`, `MORPHO_BLUE` and every seeded Chainlink feed, and `isPriceSourceForToken(token, feed)` for every feed whose token is on the chain
 
 The launch set is STRICT. Every symbol in `RobinhoodParams.launchSetSymbols()` requires its `CHAINLINK_<SYM>_USD_FEED` key in the address book, and a missing one REVERTS ("launch set: <KEY> is zero in the address book") rather than narrowing the attested set in silence. The paired `<SYM>` token key drives `setPriceSourceForToken`; on 4663 today USDC, BTC and LINK have a feed but no token entry, so those three are allowlisted as counterparties with NO token pairing and the run says so. Closing that gap is a book change (add the three token addresses) or a list change (drop the three symbols), not a code change.
 
@@ -101,15 +102,15 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 
 ### Requirement: The strategy template allowlist names only live templates
 
-`StrategyFactory`'s approval map starts empty and nothing else populates it, so a template the ceremony does not approve can never be cloned by a proposal. The StrategyFactory phase SHALL approve EXACTLY the three templates carried on the ceremony's `Stack` and SHALL assert all three read back approved. There is no skip path and no `approved > 0` threshold: a zero template address refuses the run ("zero template"). `DeployStrategyFactory._templateKeys()` names the three address-book keys `_persist` writes, and is pinned as an exact set.
+`StrategyFactory`'s approval map starts empty and nothing else populates it, so a template the ceremony does not approve can never be cloned by a proposal. The StrategyFactory phase SHALL approve EXACTLY the three templates carried on the ceremony's `Stack` and SHALL assert all three read back approved. There is no skip path and no `approved > 0` threshold: a template with no code refuses the run ("template holds no code: run the template phases first"). `DeployStrategyFactory._templateKeys()` names the three address-book keys `_persist` writes, and is pinned as an exact set.
 
-The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTRATED_LIQUIDITY_TEMPLATE`, and nothing else — every key on it has a live contract in `src/strategies/` and a script that deploys it. `MOONWELL_SUPPLY_TEMPLATE`, `AERODROME_LP_TEMPLATE`, `WSTETH_MOONWELL_TEMPLATE` and `MAMO_YIELD_TEMPLATE` were REMOVED (deprecated, 2026-08-04): none has a contract remaining in `src/strategies/`, they resolve only in the legacy Base books (`chains/8453.json`, `chains/84532.json`), and removal affects only a NEW `StrategyFactory` — already-deployed factories keep the approvals they were given.
+The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTRATED_LIQUIDITY_TEMPLATE`, and nothing else — every key on it has a live contract in `src/strategies/` and a script that deploys it. `MOONWELL_SUPPLY_TEMPLATE`, `AERODROME_LP_TEMPLATE`, `WSTETH_MOONWELL_TEMPLATE` and `MAMO_YIELD_TEMPLATE` were REMOVED (deprecated, 2026-08-04): none has a contract remaining in `src/strategies/`, none resolves in a committed address book, and removal affects only a NEW `StrategyFactory` — already-deployed factories keep the approvals they were given.
 
 `MorphoSupplyStrategy` requires NO Morpho address and NO market params at deploy time. It is an ERC-1167 template: the Morpho singleton, the `MarketParams` tuple and the supply amount all arrive per clone via `_initialize(bytes)`, so they are proposal inputs. The template is deliberately left uninitialized, which is the correct resting state for a clone source.
 
 #### Scenario: Morpho template reaches the allowlist
 - **WHEN** the ceremony completes
-- **THEN** `chains/{chainId}.json` carries `MORPHO_SUPPLY_TEMPLATE`, `_templateKeys()` names it, and `StrategyFactory.templateApproved` is true for it
+- **THEN** `chains/{chainId}.json` carries `MORPHO_SUPPLY_TEMPLATE`, `_templateKeys()` names it, and `StrategyFactory.approvedTemplate` is true for it
 
 #### Scenario: Deprecated template keys refused entry
 - **WHEN** a deprecated key is re-added to `_templateKeys()`
@@ -128,16 +129,16 @@ This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. In
 - **THEN** the run reverts naming the exact call the registry owner must make, before the template is deployed or persisted
 
 #### Scenario: Registry named but unanswerable
-- **WHEN** the address book's `TIER_REGISTRY` holds no code, or answers `isCounterpartyAllowed` with anything other than a 32-byte word
+- **WHEN** the ceremony's tier registry (on the in-memory `Stack`) holds no code, or answers `isCounterpartyAllowed` with anything other than a 32-byte word
 - **THEN** the script reverts rather than treating the silence as a grant
 
 ### Requirement: Each CL pool's volatile leg is counterparty-allowlisted before its proposal
 
 Pool provenance establishes where a pool came from; it says nothing about what the pool TRADES. A proposer can deploy a worthless ERC-20, create a genuine `(vaultAsset, junk)` pool through the real factory, initialise it at a price of their choosing, and pass every provenance check on the merits — after which `_rebalanceToTarget` buys that token with vault asset, priced by the only venue that quotes the pair.
 
-`ConcentratedLiquidityStrategy._initialize` therefore binds the pool's non-asset token (`otherToken`) through `isCounterpartyAllowed` alongside `swapAdapter`, `positionManager`, `morpho`, `collateralToken` and `uniswapFactory`, and re-checks it at `execute()` and `rerange()`.
+`ConcentratedLiquidityStrategy._initialize` therefore binds the pool's non-asset token (`otherToken`) through `isCounterpartyAllowed` alongside `swapAdapter`, `positionManager`, `morpho` and `uniswapFactory` (the market itself is admitted by its allowlisted id), and re-checks it at `execute()` and `rerange()`.
 
-This is a PER-PROPOSAL obligation, not a ceremony step: the volatile leg is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setCounterpartyAllowed(<volatile leg>, true)` for each token a CL proposal is expected to trade, before that proposal is executed. Exits are deliberately NOT gated on it — `settle`, `sweep` and `releaseUnconvertible` stay open under the existing capital-hostage rule, so a demotion cannot strand the funds it is meant to protect.
+This is a PER-PROPOSAL obligation, not a ceremony step: the volatile leg is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setCounterpartyAllowed(<volatile leg>, true)` for each token a CL proposal is expected to trade, before that proposal is executed. Exits are deliberately NOT gated on it — `settle()` stays open under the existing capital-hostage rule, so a demotion cannot strand the funds it is meant to protect.
 
 #### Scenario: Proposal naming an unvouched volatile leg
 - **WHEN** a CL proposal names a pool whose non-asset token is not counterparty-allowlisted
@@ -148,11 +149,11 @@ This is a PER-PROPOSAL obligation, not a ceremony step: the volatile leg is chos
 - **THEN** both entry paths revert, while `settle()` still completes
 
 ### Requirement: Core wiring order inside deployCore
-The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib and vault impl; ProtocolConfig (plain Ownable, fee params seeded when non-zero); governor impl wrapped in a `GovernorBeacon` (per-vault governors are `BeaconProxy`s minted at `createSyndicate` — no singleton governor proxy is deployed); **sWOOD proxy before the registry proxy** (the registry's `initialize` takes the sWOOD address; the registry↔sWOOD cycle resolves via the set-once `StakedWood.setRegistry` call after the registry exists); factory proxy (address predicted by CREATE3 and asserted); then `TierRegistry` deployed owner-as-deployer and wired via the factory-only `setTierRegistry` BEFORE the multisig handoff. The `SYNDICATE_GOVERNOR` address-book slot SHALL be persisted as zero — governors are per-vault, resolved via `factory.governorOf(vault)`.
+The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib and vault impl; ProtocolConfig (`Ownable2Step`; its constructor takes only the owner and seeds the fee splits); governor impl wrapped in a `GovernorBeacon` (per-vault governors are `BeaconProxy`s minted at `createSyndicate` — no singleton governor proxy is deployed); **sWOOD proxy before the registry proxy** (the registry's `initialize` takes the sWOOD address; the registry↔sWOOD cycle resolves via the set-once `StakedWood.setRegistry` call after the registry exists); `TierRegistry` (owner = deployer); then the factory proxy (address predicted by CREATE3 and asserted), initialised with that tier registry in its `InitParams`. The `SYNDICATE_GOVERNOR` address-book slot SHALL be persisted as zero — governors are per-vault, resolved via `factory.governorOf(vault)`.
 
-`ProtocolConfig`, the `GovernorBeacon`, `TierRegistry` and every other protocol contract are minted through CREATE3 under the `DeploySalts` namespace `sherwood.robinhood.v1.*`. The `Create3Factory` itself is minted through the canonical CREATE2 deployer `0x4e59b44847b379578588920cA78FbF26c0B4956C` at salt `sherwood.robinhood.v1.create3-factory` with a PINNED initcode hash, so every protocol address is a function of `(DEPLOYER, salt)` ONLY. An edit to `script/utils/Create3.sol` or `Create3Factory.sol` — comments included — moves that hash and with it the whole address table, because solc's CBOR metadata hashes the source and `foundry.toml` pins no `bytecode_hash`.
+`ProtocolConfig`, the `GovernorBeacon`, `TierRegistry` and every other protocol contract are minted through CREATE3 under the `DeploySalts` namespace `sherwood.robinhood.v1.*`. The `Create3Factory` itself is minted through the canonical CREATE2 deployer `0x4e59b44847b379578588920cA78FbF26c0B4956C` at salt `sherwood.robinhood.v1.create3-factory` with a PINNED initcode hash, so every protocol address is a function of `(DEPLOYER, salt)` ONLY. A change to the compiled bytecode of `script/utils/Create3.sol` or `Create3Factory.sol`, or a toolchain change, moves that hash and with it the whole address table; metadata is off (`bytecode_hash = "none"`, `cbor_metadata = false`), so a comment-only edit does not.
 
-Validation SHALL therefore read every protocol key back as `chains/{chainId}.json value == Create3.addressOf(CREATE3_FACTORY, salt)`; `script/verify-robinhood.sh <chainId>` is that check, re-deriving the table from the book's `CREATE3_FACTORY` rather than trusting the recorded values.
+Validation SHALL therefore read every protocol key back as `chains/{chainId}.json value == Create3.addressOf(CREATE3_FACTORY, salt)`; `script/verify-robinhood.sh <chainId>` is that check, re-deriving the `Create3Factory` from its compiled initcode and the book's `DEPLOYER`, then every key from it, and failing on any book value that disagrees.
 
 The handoff SHALL transfer, all inside the Mainnet run: one-step — `GovernorBeacon`, `SyndicateFactory`, `GuardianRegistry`, `StakedWood`, `StrategyFactory`; two-step (`Ownable2Step`, so the Safe owes `acceptOwnership()`) — `ProtocolConfig`, `TierRegistry`, `ExposureLedger` and `ChallengeGame`. Each leg is skipped when it is already done, so a resumed run is a no-op rather than a revert.
 
@@ -162,12 +163,12 @@ The handoff SHALL transfer, all inside the Mainnet run: one-step — `GovernorBe
 
 #### Scenario: Two-step handoffs asserted as pending
 - **WHEN** the multisig handoff runs (ProtocolConfig and TierRegistry are `Ownable2Step`)
-- **THEN** validation asserts `pendingOwner == multisig` and the runbook requires the multisig to call `acceptOwnership()` — a deployer that forgot the acceptance step is caught at deploy time
+- **THEN** validation asserts `pendingOwner == multisig` and the runbook requires the multisig to call `acceptOwnership()` — a handoff that never armed the two-step transfer is caught at deploy time; acceptance is the Safe's post-deploy step
 
 ### Requirement: Fork funding via Tenderly cheats only
 Three cheats are available: `tenderly_setBalance` (native), `tenderly_setErc20Balance`, and `tenderly_setStorageAt` (any slot). Time travel uses `evm_increaseTime` + `evm_mine`, and `evm_snapshot` / `evm_revert` are available for baseline resets.
 
-**`tenderly_setErc20Balance` IS available and is the preferred ERC-20 path.** Verified 2026-08-20 on the `a3fb16` vnet against both WOOD (a plain OZ ERC20) and USDG (a proxy) — the balance lands and `balanceOf` reads it back. This spec previously asserted the method did NOT exist, which was measured on the older `dbe358` vnet; the claim did not survive re-measurement and SHALL NOT be restored without one. It matters beyond convenience: `cli/src/e2e` funds every scenario through that method, so "unavailable" implied the e2e harness could never run against the fork.
+**`tenderly_setErc20Balance` IS available and is the preferred ERC-20 path.** Verified 2026-08-20 against both WOOD (a plain OZ ERC20) and USDG (a proxy) — the balance lands and `balanceOf` reads it back. An earlier measurement on an older vnet said the method did not exist; that claim did not survive re-measurement and SHALL NOT be restored without one. It matters beyond convenience: `cli/src/e2e` funds every scenario through that method, so "unavailable" implied the e2e harness could never run against the fork.
 
 The direct-storage route remains the DOCUMENTED FALLBACK for a vnet or token where the cheat does not work: write the `_balances` mapping slot as `keccak256(abi.encode(holder, balancesSlot))`, with WOOD at slot 0 and USDG at slot 1 (slot 0 holds other proxy state). `cast rpc` params SHALL be passed as separate positional args, not one JSON array (the array form returns `-32602`). For an unlisted token, the balances slot SHALL be discovered by brute-forcing slots 0..40 (write a sentinel to `keccak(holder, S)`, read `balanceOf`), falling back to the OZ v5 ERC-7201 namespaced location.
 
@@ -185,14 +186,14 @@ The direct-storage route remains the DOCUMENTED FALLBACK for a vnet or token whe
 - **THEN** the RPC returns `-32602`; the positional form succeeds
 
 ### Requirement: Mainnet-faithful parameters are not accelerated
-The fork deploy SHALL bake the real mainnet parameters and the operator SHALL NOT accelerate them for guardian sims (advance time with `evm_increaseTime` instead): `MIN_VOTING_PERIOD` 1h and `MIN_COOLDOWN_PERIOD` 1h (governor impl constructor immutables, held at the per-vault floor so they can never bind tighter than the setters; the 24h operating value is the factory's per-vault default), `reviewPeriod` 24h and `blockQuorumBps` 30% (registry init), `MIN_COHORT_STAKE_AT_OPEN` 50,000 WOOD (registry constant), `minGuardianStake`/`minOwnerStake` 10,000 WOOD each, `coolDownPeriod` 7 days, `minSlashBps`/`maxSlashBps` 10%/100% (sWOOD init), and the 200 bps management fee stamped per vault. Every one of these is a committed constant in `script/robinhood-mainnet/RobinhoodParams.sol` — the same values on Mainnet and Fork posture, with no runtime override. (The 46630 testnet's 600s-floor governor upgrade is explicitly NOT applied to the fork.)
+The fork deploy SHALL bake the real mainnet parameters and the operator SHALL NOT accelerate them for guardian sims (advance time with `evm_increaseTime` instead): `MIN_VOTING_PERIOD` 1h and `MIN_COOLDOWN_PERIOD` 1h (governor impl constructor immutables, held at the per-vault floor so they can never bind tighter than the setters; the 24h operating value is the factory's per-vault default), `reviewPeriod` 24h and `blockQuorumBps` 30% (registry init), `minGuardianStake`/`minOwnerStake` 10,000 WOOD each, `coolDownPeriod` 7 days, `minSlashBps`/`maxSlashBps` 10%/100% (sWOOD init), and the 200 bps management fee stamped per vault. Every one of these is a committed constant in `script/robinhood-mainnet/RobinhoodParams.sol` — the same values on Mainnet and Fork posture, with no runtime override. (The 46630 testnet's 600s-floor governor upgrade is explicitly NOT applied to the fork.)
 
 #### Scenario: Governance window traversal
 - **WHEN** a proposal must pass the 24h vote + 24h review windows
 - **THEN** the operator advances `evm_increaseTime 172800` + `evm_mine` rather than deploying shortened floors
 
 ### Requirement: Lifecycle validation with route and staleness discipline
-A full one-fund lifecycle (owner stake → fund create → deposit → strategy propose → vote → execute → settle) SHALL be run through the CLI's first-class `robinhood-fork` network with an operator wallet separate from the deployer. Swap routes SHALL be quoted on the fork with the V4Quoter before proposing — never guessed (NVDA/TSLA have direct USDG v4 pools at fee 3000 / tickSpacing 60; the 5%-fee direct pools quote garbage and breach the 5% slippage floor). Because governance warps age the Chainlink push feeds past their 26h default staleness, proposals SHALL either pass a large `--max-price-ages` (up to the 2,592,000s = 30d bound) or refresh the feed's `updatedAt` via `setStorageAt` after each warp.
+A full one-fund lifecycle (owner stake → fund create → deposit → strategy propose → vote → execute → settle) SHALL be run through the CLI's first-class `robinhood-fork` network with an operator wallet separate from the deployer. Swap routes SHALL be quoted on the fork with the V4Quoter before proposing — never guessed (NVDA/TSLA have direct USDG v4 pools at fee 3000 / tickSpacing 60; the 5%-fee direct pools quote garbage and breach the 5% slippage floor). Because governance warps age the Chainlink push feeds past `PortfolioStrategy`'s flat 26h `MAX_PUSH_PRICE_AGE`, the operator SHALL refresh each feed's `updatedAt` via `setStorageAt` after each warp; there is no per-proposal price-age input.
 
 #### Scenario: Round-trip sanity result
 - **WHEN** the validated lifecycle runs (50,000 USDG deposited, 40k deployed into NVDA/TSLA, settled with no market move)
@@ -200,43 +201,20 @@ A full one-fund lifecycle (owner stake → fund create → deposit → strategy 
 
 #### Scenario: Stale feed after warp
 - **WHEN** execute/settle runs after a 48h warp with default max price age
-- **THEN** it trips `StalePrice`; passing `--max-price-ages 2592000` (or refreshing `updatedAt`) clears it
-
-### Requirement: Guardian-network simulation preconditions
-To make guardian blocking real (not the cold-start bypass), total staked guardian weight at review-open SHALL exceed `MIN_COHORT_STAKE_AT_OPEN` = 50,000 WOOD — e.g. ≥6 wallets staking 10,000 WOOD each. `agentId = 0` is acceptable (a guardian's `agentId` is recorded, never checked against the identity registry). Guardians become active at `block.timestamp`, and checkpoints are read at `t−1`, so the operator SHALL advance time by ≥1s (`evm_increaseTime 1`) between staking and opening a review.
-
-Clearing the cohort floor is necessary but NOT sufficient, because the two sides of the block-quorum comparison are measured differently: `cohortTooSmall` and the quorum denominator read `getPastTotalVotes`, which is RAW staked WOOD ("totals stay raw"), while a blocker's contribution reads `getPastVotes`, which applies `_ageFactorBps` on top. Fresh stake therefore counts in full against the bar it must clear and at only `ageFloorBps` (25%) toward clearing it. A cohort whose stake is all fresh cannot reach a 30% block quorum even at 100% participation — 0.25 × 60,000 = 15,000 against the 18,000 required. This asymmetry is deliberate: it denies an attacker a veto bought with stake parked seconds before the review. The operator SHALL therefore age the cohort before opening a review that is meant to be blocked, advancing time by at least `maturationPeriod × (blockQuorumBps − ageFloorBps) / (10 000 − ageFloorBps)` — 2 days at the fork's defaults (30 d, 30%, 25%) — and proportionally more when participation is partial.
-
-Reviews snapshot cohort stake + `blockQuorumBps` at entry; 30% of cohort stake voting Block rejects the proposal, slashes approvers (WOOD burned), and attributes blockers for off-chain Merkl rewards. Vote-change is allowed until the final 10% of the window; approvers are capped at 100/proposal, blockers uncapped. Slash severity is NOT voted: `voteOnProposal(address,uint256,GuardianVoteType)` carries no severity argument, and `_severityBps(Review storage)` derives it deterministically from the review — a quadratic ramp from `minSlashBps` to `maxSlashBps` that saturates at a 66.67% block supermajority, with the bounds snapshotted at `openReview` (stored plus one, so a genuine snapshot can never read as the unset sentinel) to deny an owner any mid-review re-rating. The own bond is the only slash leg (DPoS delegation removed/postponed 2026-07-26). `emergencySettleWithCalls` re-checks `requiredOwnerBond = max(minOwnerStake, MIN_OWNER_BOND_FLOOR = 1,000 WOOD)` at call time (TVL scaling is not implemented in V1 → flat 10k floor at the deployed `minOwnerStake`), and additionally requires the posted bond to be strictly positive. The Slash Appeal Reserve is NOT auto-seeded by the mainnet deploy override — the operator SHALL seed it post-deploy (`approve` + `registry.fundSlashAppealReserve`).
-
-#### Scenario: Cold-start floor cleared
-- **WHEN** six guardians each stake 10,000 WOOD and time advances 1s before a review opens
-- **THEN** cohort stake 60,000 > 50,000 clears `cohortTooSmall`, so the review is votable rather than auto-cleared
-
-#### Scenario: Fresh cohort cannot reach the block quorum
-- **WHEN** all six guardians vote Block on a review opened 1s after staking
-- **THEN** their combined age-weighted weight is 15,000 against an 18,000 bar and the proposal is NOT rejected — the sim MUST advance time ≥2 days after staking for a block to be achievable
-
-#### Scenario: Aged cohort blocks
-- **WHEN** the operator advances `evm_increaseTime 172800` after staking and then opens the review
-- **THEN** `_ageFactorBps` has reached 30%, and 30% of the snapshot voting Block rejects the proposal and slashes approvers
-
-#### Scenario: Appeal without a seeded reserve
-- **WHEN** `refundSlash` is attempted before the Slash Appeal Reserve is funded
-- **THEN** the refund cannot be paid — seeding the reserve is a required post-deploy step
+- **THEN** it trips `StalePrice`; refreshing each feed's `updatedAt` clears it
 
 ### Requirement: Plan B deployment pre-flights and wiring
-The Plan B phase (ExposureLedger + ProposerBondEscrow) SHALL fail its pre-flights BEFORE anything is minted, and SHALL wire in the order: deploy ledger (epoch length 28d, immutable) → deploy escrow → seed ledger params (`setWoodUsdPrice`, `setWoodFeed`, `setAssetFeed`, `setGuardianRegistry`, `setCoveredTvlCapUsd`, `setWoodHaircutBps`) → `registry.setExposureLedger` → `factory.setExposureLedger` / `setBondEscrow`. Its numeric inputs are `RobinhoodParams` constants — `EPOCH_LENGTH`, `EXPECTED_CHALLENGE_WINDOW`, `WOOD_HAIRCUT_BPS`, `MAX_STRATEGY_DURATION`, `ASSET_FEED_MAX_DELAY`, `COVERED_TVL_CAP_USD18`, `CAP_OVER_SPOT_BPS` — committed and reviewed in the PR, never read from the environment. Checks:
-- PRE-FLIGHT (pre-broadcast): `swood.maxSlashBps() == 10_000` — the ledger books liability at 100% of allocation, so a lower ceiling makes recovery a strict shortfall by construction; and `COVERED_TVL_CAP_USD18 != 0` — a zero cap is fail-closed and would brick all proposing.
+The Plan B phase (ExposureLedger + ProposerBondEscrow) SHALL fail its pre-flights BEFORE anything is minted, and SHALL wire in the order: deploy ledger (epoch length 28d, immutable) → deploy escrow → seed ledger params (`setWoodUsdPrice`, `setWoodHaircutBps`, `setWoodFeed`, `setAssetFeed`, `setGuardianRegistry`, `setCoveredTvlCapUsd`) → `registry.setExposureLedger` → `factory.setExposureLedger` → `factory.setBondEscrow` → `swood.setExposureLedger` → `protocolConfig.setMaxStrategyDuration`. Its numeric inputs are `RobinhoodParams` constants — `EPOCH_LENGTH`, `EXPECTED_CHALLENGE_WINDOW`, `WOOD_HAIRCUT_BPS`, `MAX_STRATEGY_DURATION`, `ASSET_FEED_MAX_DELAY`, `COVERED_TVL_CAP_USD18`, `CAP_OVER_SPOT_BPS` — committed and reviewed in the PR, never read from the environment. Checks:
+- PRE-FLIGHT (pre-broadcast): `swood.maxSlashBps() == 10_000` — a guardian's declared lock may equal their entire live stake and a conviction burns that lock as bps of the stake basis, so a lower ceiling would clip the burn beneath the lock; `swood.minSlashBps() != 0` — it is the single deterrence floor under declared locks, and at zero a token lock buys a token penalty; and `COVERED_TVL_CAP_USD18 != 0` — a zero cap is fail-closed and would brick all proposing.
 - Drift guard: the deployed ledger's `challengeWindow` SHALL equal the expected 14d constant.
-- POST-wiring: `swood.exposureLedger() != address(0)` — `claimUnstakeGuardian` fails OPEN when unset, so an unwired pointer silently lets guardians walk out from under pending challenges.
-- WIRING refusal: each pointer slot this phase writes (`StakedWood.exposureLedger`, `GuardianRegistry.exposureLedger`, `SyndicateFactory.exposureLedger`, `SyndicateFactory.bondEscrow`, `ExposureLedger.guardianRegistry`) SHALL be free or already hold the address this run will mint. A slot naming a FOREIGN address is refused — the ceremony never repoints a live slot — and because CREATE3 makes the addresses knowable before the mint, the refusal lands before anything is deployed.
+- POST-wiring: `swood.exposureLedger()` SHALL equal the minted ledger — `claimUnstakeGuardian` fails OPEN when unset, so an unwired pointer silently lets guardians walk out from under pending challenges.
+- WIRING refusal: each pointer slot this phase writes (`StakedWood.exposureLedger`, `GuardianRegistry.exposureLedger`, `SyndicateFactory.exposureLedger`, `SyndicateFactory.bondEscrow`, `ExposureLedger.guardianRegistry`) SHALL be free or already hold the address this run will mint. A slot naming a FOREIGN address is refused — the ceremony never repoints a live slot. Because CREATE3 makes the addresses knowable before the mint, the refusal lands before anything is deployed for the four sWOOD, registry and factory slots; `ExposureLedger.guardianRegistry` is checked on the minted (or adopted) ledger.
 - `ASSET_FEED_MAX_DELAY` SHALL be sized above the aggregator's publication heartbeat (24h on 4663), because it bounds that aggregator's own `updatedAt` age on every `coverageUsd` read; a bound at or below the heartbeat makes every covered proposal revert `StalePrice`.
 - The obsolete cooldown pre-flight (`coolDownPeriod >= epochLength + challengeWindow`) is REMOVED — unsatisfiable (cooldown caps at 30d) and superseded by the exact exit gate on `claimUnstakeGuardian`.
 - PRE-FLIGHT 8 (STAGE GATE): the WOOD feed SHALL answer `latestRoundData()` with a positive price BEFORE any Plan B contract is minted. On Mainnet a feed that does not yet answer is not a failure but a CHECKPOINT: `deployAll` returns `Checkpoint.AwaitingWoodFeed` and the operator re-runs after the keeper has primed it. Post-broadcast the phase additionally requires `ledger.woodUsdPriceX8() != 0` AND the composed `ledger.woodPriceX8()` to resolve non-zero. These are two independent failures with different remedies. The first is the price CAP being unset, which under the cap-only model is a revert (`NoWoodPrice`) rather than "uncapped" — reading zero as "no ceiling" would make the likeliest misconfiguration the one state in which a ~$438k pool prices every guardian bond without bound. The second is a CAP configured with nothing priced beneath it, which a cap-only check misses entirely. `woodPriceX8()` SHALL be read by low-level probe rather than a typed call, because it reverts instead of returning zero when unpriceable, and a bare revert would surface as an opaque script failure with no instruction attached.
 - No WOOD price is committed. BOTH postures SHALL DERIVE the cap at deploy time as `spot * CAP_OVER_SPOT_BPS / 10_000` from the live WOOD/WETH pair and the ETH/USD feed, and the ceremony SHALL still refuse a cap outside `[1.25x, 2x]` of that same spot — below 1.25x the cap binds permanently and pins every bond, above 2x it stops bounding manipulation. The cap is a ceiling on manipulation, never served as a price, and sits ABOVE market; the old "≤ 30-day low" instruction is exactly backwards. Deriving is what keeps the two postures on one code path and stops a measured constant from drifting out of its own band between the PR and the run.
 - The market source is `src/pricing/WoodPoolFeed.sol`, minted by the ceremony itself and wired through `ledger.setWoodFeed(feed, maxDelay)` with `maxDelay = window + 2h + 1` (`RobinhoodParams.WOOD_FEED_MAX_DELAY`): `updatedAt` rolls at most once per window, so the bound must clear a window plus the keeper cadence. There is no separate TWAP-oracle contract and no unwired-market-source configuration — a ledger with no live WOOD price source never gets minted, because the stage gate runs first.
-- PRE-FLIGHT 12 (pre-broadcast): the feed address SHALL hold code and its `maxDelay` SHALL be non-zero. `setWoodFeed` already enforces the pairing, but from inside the broadcast after the ledger and escrow exist and four setters have run; checking pre-broadcast turns a half-applied run into a free refusal.
+- PRE-FLIGHT 12 (pre-mint): the WOOD feed and its `maxDelay` SHALL be set together, a set feed SHALL hold code, and `maxDelay` SHALL exceed the feed's `window` plus the 2h keeper allowance. `setWoodFeed` already enforces the pairing, but only once the ledger and escrow exist and several setters have run; checking before the mint turns a half-applied run into a free refusal.
 
 #### Scenario: Unset price cap refused post-broadcast
 - **WHEN** the Plan B phase completes its writes with `woodUsdPriceX8` still zero
@@ -262,34 +240,38 @@ The Plan B phase (ExposureLedger + ProposerBondEscrow) SHALL fail its pre-flight
 - **WHEN** the Plan B phase runs against an sWOOD with `maxSlashBps < 10_000`
 - **THEN** the script reverts its PRE-FLIGHT before deploying the ledger
 
+#### Scenario: Zero deterrence floor refused pre-deploy
+- **WHEN** the Plan B phase runs against an sWOOD with `minSlashBps == 0`
+- **THEN** the script reverts its PRE-FLIGHT before deploying the ledger, naming `minSlashBps` as the deterrence floor that must be set by governance
+
 #### Scenario: Unwired unstake gate refused post-wiring
-- **WHEN** the writes complete but sWOOD's `exposureLedger` pointer is still zero
-- **THEN** the script reverts, directing the operator to call `setExposureLedger(ledger)` by governance and re-run
+- **WHEN** the writes complete but sWOOD's `exposureLedger` pointer does not name the minted ledger
+- **THEN** the script reverts, stating that the broadcast should have wired it and that the run must be repeated from the sWOOD owner
 
 ### Requirement: The WOOD price source is minted by the ceremony, per posture
-On Mainnet posture the ceremony SHALL mint `src/pricing/WoodPoolFeed.sol` at the `sherwood.robinhood.v1.wood-pool-feed` salt and wire it as the ledger's market source. The feed reads two independent `WOOD/WETH` venues — a Uniswap-V2-style pair's own cumulative-price accumulators and a Uniswap V3 pool's observation ring — and the chain's Chainlink **ETH/USD** feed, composed as `WOOD/USD = TWAP(WOOD per ETH) × ETH/USD`; it needs no Chainlink WOOD/USD aggregator, which is the point of it. The V3 leg is specified in full below.
+On Mainnet posture the ceremony SHALL mint `src/pricing/WoodPoolFeed.sol` at the `sherwood.robinhood.v1.wood-pool-feed` salt and wire it as the ledger's market source. The feed reads two independent `WOOD/WETH` venues — a Uniswap-V2-style pair's own cumulative-price accumulators and a Uniswap V3 pool's tick accumulator, averaged from a stored snapshot to the live `observe([0])` — and the chain's Chainlink **ETH/USD** feed, composed as `WOOD/USD = TWAP(WOOD per ETH) × ETH/USD`; it needs no Chainlink WOOD/USD aggregator, which is the point of it. The V3 leg is specified in full below.
 
 Pre-flights, all PRE-broadcast:
 - The two named venues SHALL be DISTINCT and each SHALL hold exactly `{WOOD, WETH}`. The V2 pair's WETH reserve SHALL be at or above `MIN_WETH_RESERVE`; the V3 pool's floor is its in-range `liquidity()`, below.
 - WOOD and WETH SHALL share a decimals count. The composition multiplies a raw UQ112x112 ratio by ETH/USD with no decimals normalisation, so a mismatch prices WOOD off by orders of magnitude while every other check passes.
-- The V2 pair SHALL have traded within `MAX_PAIR_IDLE` (5 minutes). A pair that stopped trading accepts the deploy and then no-ops forever, because the cumulative read refuses to extrapolate across a long idle span. On 4663 the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production and impossible to satisfy on a fork.
+- The V2 pair SHALL have traded within `MAX_PAIR_IDLE` (5 minutes). A pair with no trade in that span has no live market behind it; `update()` syncs the pair and would still snapshot, so this guard refuses a dead market, not a dead keeper. On 4663 the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production and impossible to satisfy on a fork.
 - The ETH/USD feed answers positive and is no staler than `ETH_USD_MAX_AGE`.
 
 #### Scenario: Deploy lays a baseline but leaves the oracle unpriced
 - **WHEN** the script completes
-- **THEN** `latestObservation` is set, `consult()` still reports unavailable, and `DeployPlanB` pre-flight 8 still refuses — an operator cannot mistake the deploy for a primed oracle
+- **THEN** `latestObservation` is set, `latestRoundData()` still reverts `PriceUnavailable`, and `DeployAll` returns `Checkpoint.AwaitingWoodFeed` — an operator cannot mistake the deploy for a primed oracle
 
 #### Scenario: Idle pool refused before deploying
-- **GIVEN** the `WOOD/WETH` pair has not traded within `twapWindow / 20`
-- **THEN** the script refuses PRE-broadcast, naming that `update()` would no-op forever and that a fork/vnet pool does not trade at all
+- **GIVEN** the `WOOD/WETH` pair has not traded within `MAX_PAIR_IDLE` (5 minutes)
+- **THEN** the script refuses PRE-broadcast, naming that no live market stands behind the pair
 
 #### Scenario: Fork cannot prime the oracle
 - **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
-- **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
+- **THEN** the idle pre-flight refuses the vnet pair, so the Fork posture mints `ForkWoodFeedFixture` instead of `WoodPoolFeed` — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
 
 ### Requirement: The WOOD feed's second leg is a Uniswap V3 pool, averaged from a stored snapshot of its tick accumulator to the live one
 
-Chain 4663 carries ONE Uniswap-V2-style WOOD/WETH pair, so the second leg of the two-leg WOOD/USD feed SHALL be a Uniswap **V3** WOOD/WETH pool rather than a second V2 pair. `chains/{chainId}.json` SHALL carry it under `WOOD_WETH_UNISWAP_V3_POOL` together with the factory that created it under `WOOD_WETH_UNISWAP_V3_FACTORY` — chain 4663 carries TWO Uniswap V3 deployments and the canonical `UNISWAP_V3_FACTORY`'s WOOD/WETH pools are empty — and `script/DeployWoodPoolFeed.s.sol:DeployWoodPoolFeed` SHALL read both keys — environment override first, address book second — with NO `WOOD_WETH_SUSHI_V2_PAIR` reference remaining. `update()` SHALL store accumulator readings for BOTH legs — the pair's cumulative price and the pool's `observe([0])` tick cumulative. The V2 leg SHALL be averaged between its two stored readings. The V3 leg SHALL be averaged from a stored reading (the latest one once it is at least `window` old, else the previous one) to the pool's LIVE `observe([0])` accumulator, over a span of at least `window`, so a crash in the pool is tracked between rolls rather than hidden until the next one. The V3 leg SHALL NOT read the pool's observation ring backwards: that ring is written by any swapper, one slot per SECOND in which the pool is touched, and `observationCardinality` is a `uint16`, so no ring anyone can pay for spans a 24h window against a per-second writer and a backward read is an availability lever held by the market (v1 audit F2). Its depth floor is the pool's in-range `liquidity()` (`MIN_V3_LIQUIDITY`), the V3 equivalent of the V2 leg's WETH reserve floor.
+Chain 4663 carries ONE Uniswap-V2-style WOOD/WETH pair, so the second leg of the two-leg WOOD/USD feed SHALL be a Uniswap **V3** WOOD/WETH pool rather than a second V2 pair. `chains/{chainId}.json` SHALL carry it under `WOOD_WETH_UNISWAP_V3_POOL` together with the factory that created it under `WOOD_WETH_UNISWAP_V3_FACTORY` — chain 4663 carries TWO Uniswap V3 deployments and the canonical `UNISWAP_V3_FACTORY`'s WOOD/WETH pools are empty — and `DeployAll._readInputs` SHALL require both keys from the address book (no environment override), with NO `WOOD_WETH_SUSHI_V2_PAIR` reference remaining. `update()` SHALL store accumulator readings for BOTH legs — the pair's cumulative price and the pool's `observe([0])` tick cumulative. The V2 leg SHALL be averaged between its two stored readings. The V3 leg SHALL be averaged from a stored reading (the latest one once it is at least `window` old, else the previous one) to the pool's LIVE `observe([0])` accumulator, over a span of at least `window`, so a crash in the pool is tracked between rolls rather than hidden until the next one. The V3 leg SHALL NOT read the pool's observation ring backwards: that ring is written by any swapper, one slot per SECOND in which the pool is touched, and `observationCardinality` is a `uint16`, so no ring anyone can pay for spans a 24h window against a per-second writer and a backward read is an availability lever held by the market. Its depth floor is the pool's in-range `liquidity()` (`MIN_V3_LIQUIDITY`), the V3 equivalent of the V2 leg's WETH reserve floor.
 
 Pre-flights on the pool, all PRE-broadcast: it has code, it holds exactly `{WOOD, WETH}`, `fee()` answers, `liquidity() >= MIN_V3_LIQUIDITY`, the booked factory's `getPool(token0, token1, fee())` resolves back to the booked pool and the pool names that same factory, and `observe([0])` answers — the read the leg actually makes, which any initialised pool serves whatever its ring holds. `MIN_V3_LIQUIDITY` SHALL be refused rather than truncated above the `uint128` width a pool reports liquidity in — a silent truncation there REMOVES the floor instead of raising it.
 
@@ -328,7 +310,7 @@ On Fork posture the ceremony SHALL mint `script/robinhood-mainnet/ForkWoodFeedFi
 
 #### Scenario: Idle pool refused before deploying
 - **GIVEN** a WOOD/WETH pair that has not traded within `MAX_PAIR_IDLE`
-- **THEN** the Mainnet feed phase refuses PRE-broadcast, naming that `update()` would never snapshot
+- **THEN** the Mainnet feed phase refuses PRE-broadcast, naming that no live market stands behind the pair
 
 #### Scenario: Fork price survives a governance warp
 - **GIVEN** the fixture feed is wired as the ledger's market source
@@ -347,7 +329,7 @@ The Plan B phase SHALL seat `ProtocolConfig.maxStrategyDuration` to `RobinhoodPa
 - **THEN** the phase writes nothing and the assert still passes
 
 ### Requirement: DeployPlanB asserts delegation is off
-`DeployPlanB`'s post-broadcast pre-flights SHALL fail the run if `delegationEnabled` reads true on the target chain, naming the delegator-walkout hole: delegated stake is credited to a ~35-day coverage window while `requestUnstakeDelegation` checks only the delegator, and the unbonding pool is slashable for only `coolDownPeriod`.
+`DeployPlanB`'s post-broadcast pre-flights SHALL fail the run if the sWOOD answers `delegationEnabled()` with a non-zero word, naming the delegator-walkout hole. The probe is a staticcall: the current `StakedWood` has no delegation and no such selector, so the probe reads false and passes; it exists to refuse a future sWOOD that turns delegation on.
 
 #### Scenario: Delegation accidentally on
 - **GIVEN** `delegationEnabled` reads true on the target chain
@@ -355,13 +337,14 @@ The Plan B phase SHALL seat `ProtocolConfig.maxStrategyDuration` to `RobinhoodPa
 - **THEN** the run FAILS with a message naming the delegator-walkout hole
 
 #### Scenario: Preflight tests cover both invariants
-- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: the duration ceiling seated once and left alone on a resumed run; delegation-on fails the named assert and delegation-off passes; a code-less feed refused; a zero `maxDelay` refused; each of the five pointer slots refused when it names a foreign address; and the two post-broadcast price checks (unset cap, cap with nothing priced beneath it)
+- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: the duration ceiling seated; delegation-on fails the named assert and delegation-off passes; a code-less feed refused; a zero `maxDelay` refused; a foreign `StakedWood.exposureLedger` slot refused (the `GuardianRegistry` slot is covered in `test/deploy/DeployAll.t.sol`); and the two post-broadcast price checks (unset cap, cap with nothing priced beneath it)
 
 ### Requirement: Plan D deployment pre-flights and wiring order
 The Plan D phase (ChallengeGame, against the Plan B contracts minted earlier in the same ceremony) SHALL run pre-flights before deploying anything, then wire the game's four roles in this order: `swood.setAuthorizedSlasher(game)` → `game.setStakedWood(swood)` → `tierRegistry.setAuthorizedDemoter(game)` → `ledger.setCoverageFreezer(game)`. The order is load-bearing at both ends: `setStakedWood` rejects a sWOOD that has not already granted the slasher role, so the GRANT precedes the POINTER; and `setCoverageFreezer` reverts `CoverageFrozen` once coverage is frozen, so the freeze role is granted LAST. Checks:
 - PRE-FLIGHT 1: each of the three roles (`coverageFreezer`, `authorizedDemoter`, `authorizedSlasher`) MUST be UNSET **or already the game this run will mint** — the setters overwrite silently, so a role held by a FOREIGN address is refused rather than clobbered, while a resumed run adopts its own game instead of dying. Rotations require clearing by governance first.
-- PRE-FLIGHT 0 (ownership): the broadcaster SHALL own `EXPOSURE_LEDGER`, `TIER_REGISTRY` and `STAKED_WOOD`; all three grant setters are `onlyOwner`, so all three get a named refusal ("PRE-FLIGHT: broadcaster does not own …") rather than an opaque `OwnableUnauthorizedAccount` mid-run.
-- PRE-FLIGHT 2: the COMPOSED `ledger.woodPriceX8() != 0` (not the raw scalar) — a zero composed price means `file()` reverts `WoodPriceUnset` and nothing can be challenged. Read by low-level PROBE rather than a typed call: under design revision 2 that view reverts `NoWoodPrice` instead of returning zero when no source can price WOOD, and a typed call would let the revert propagate as an opaque script failure. Both shapes (reverts, or answers zero) fold into the same refusal, since to the game they are the same problem.
+- PRE-FLIGHT 4 (ownership): the broadcaster SHALL own `EXPOSURE_LEDGER`, `TIER_REGISTRY` and `STAKED_WOOD`; all three grant setters are `onlyOwner`, so all three get a named refusal ("PRE-FLIGHT: broadcaster does not own …") rather than an opaque `OwnableUnauthorizedAccount` mid-run.
+- PRE-FLIGHT 2: `swood.exposureLedger()` SHALL equal `EXPOSURE_LEDGER`.
+- PRE-FLIGHT 3: the COMPOSED `ledger.woodPriceX8() != 0` (not the raw scalar) — a zero composed price means `file()` reverts `WoodPriceUnset` and nothing can be challenged. Read by low-level PROBE rather than a typed call: that view reverts `NoWoodPrice` instead of returning zero when no source can price WOOD, and a typed call would let the revert propagate as an opaque script failure. Both shapes (reverts, or answers zero) fold into the same refusal, since to the game they are the same problem.
 - Drift guard: `game.challengeWindow() == ledger.challengeWindow()`.
 - Post-conditions: all four roles verified to land on THIS game, plus the game's `exposureLedger`/`tierRegistry` constructor pointers.
 
@@ -380,7 +363,7 @@ The broadcaster MUST already own the ledger, tier registry, and sWOOD. `game.set
 - **THEN** the pre-flight follows the composed value — the figure `file()` actually divides by
 
 ### Requirement: The challenge vote's launch parameters are an operator decision
-`voteWindow` (7 d, floored at `MIN_VOTE_WINDOW` = 2 d) and `challengeQuorumBps` (3,000 of the votable stake, bounded to [1,000, 10,000]) SHALL be reviewed against the live guardian cohort before the game is handed off, because together they decide whether an honest filing can be carried at all: the quorum's denominator is total staked WOOD at `filedAt - 1` less the accused cohort's stake, so a network whose stake concentrates in a few large guardians can leave the bar unreachable by everyone else the moment one of them is accused. The deploy phase SHALL verify `game.stakedWood() == STAKED_WOOD`, or the electorate that votes is not the cohort that gets slashed, and SHALL verify the Plan D roles are intact (`ledger.coverageFreezer()`, `tiers.authorizedDemoter()`, `swood.authorizedSlasher()` all equal to the game) — or a conviction dead-ends at `_settle`. These values await an economics run; the launch set is a decision, not a default to inherit.
+`voteWindow` (7 d, floored at `MIN_VOTE_WINDOW` = 2 d) and `challengeQuorumBps` (3,000 bps of `totalStakeAtFiling`, bounded to [1,000, 10,000]) SHALL be reviewed against the live guardian cohort before the game is handed off, because together they decide whether an honest filing can be carried at all: the quorum's denominator, `totalStakeAtFiling`, is the votable stake (total staked WOOD at `filedAt - 1` less the accused cohort's stake then) plus the accused cohort's capped stake at execution, and a filing whose votable stake cannot reach the quorum is refused (`NoVotableStake`), so a network whose stake concentrates in a few large guardians can leave the bar unreachable by everyone else the moment one of them is accused. The deploy phase SHALL verify `game.stakedWood() == STAKED_WOOD`, or the electorate that votes is not the cohort that gets slashed, and SHALL verify the Plan D roles are intact (`ledger.coverageFreezer()`, `tiers.authorizedDemoter()`, `swood.authorizedSlasher()` all equal to the game) — or a conviction dead-ends at `_settle`. These values await an economics run; the launch set is a decision, not a default to inherit.
 
 Manual follow-ups: an sWOOD upgrade touching `slashVerdict`'s ABI and any ChallengeGame redeploy that calls it MUST ship as ONE atomic governance batch (a selector mismatch makes every `resolve()` revert with coverage frozen); monitor the rate of filings that reach quorum against those that lapse in silence, since a cohort that never votes turns the whole accountability tail into a time delay.
 
@@ -393,14 +376,14 @@ Manual follow-ups: an sWOOD upgrade touching `slashVerdict`'s ABI and any Challe
 - **THEN** the phase refuses — a challenge that reaches its convict quorum must be able to execute the verdict
 
 ### Requirement: Chain-specific factory identity configuration
-On Robinhood Chain the factory SHALL be deployed with the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, `RobinhoodParams.AGENT_REGISTRY`) as `agentRegistry`, so `createSyndicate` requires the creator to own `creatorAgentId` and `registerAgent` requires the agent NFT to be owned by the agent or the vault owner. Validation SHALL assert it reads back as that address at both ceremony checkpoints. Because the registry is a third-party upgradeable contract, it is a liveness dependency: if it breaks, the owner Safe SHALL call `setAgentRegistry(address(0))`, which turns identity gating off for creation and for every existing vault's `registerAgent` without a redeploy. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663).
+On Robinhood Chain the factory's `agentRegistry` SHALL end the ceremony as the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, `RobinhoodParams.AGENT_REGISTRY`) — set at initialisation on the Fork posture, and on Mainnet set in run 2 after the closed sentinel `AGENT_REGISTRY_CLOSED` held creation shut — so `createSyndicate` requires the creator to own `creatorAgentId` and `registerAgent` requires the agent NFT to be owned by the agent or the vault owner. Validation SHALL assert `AGENT_REGISTRY_CLOSED` at `Checkpoint.AwaitingWoodFeed` and `AGENT_REGISTRY` at `Checkpoint.Complete`. Because the registry is a third-party upgradeable contract, it is a liveness dependency: if it breaks, the owner Safe SHALL call `setAgentRegistry(address(0))`, which turns identity gating off for creation and for every existing vault's `registerAgent` without a redeploy. The factory carries no ENS registrar (there is no ENS/Durin registrar on 4663).
 
 #### Scenario: Identity enabled on Robinhood
-- **WHEN** post-deploy validation runs on 4663 or its fork
+- **WHEN** post-deploy validation runs at `Checkpoint.Complete` on 4663 or its fork
 - **THEN** `factory.agentRegistry() == 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`
 
 ### Requirement: Accepted oracle risks are stated in the deploy runbook
-Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period gate (`src/libraries/ChainlinkReader.sol`'s `SequencerDown`/`GracePeriodNotOver`) cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still clearing the aggregator's own publication heartbeat.
+Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period sequencer gate cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still clearing the aggregator's own publication heartbeat.
 
 The WOOD half of exposure (1) is now BOUNDED rather than merely disclosed: every market source, Chainlink included, is admitted only under `min(source, woodUsdPriceX8)`, so a clamped-high aggregator can over-value bonds by at most the cap. The asset half is unchanged — `coverageUsd` has no such ceiling.
 
@@ -409,14 +392,14 @@ The WOOD half of exposure (1) is now BOUNDED rather than merely disclosed: every
 - **THEN** they encounter the aggregator clamping risk with its anti-conservative direction and the affected read paths (`coverageUsd`, `woodPriceX8`), the fact that the WOOD path is capped and the asset path is not, and the absence of a sequencer-uptime feed on Robinhood 4663 with why the usual staleness gate cannot exist, all stated as accepted-for-v1
 
 ### Requirement: The WOOD price is market-sourced and governance-capped
-`ExposureLedger` SHALL resolve the WOOD price as `haircut(min(market, woodUsdPriceX8))`, floored at 1, where `market` is the wired WOOD/USD feed — on Robinhood the ceremony's own `WoodPoolFeed`, which is Chainlink-shaped — when it is fresh. `woodUsdPriceX8` SHALL NEVER be served as a price. With no market source available the ledger SHALL revert `NoWoodPrice` rather than fall back to the governance scalar (design revision 2, 2026-08-02).
+`ExposureLedger` SHALL resolve the WOOD price as `haircut(min(market, woodUsdPriceX8))`, floored at 1, where `market` is the wired WOOD/USD feed — on Robinhood the ceremony's own `WoodPoolFeed`, which is Chainlink-shaped — when it is fresh. `woodUsdPriceX8` SHALL NEVER be served as a price. With no market source available, or with a zero cap, the ledger SHALL revert `NoWoodPrice` rather than fall back to the governance scalar (design revision 2, 2026-08-02).
 
 The runbook SHALL state the operational consequences:
-- **Seed and maintain the cap ABOVE market.** It bounds upward manipulation and nothing else; a cap at `M×` market caps manipulation at `M×`. It does not need accuracy, because it is never the valuation — a monthly review is sufficient, since a drifted cap simply stops binding. It does need MAINTENANCE: it is the only thing bounding upward manipulation of a ~$438k pool, where moving spot 2× costs ~$91k.
-- **Lowering the cap is the emergency brake** — safe direction, unbounded, immediate, and NOT rate-limited on-chain. The ledger's one-move-per-day interval and its 2×-per-raise ceiling were both removed (issue #89); rate limiting is enforced off-chain by a Zodiac module on the owner Safe. See "Rate limiting is enforced off-chain" below.
-- **A keeper SHALL call `WoodPoolFeed.update()`**, permissionlessly and on a schedule shorter than the `maxDelay` passed to `setWoodFeed`. A failing keeper is how the feed goes stale, and a stale feed with no other WOOD source is `NoWoodPrice`. `update()` is a no-op when a pool is early or below its depth floor, so a failing keeper looks like nothing at all.
-- **`NoWoodPrice` is fail-safe, not a halt, and the asymmetry is deliberate.** `recordApproval` CATCHES it and books nothing, so approve votes still land and reviews never become block-only. `requireApproveQuorum` (execute), `proposerBondWood` (propose) and `ChallengeGame.file` all let it revert. `slashBpsFor` reads no price at all (PR #102), so convictions still compute through a total outage. Net effect: votes work, nothing new can be proposed, nothing can execute, live challenges resolve.
-- **Monitoring SHALL poll `woodPriceDetail()`**, which returns `(price, fromFeed, capBinding)`. Alert on `capBinding == true` persisting beyond a short excursion: it means the cap has drifted BELOW market and is pinning every bond while the market source sits inert. Alert on `woodPriceX8()` reverting at all. There is no event for either state.
+- **Seed and maintain the cap ABOVE market.** It bounds upward manipulation and nothing else; a cap at `M×` market caps manipulation at `M×`. It does not need accuracy, because it is never the valuation — a monthly review is sufficient, since a drifted cap simply stops binding. It does need MAINTENANCE: it is the only thing bounding upward manipulation of a ~$438k pool, where moving spot 2× costs ~$91k. A cap seeded or left BELOW market binds on every read and understates every guardian bond, the proposer bond's WOOD price and the challenger bond's WOOD price.
+- **Lowering the cap is the emergency brake** — safe direction, unbounded, immediate, and NOT rate-limited on-chain. The ledger's one-move-per-day interval and its 2×-per-raise ceiling were both removed; rate limiting is enforced off-chain by a Zodiac module on the owner Safe. See "Rate limiting is enforced off-chain" below.
+- **A keeper SHALL call `WoodPoolFeed.update()`**, permissionlessly and on a schedule shorter than the `maxDelay` passed to `setWoodFeed`. A failing keeper is how the feed goes stale, and a stale feed with no other WOOD source is `NoWoodPrice`. `update()` is a no-op until the window has elapsed or while the V2 pair is below its WETH-reserve floor (the V3 floor bites only at read), so a failing keeper looks like nothing at all.
+- **`NoWoodPrice` halts new risk.** `recordApproval` lets it revert (the approve-time slot floor values the lock at `woodPriceX8()`), so approve votes revert during an outage while block votes, which read no price, still land. `requireApproveQuorum` (execute) and `proposerBondWood` (propose, read only when a bond escrow is wired) let it revert; `ChallengeGame.file` catches the liability read's failure and reverts `WoodPriceUnset`; `proposerBondWood` returns zero before reading the price when the required coverage is zero, so a zero-coverage proposal can still be proposed and executed. `slashBpsFor` reads no price at all, so convictions still compute through a total outage. Net effect: block votes work; approve votes, proposals and execution with non-zero required coverage, and new challenge filings halt; the challenge window keeps running.
+- **Monitoring SHALL compare the WOOD feed's answer with `woodUsdPriceX8()`.** The ledger has no detail view and no event for either state. Alert when the cap sits below the feed's answer beyond a short excursion: the cap has drifted BELOW market and is pinning every bond while the market source sits inert. Alert on `woodPriceX8()` reverting at all.
 
 #### Scenario: Operator wires a Chainlink WOOD feed
 - **WHEN** the operator wires `setWoodFeed(feed, maxDelay)`
@@ -428,14 +411,14 @@ The runbook SHALL state the operational consequences:
 
 #### Scenario: The WOOD feed goes stale
 - **WHEN** the keeper stops and the newest snapshot ages past the wired `maxDelay`
-- **THEN** approve and block votes both continue to land, new proposals are refused at `propose`, tier-gated proposals cannot execute, and convictions on already-filed challenges still compute
+- **THEN** block votes continue to land, approve votes revert, new proposals with non-zero required coverage are refused at `propose` (a bond escrow being wired, as the ceremony wires it), proposals with non-zero required coverage cannot execute, `ChallengeGame.file` reverts `WoodPriceUnset`, and convictions on already-filed challenges still compute
 
 ### Requirement: The WOOD price carries two accepted overstatements, and `woodHaircutBps` is the control
 Two exposures are ACCEPTED rather than eliminated (owner decision 2026-08-02). The runbook SHALL state both, together with the parameter that covers them.
 
 **(a) The two legs are not contemporaneous.** `WoodPoolFeed` multiplies a near-real-time WOOD/ETH average by a single Chainlink ETH/USD answer that may be up to one heartbeat old — the live 4663 feed was measured **10.7 hours old while perfectly healthy**, so this is the normal case, not a degraded one. During an ETH drawdown inside that heartbeat the pair ratio rises while the stale, pre-drawdown ETH price is still the multiplier, so WOOD/USD reads high by roughly the size of the ETH move and every bond is over-valued until the feed ticks. **No attacker capital is required** — ordinary market movement against a slow feed, which makes it likelier than any manipulation scenario.
 
-It is accepted because the remedy is worse. Requiring the ETH answer to be no older than the averaging `window` forces `window >= ~12h`, and a 12-hour window means half a day of blindness to a WOOD crash — unbounded in magnitude and fixed in duration, traded against an overstatement that is bounded in magnitude. Tracking a drawdown without waiting on a human is the whole purpose of the feed. `ethUsdMaxAge` is therefore deliberately INDEPENDENT of `window`, so the window can be short.
+It is accepted because the remedy is worse: tying the ETH answer's age to the averaging `window` would couple two independent bounds to remove an overstatement that is already bounded in magnitude. `ethUsdMaxAge` is therefore deliberately INDEPENDENT of `window` (whose own floor is `MIN_WINDOW`, 24 hours).
 
 **(b) Residual crash lag** of up to `window + maxDelay`, inherent to averaging and the price paid for manipulation resistance.
 
@@ -443,15 +426,15 @@ Both OVERSTATE bond value — the dangerous direction — and both are bounded b
 
 **The shipped value is 5,000 — a 50% allowance — and the Plan B phase SHALL seat it** inside the broadcast from `RobinhoodParams.WOOD_HAIRCUT_BPS`, with no runtime override. The ledger's own default is 10,000, which is no haircut and therefore no allowance at all, and its setter ACCEPTS 10,000 as a legal value — so nothing else in the stack refuses that configuration and it would ship silently. Pre-flight 9 refuses it. 5,000 is also the ledger's `MIN_WOOD_HAIRCUT_BPS`, so the deploy default and the floor coincide by design and any raise of the floor must move the deploy constant in the same change. Precisely: 5,000 values every source at 50%, so an overstatement of up to 100% still leaves bonds valued at or below their true worth.
 
-5,000 was once rejected as too costly to guardian return on equity, but that was under full-coverage reservation. With declared locks (SHE-227) the haircut is the ONLY buffer between the WOOD price at approval and at verdict 4–6 weeks later: at 7,000 the cohort's burn equals the loot after a 30% WOOD drop, at 5,000 after a 50% drop, and guardian ROE stays at 1.6–4.2%/yr. SHE-182 adopted 5,000 as the launch configuration on that basis.
+5,000 was once rejected as too costly to guardian return on equity, but that was under full-coverage reservation. With declared locks the haircut is the ONLY buffer between the WOOD price at approval and at verdict 4–6 weeks later: at 7,000 the cohort's burn equals the loot after a 30% WOOD drop, at 5,000 after a 50% drop, and guardian ROE stays at 1.6–4.2%/yr. 5,000 was adopted as the launch configuration on that basis.
 
-**The shipped value sits ON the floor, so there is no downward travel left.** Lowering the haircut would be the safe direction (more allowance, bonds valued lower, quorums harder), but the setter refuses anything below `MIN_WOOD_HAIRCUT_BPS`, and issue #89's removal of the once-per-day interval therefore buys nothing here. The crisis brake is the other lever this section names: lowering `woodUsdPriceX8` truncates every bond, takes one owner transaction, and is likewise un-rate-limited on-chain. Raising the floor is not a parameter change at all — `MIN_WOOD_HAIRCUT_BPS` is a constant, so it needs a ledger redeploy.
+**The shipped value sits ON the floor, so there is no downward travel left.** Lowering the haircut would be the safe direction (more allowance, bonds valued lower, quorums harder), but the setter refuses anything below `MIN_WOOD_HAIRCUT_BPS`, and the removal of the once-per-day interval therefore buys nothing here. The crisis brake is the other lever this section names: lowering `woodUsdPriceX8` truncates every bond, takes one owner transaction, and is likewise un-rate-limited on-chain. Raising the floor is not a parameter change at all — `MIN_WOOD_HAIRCUT_BPS` is a constant, so it needs a ledger redeploy.
 
-Finding 5's window-vs-staleness invariant is unaffected and remains enforced by `WoodPoolFeed` itself — a different problem (structural unavailability) with a different fix.
+The feed's own window-vs-staleness invariant is unaffected and remains enforced by `WoodPoolFeed` itself — a different problem (structural unavailability) with a different fix.
 
 #### Scenario: Operator sizes the haircut
 - **WHEN** the operator seats `woodHaircutBps` before launch
-- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that the shipped value is 5,000 (a 50% allowance, equal to the ledger floor), that 10,000 leaves none at all and is refused by pre-flight 9, and that the earlier guardian-ROE objection to 5,000 was reconsidered under declared locks (SHE-182)
+- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that the shipped value is 5,000 (a 50% allowance, equal to the ledger floor), that 10,000 leaves none at all and is refused by pre-flight 9, and that the earlier guardian-ROE objection to 5,000 was reconsidered under declared locks
 
 #### Scenario: Deploy would leave the haircut at the ledger default
 - **WHEN** `DeployPlanB` would complete with `woodHaircutBps == 10_000`
@@ -459,10 +442,10 @@ Finding 5's window-vs-staleness invariant is unaffected and remains enforced by 
 
 #### Scenario: Bond valuation needs tightening during a crash
 - **GIVEN** the deploy seated the haircut at the floor minutes earlier
-- **THEN** `setWoodUsdPrice` succeeds at once — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration — while `setWoodHaircutBps` below `MIN_WOOD_HAIRCUT_BPS` is refused by value, not by time
+- **THEN** `setWoodUsdPrice` succeeds at once — the on-chain interval that would have refused it is gone, and any delay now comes from the owner Safe's module configuration — while `setWoodHaircutBps` below `MIN_WOOD_HAIRCUT_BPS` is refused by value, not by time
 
 ### Requirement: Rate limiting is enforced off-chain, and the contract imposes none
-`ExposureLedger.setWoodUsdPrice` and `setWoodHaircutBps` SHALL impose no rate limit and no per-call size ceiling. The owner may move either lever to any legal value, any number of times, within one block. **Rate limiting is enforced OFF-CHAIN by a Zodiac Delay/Roles module on the owner Safe** (issue #89, owner decision 2026-08-02).
+`ExposureLedger.setWoodUsdPrice` and `setWoodHaircutBps` SHALL impose no rate limit and no per-call size ceiling. The owner may move either lever to any legal value, any number of times, within one block. **Rate limiting is enforced OFF-CHAIN by a Zodiac Delay/Roles module on the owner Safe** (owner decision 2026-08-02).
 
 This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter natspec and this runbook. An auditor reading `ExposureLedger` previously saw a self-limiting owner; they now see an unrestricted one, with the control living in a Safe configuration that is invisible from the source. Undocumented, the next reviewer either files it as a finding or — worse — assumes a protection that was moved.
 
@@ -472,15 +455,15 @@ This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter n
 
 **THE PROPERTY THE ZODIAC CONFIGURATION MUST PRESERVE — the delay SHALL be ASYMMETRIC: raises delayed, drops immediate.** A plain Zodiac Delay module is symmetric and would delay the emergency lowering too, relocating the bug rather than fixing it — possibly with a longer delay than the one removed. A Roles modifier can scope by selector and by static parameter conditions but **cannot compare an argument against current on-chain state**, so it cannot express "allow if lower than the stored value". The practical shape is therefore a **fast path for arguments below a fixed threshold** set comfortably beneath any plausible cap, with everything above it routed through the Delay module. **If the configuration cannot preserve the asymmetry, the in-contract limit SHALL NOT have been removed** — restore the direction-scoped interval instead.
 
-**It must actually be deployed.** A documented off-chain control that nobody configured is worse than an on-chain one, because the source no longer carries a trace of the requirement. Pre-flight 10 has MOVED out of the Plan B phase and into the ceremony's post-handoff validation, because the ledger owner is the deployer until the handoff runs and only afterwards is the Safe the answer: on Mainnet posture, `ExposureLedger.pendingOwner()` SHALL be `OWNER_MULTISIG` and that address SHALL hold code. On Fork posture it is SKIPPED — the owner is the deployer, an EOA, and there is no Safe — which retires `ALLOW_EOA_LEDGER_OWNER`: the waiver is now a property of posture rather than an env key an operator could set on mainnet. Acceptance itself is verified later by `script/verify-robinhood.sh`, after the Safe has called `acceptOwnership()`. This is the most an on-chain check can establish. It deliberately does not probe for modules: enumerating a Safe's modules would prove only that *some* module is attached, not that the delay is asymmetric, and a probe that appears to verify the requirement while verifying something weaker is worse than none. **The asymmetry is a runbook obligation, verified by a human before launch.** The Zodiac configuration is a prerequisite for LAUNCH, not for merge; until it exists the protocol has neither the on-chain limit nor the off-chain one.
+**It must actually be deployed.** A documented off-chain control that nobody configured is worse than an on-chain one, because the source no longer carries a trace of the requirement. Pre-flight 10 has MOVED out of the Plan B phase and into the ceremony's post-handoff validation, because the ledger owner is the deployer until the handoff runs and only afterwards is the Safe the answer: on Mainnet posture, `ExposureLedger.pendingOwner()` SHALL be `OWNER_MULTISIG` and that address SHALL hold code. On Fork posture it is SKIPPED — the owner is the deployer, an EOA, and there is no Safe — which retires `ALLOW_EOA_LEDGER_OWNER`: the waiver is now a property of posture rather than an env key an operator could set on mainnet. `script/verify-robinhood.sh` accepts the Safe as either owner or pending owner on Mainnet, so acceptance itself SHALL be confirmed by reading `owner()` after the Safe has called `acceptOwnership()`. This is the most an on-chain check can establish. It deliberately does not probe for modules: enumerating a Safe's modules would prove only that *some* module is attached, not that the delay is asymmetric, and a probe that appears to verify the requirement while verifying something weaker is worse than none. **The asymmetry is a runbook obligation, verified by a human before launch.** The Zodiac configuration is a prerequisite for LAUNCH, not for merge; until it exists the protocol has neither the on-chain limit nor the off-chain one.
 
 #### Scenario: Auditor reads the price setters
 - **WHEN** a reviewer reads `setWoodUsdPrice` and finds no interval and no size ceiling
 - **THEN** the natspec states plainly that rate limiting is enforced off-chain by a Zodiac module and that this contract deliberately imposes none, so the absence reads as a documented decision rather than a missing control
 
 #### Scenario: EOA owner refused at deploy
-- **WHEN** a Mainnet run completes with `OWNER_MULTISIG` naming an externally-owned account
-- **THEN** pre-flight 10 FAILS in post-handoff validation, naming that the protocol would carry neither the on-chain limit nor the off-chain one
+- **WHEN** a Mainnet run is started with `OWNER_MULTISIG` naming an externally-owned account
+- **THEN** the pre-broadcast pre-flight reverts "OWNER_MULTISIG must be a contract (Safe), not an EOA", and the post-handoff validation repeats the same check, because the protocol would otherwise carry neither the on-chain limit nor the off-chain one
 
 #### Scenario: Fork posture skips the owner check
 - **GIVEN** a Tenderly vnet, whose deployer is an impersonated EOA and where no Safe exists
@@ -499,5 +482,90 @@ This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter n
 - **THEN** WOOD/USD reads high by roughly the ETH move until the feed ticks, bonds are over-valued for that period, and the exposure is bounded above by the cap and below by the haircut — an accepted risk, documented, not a defect to file
 
 #### Scenario: Short averaging window with a slow USD feed
-- **WHEN** the feed's averaging `window` is short while `ethUsdMaxAge` is 24 hours
-- **THEN** the configuration is ACCEPTED — the two are independent by design, and coupling them would force a ~12-hour window and surrender the crash tracking the feed exists to provide
+- **WHEN** the feed's averaging `window` is at its 24-hour minimum while `ethUsdMaxAge` is 26 hours (the 24h ETH/USD heartbeat plus a 2h allowance)
+- **THEN** the configuration is ACCEPTED — the two bounds are independent by design, and the window is not lengthened to match the USD feed's staleness
+
+### Requirement: Each Morpho market is allowlisted by id before its proposal
+
+Morpho Blue market creation is permissionless for any oracle, collateral token, irm and lltv, so the market a strategy clone names is only as sound as all five of its parameters together. `ConcentratedLiquidityStrategy._initialize` and `MorphoSupplyStrategy._initialize` SHALL require the market id (`MarketParamsLib.id` over all five fields) to be allowlisted through `isMorphoMarketAllowed`, read fail-closed, and SHALL re-check it at `execute()` (and, for CL, at `rerange()`). Separate counterparty grants for the oracle or the collateral token SHALL NOT admit a market.
+
+This is a PER-PROPOSAL obligation, not a ceremony step: the market is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setMorphoMarketAllowed(<marketId>, true)` for each market a proposal is expected to use, before clone-init, after reading the market's five parameters from Morpho and refusing a market whose `irm` is the zero address or whose oracle does not price its collateral. For the known 4663 USDG market the call is `setMorphoMarketAllowed(0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114, true)`. Settle paths are NOT gated on it, so a demotion cannot strand the funds it is meant to protect.
+
+#### Scenario: Proposal naming a market that is not allowlisted
+- **WHEN** a CL or Morpho-supply clone names a market whose id is not allowlisted, even if its oracle and collateral are allowed counterparties
+- **THEN** clone-init reverts `MorphoMarketNotAllowed(marketId, registry)`
+
+#### Scenario: Allowlisted market needs no part grants
+- **WHEN** a clone names an allowlisted market whose oracle and collateral hold no counterparty grant
+- **THEN** clone-init succeeds
+
+#### Scenario: Market demoted after init
+- **WHEN** the market id is de-listed between clone-init and `execute()`
+- **THEN** `execute()` reverts `MorphoMarketNotAllowed(marketId, registry)` and no vault funds move
+
+### Requirement: The StrategyFactory phase wires the registry before handoff
+The StrategyFactory phase SHALL require the ceremony's tier registry (carried on the in-memory `Stack`) to be set and `TierRegistry.owner() == deployer`, SHALL call `setStrategyFactory(<minted factory>)` inside its broadcast, and SHALL assert `strategyFactory()` reads back the minted factory. There SHALL be no deferred or escape-hatch path: an unwired registry makes every `propose` revert `StrategyNotRegistered` and every non-asset batch target refused. Inside the single ceremony this is a PHASE-ORDERING property — the StrategyFactory phase runs before `_handoffAll` — so the refusal below bites only on a RE-RUN against a registry the Safe has already accepted. A registry already naming a FOREIGN StrategyFactory is likewise refused ("TIER_REGISTRY already points at a foreign StrategyFactory") rather than repointed. A TierRegistry redeploy runbook SHALL list `setStrategyFactory(STRATEGY_FACTORY)` alongside the certification set.
+
+#### Scenario: The ceremony leaves the registry wired
+- **WHEN** `DeployStrategyFactory` completes against a registry the deployer still owns
+- **THEN** `tierRegistry.strategyFactory()` equals the minted factory and a `propose` naming a strategy registered on it succeeds
+
+#### Scenario: A re-run against a handed-off registry is refused
+- **WHEN** the phase is re-run after the multisig has accepted TierRegistry ownership
+- **THEN** it reverts naming the wiring, deploying nothing
+
+### Requirement: Syndicate creation is closed until the end of Mainnet run 2
+A governor minted before the Plan B phase has wired the factory carries no exposure ledger and no bond escrow, and nothing in the ceremony can reliably wire it afterwards: `pushWiring` reverts while the governor has an open proposal, and a gap-vault owner can keep one open indefinitely. On Mainnet posture the factory SHALL therefore be initialised with a closed agent-registry sentinel, `RobinhoodParams.AGENT_REGISTRY_CLOSED`: a non-zero, codeless address (zero would turn identity gating off). `createSyndicate` calls `ownerOf` on it and reverts for every caller, sponsored or not, from the factory's own initialisation transaction onward — through all of run 1 and the gap. As the last step of run 2 before the handoff, while the deployer still owns the factory and only while the registry still equals the sentinel, the ceremony SHALL require `syndicateCount() == 0` and call `setAgentRegistry(RobinhoodParams.AGENT_REGISTRY)`. The pre-flight SHALL refuse a sentinel that holds code. The `AwaitingWoodFeed` validation SHALL require the sentinel and `syndicateCount() == 0`; the `Complete` validation the real registry. Fork posture is unchanged: one run, the real registry from initialisation. `script/verify-robinhood.sh` SHALL still check, read-only, that every live governor's ledger, escrow and tier registry equal the factory's.
+
+#### Scenario: No vault can be created from the factory's initialisation
+- **GIVEN** `deployCore` has just initialised the Mainnet factory
+- **WHEN** an outsider with a prepared owner stake and an agent identity calls `createSyndicate`
+- **THEN** the call reverts and `syndicateCount()` stays zero
+
+#### Scenario: Sponsorship does not open the gap
+- **GIVEN** run 1 has completed at `AwaitingWoodFeed` and the deployer has sponsored a creator
+- **WHEN** that creator calls `createSyndicate`
+- **THEN** the call reverts
+
+#### Scenario: Run 2 opens creation and every vault is wired at creation
+- **WHEN** run 2 completes
+- **THEN** the factory's registry is the ERC-8004 registry, creation costs the invite-only fee, a new syndicate's governor has the factory's `exposureLedger` and `bondEscrow` from creation, and a full-capital proposal with no approvals reverts `InsufficientApproveCoverage` at execute
+
+#### Scenario: Validation refuses an open registry or a syndicate between the runs
+- **WHEN** `_validateAll` runs at `AwaitingWoodFeed` and the registry is not the sentinel, or a syndicate exists
+- **THEN** it reverts naming the registry or the syndicate count
+
+### Requirement: The ETH/USD staleness bound exceeds the feed heartbeat
+`RobinhoodParams.ETH_USD_MAX_AGE` SHALL be strictly greater than the 4663 ETH/USD feed's 24h heartbeat (`ETH_USD_HEARTBEAT`); the shipped value is 26 hours, the same 2h allowance as `ASSET_FEED_MAX_DELAY`. At exactly the heartbeat a round published one second late makes `WoodPoolFeed` revert, which halts propose, approve, execute and `ChallengeGame.file` protocol-wide. The WOOD feed phase's pre-flight SHALL refuse a bound at or below the heartbeat before anything is minted.
+
+#### Scenario: A late heartbeat round still prices
+- **WHEN** the ETH/USD answer is 24 hours and one second old
+- **THEN** `WoodPoolFeed.latestRoundData` answers and every priced entry point lands
+
+#### Scenario: A bound at the heartbeat is refused
+- **WHEN** the feed phase is run with `ethUsdMaxAge` equal to 24 hours
+- **THEN** the pre-flight reverts before the feed is minted
+
+### Requirement: Guardian-network simulation stakes before the proposal
+To make guardian blocking real, guardians SHALL stake BEFORE the proposal is created. Both sides of the block-quorum comparison are read at the proposal's snapshot `snapshotAt`, one second before the timestamp of the block in which the proposal entered Pending (the `propose` block; for a collaborative proposal, the block of the last co-proposer approval): `openReview` stores `getPastTotalVotes(snapshotAt)` as the denominator and each vote weighs the voter's `getPastStake(voter, snapshotAt)`. Stake checkpointed at a timestamp at or before `snapshotAt` counts; stake checkpointed in that block or later neither votes (`NotActiveGuardian`) nor counts. The operator SHALL therefore advance time by ≥1s (`evm_increaseTime 1`) between staking and `propose`. `agentId = 0` is acceptable (a guardian's `agentId` is recorded, never checked against the identity registry).
+
+Ballots weigh RAW stake, not the age-weighted `getPastVotes`, so a freshly staked cohort can block at once and no ageing step is needed. There is no cohort-size floor: any positive snapshot total decides its own review, and only a zero total fails open.
+
+Reviews snapshot `blockQuorumBps` and the slash envelope at `openReview`; 30% of the snapshot stake voting Block rejects the proposal and slashes approvers (WOOD burned); only approvers are recorded for attribution (`getApproverWeights`, `getApproverCoverage`), blockers exist only as weight in the tally. Voting, first votes and vote changes alike, closes for the final 10% of the window (`VoteChangeLockedOut`); approvers are capped at 100/proposal, blockers uncapped. Slash severity is NOT voted: `voteOnProposal(address,uint256,GuardianVoteType,uint256)` carries the approver's WOOD lock and no severity argument, and `_severityBps(Review storage)` derives severity deterministically from the review — a quadratic ramp from `minSlashBps` to `maxSlashBps` that saturates at a 66.67% block supermajority, with the bounds snapshotted at `openReview` (stored plus one, so a genuine snapshot can never read as the unset sentinel). Each approver's rate is its lock over its slash basis, multiplied by that severity and clamped into the snapshotted envelope. The own bond is the only slash leg (DPoS delegation removed/postponed 2026-07-26). `emergencySettleWithCalls` re-checks `requiredOwnerBond = max(minOwnerStake, MIN_OWNER_BOND_FLOOR = 1,000 WOOD)` at call time (no TVL scaling → a flat floor at the deployed `minOwnerStake` of 10,000 WOOD), and additionally requires the posted bond to be strictly positive. The Slash Appeal Reserve is NOT seeded by `DeployAll` — the operator SHALL seed it post-deploy (`approve` + `registry.fundSlashAppealReserve`).
+
+#### Scenario: Stake placed after propose cannot vote
+- **WHEN** a guardian stakes after `propose` and votes on that proposal's review
+- **THEN** its snapshot stake is zero and the vote reverts `NotActiveGuardian`
+
+#### Scenario: Fresh cohort blocks
+- **WHEN** six guardians each stake 10,000 WOOD, time advances 1s, the proposal is created, and all six vote Block in its review
+- **THEN** their raw snapshot weight is 60,000 against an 18,000 bar and the proposal is rejected and any approvers slashed
+
+#### Scenario: Non-voting stake raises the bar
+- **WHEN** another 100,000 WOOD is staked before `propose` and never votes
+- **THEN** the bar is 30% of 160,000 = 48,000, and the six guardians' 60,000 still clears it; at 150,000 of non-voting stake (bar 63,000) it no longer would
+
+#### Scenario: Appeal without a seeded reserve
+- **WHEN** `refundSlash` is attempted before the Slash Appeal Reserve is funded
+- **THEN** the refund cannot be paid — seeding the reserve is a required post-deploy step
+
