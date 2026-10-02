@@ -63,7 +63,7 @@ means `stakedAmount > 0` and no pending unstake request.
 | `minSlashBps` — the **deterrence floor**: the least a convicted approver loses, as a fraction of their whole bond, whatever WOOD they declared. Launch value is a governance decision; `DeployPlanB` refuses zero. | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.setMinSlashBps` |
 | `maxSlashBps` — must be 100%: a guardian may lock their entire stake behind one proposal, and a ceiling below that would cap the burn beneath the lock. `DeployPlanB` pre-flight asserts it. | 100% | ≥ `minSlashBps` | 100% | `StakedWood.setMaxSlashBps` |
 | `ageFloorBps` (new-stake weight in `getPastVotes`; no on-chain reader) | 25% | > 0 | 100% | `StakedWood.setAgeFloorBps` |
-| `maturationPeriod` (ramp to full weight in `getPastVotes`) | 30 d | 7 d | 90 d | `StakedWood.setMaturationPeriod` |
+| `maturationPeriod` (ramp to full weight in `getPastVotes`; no on-chain reader) | 30 d | 7 d | 90 d | `StakedWood.setMaturationPeriod` |
 
 **Every guardian vote weighs raw stake.** No vote path applies an age discount:
 
