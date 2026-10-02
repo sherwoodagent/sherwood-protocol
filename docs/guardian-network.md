@@ -410,11 +410,23 @@ Anti-griefing details:
   caps, not the declare-time envelope.
 - `emergencySettleWithCalls` (`GovernorEmergency.sol:107`) — vault owner submits
   **new** calls; requires the owner's sWOOD bond (`requiredOwnerBond` =
-  `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)` at `StakedWood.sol:1179`,
-  `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD at `:210`, and the posted bond must be
+  `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)` at `StakedWood.sol:1155`,
+  `MIN_OWNER_BOND_FLOOR` = 1 000 WOOD at `:213`, and the posted bond must be
   strictly positive) and opens a fresh guardian review (block-only voting). A
   block slashes the **owner's bond**, not guardians. Finalize executes with
-  per-call caps disabled — the escape hatch for a settlement leg stuck on a cap.
+  per-call caps disabled — the escape hatch for a settlement leg stuck on a cap —
+  and a net egress budget of zero, measured across the whole batch: vault float
+  may leave inside the batch only if at least as much comes back before it ends
+  (a solvent repay the vault fronts and the redeemed collateral returns passes),
+  and what the strategy returns may be passed on (the guardian veto is the
+  control for that). Only an insolvent unwind needs funds sent to the strategy
+  from outside the vault.
+- After a blocked round burns the bond, the same owner re-bonds with
+  `prepareOwnerStake` → `approveOwnerStakeBinding(vault)` →
+  `rotateOwner(vault, owner)`, which is allowed while the stuck proposal is still
+  open (rotation to any other address still waits until nothing is open), then
+  opens a new round. Each blocked round costs a bond. The rotation drains the
+  vault's agent set, so the owner calls `registerAgent` again before proposing.
 
 ### Migrating a vault created under the zero-bond sentinel
 

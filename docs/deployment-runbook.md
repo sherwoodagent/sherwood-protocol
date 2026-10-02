@@ -49,14 +49,30 @@ Nothing is read from the environment. Every number comes from
      --gas-estimate-multiplier 200
    ```
    It stops at `Checkpoint.AwaitingWoodFeed`: `WoodPoolFeed` is minted, nothing
-   of Plan B is, and **no ownership has moved**.
+   of Plan B is, and **no ownership has moved**. **No syndicate can be created**:
+   the factory is initialised with a closed agent-registry sentinel
+   (`AGENT_REGISTRY_CLOSED`, non-zero and codeless), so every `createSyndicate`
+   reverts, sponsored or not, from the factory's own initialisation until run 2's
+   last step. A vault minted earlier would get a governor with no exposure ledger
+   and no bond escrow.
 3. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
    `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
    key owns every contract for this whole interval; that is the cost of the
    warm-up, and it is why step 2 hands nothing off.
+   **Before launch, record who holds the WOOD/WETH liquidity**: the V3 full-range
+   position and the V2 LP tokens, and whether each is locked. Below
+   `MIN_V3_LIQUIDITY` or `MIN_WETH_RESERVE` the feed reverts, which halts propose,
+   approve, execute and `ChallengeGame.file` until it recovers. Recovery is the
+   Safe deploying and keeping alive a replacement aggregator, then
+   `ExposureLedger.setWoodFeed(replacement, maxDelay)`.
 4. **Second run.** The same command. The stage gate passes, Plan B / Plan D
-   deploy, the handoff runs, and `deployAll` returns
-   `Checkpoint.Complete`. Addresses are written to `chains/4663.json` last.
+   deploy, and as its last step before the handoff the run opens
+   creation by pointing the factory at the real ERC-8004 registry (refusing if any
+   syndicate exists). Creation then costs the invite-only fee (1M WOOD to the Safe).
+   The handoff runs and `deployAll` returns `Checkpoint.Complete`. Addresses are
+   written to `chains/4663.json` last. If a `WoodPoolFeed` with a different
+   `ethUsdMaxAge` was already deployed on the target chain, the run refuses to
+   adopt it: deploy a new feed under a new salt and prime it.
 5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
    `ExposureLedger` and `ChallengeGame` (the one-step contracts —
    beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already
@@ -66,7 +82,9 @@ Nothing is read from the environment. Every number comes from
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
 6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
-   address from the book's `CREATE3_FACTORY` and fails on any disagreement.
+   address from the book's `CREATE3_FACTORY` and fails on any disagreement, and
+   checks that every live governor carries the factory's ledger, escrow and tier
+   registry.
 
 **Fork — one run.** Chain 9994663, `chains/9994663.json` committed. Same command
 with `--unlocked --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` instead of
@@ -145,6 +163,9 @@ Also publish the new addresses (handbook item 94): `sherwood/cli/src/lib/address
 
 Not one-time steps. Nothing below is enforced on-chain.
 
+- **Upgrading a live v1 deployment to `post-audit-v2`:** follow
+  [`upgrade-v1-to-v2-runbook.md`](upgrade-v1-to-v2-runbook.md), not this ceremony.
+
 - **Keep `woodUsdPriceX8` above market.** It is a manipulation cap, never a
   price — seeded at or below market it binds permanently and pins every bond.
   Review monthly; lowering it is the emergency brake and is not rate-limited
@@ -169,6 +190,19 @@ Not one-time steps. Nothing below is enforced on-chain.
   ```bash
   forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
   ```
+
+- **Allowlisting a Morpho market before a strategy uses it.** Before a
+  `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy` clone is
+  initialised, the `TierRegistry` owner calls `setCounterpartyAllowed(<oracle>, true)`
+  for that market's oracle. For the supply strategy, it also calls it for the
+  market's collateral token, unless that token is the vault asset. Otherwise
+  clone-init reverts `CounterpartyNotAllowed`. Execute re-checks both; settle
+  does not. Never allowlist `address(0)`, so a market with
+  `oracle == address(0)` stays refused. The known 4663 USDG market
+  (id `0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114`)
+  needs:
+  - oracle `0xe694c531F65c4BaBc88A52d7178476e095e51574`
+  - collateral `0xde770c84FE66E063336b31737cFE9790f18c4087`
 
 - **Incident: the ERC-8004 registry breaks.** It is a third-party UUPS proxy
   whose owner is an outside EOA. If `ownerOf` starts reverting, then

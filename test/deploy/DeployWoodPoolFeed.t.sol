@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {DeployWoodPoolFeed} from "../../script/DeployWoodPoolFeed.s.sol";
 import {ForkWoodFeedFixture} from "../../script/robinhood-mainnet/ForkWoodFeedFixture.sol";
+import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
 import {WoodPoolFeed} from "../../src/pricing/WoodPoolFeed.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
@@ -54,7 +55,7 @@ contract DeployWoodPoolFeedTest is Test {
     uint256 constant EXPECTED_WOOD_USD_X8 = 442_239; // ~$0.00442
 
     uint256 constant WINDOW = 24 hours;
-    uint256 constant ETH_USD_MAX_AGE = 1 days;
+    uint256 constant ETH_USD_MAX_AGE = RobinhoodParams.ETH_USD_MAX_AGE;
     uint256 constant MIN_WETH_RESERVE = 10e18;
     uint128 constant MIN_V3_LIQUIDITY = 1e22;
     uint128 constant V3_LIQUIDITY = 2.128e22;
@@ -139,7 +140,29 @@ contract DeployWoodPoolFeedTest is Test {
         assertEq(afterTs, tsBefore, "no second baseline on a resumed run");
     }
 
+    /// @notice A resumed run refuses to adopt a feed minted with a different ETH/USD bound.
+    function test_deploy_refusesToAdoptAFeedWithADifferentEthUsdMaxAge() public {
+        _deploy(script, _params());
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.ethUsdMaxAge = ETH_USD_MAX_AGE + 1;
+        vm.prank(address(script));
+        vm.expectRevert(bytes("PRE-FLIGHT: adopted WOOD feed has a different ETH_USD_MAX_AGE"));
+        script.deploy(p);
+    }
+
     // ── Pre-flights ──
+
+    /// @notice Audit 2026-10-01 V1-06: an ETH/USD bound at the 24h heartbeat is refused.
+    function test_preflight_bites_whenEthUsdMaxAgeDoesNotExceedTheHeartbeat() public {
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.ethUsdMaxAge = RobinhoodParams.ETH_USD_HEARTBEAT;
+        vm.expectRevert(
+            bytes(
+                "PRE-FLIGHT: ETH_USD_MAX_AGE must EXCEED the ETH/USD heartbeat (24h), or a late round halts WOOD pricing"
+            )
+        );
+        script.deploy(p);
+    }
 
     function test_preflight_bites_whenAPairHoldsTheWrongTokens() public {
         uniPair.setTokens(address(weth), address(new ERC20Mock("NOT", "NOT", 18)));

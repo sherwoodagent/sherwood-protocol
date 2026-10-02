@@ -626,7 +626,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      let it unilaterally reassign vault control. Requires the old owner to
     ///      have already unstaked, or rotating would strand the old stake, and is
     ///      forbidden while any proposal binds the vault, or the new owner would
-    ///      inherit `pause()` and other owner-only powers mid-flight.
+    ///      inherit `pause()` and other owner-only powers mid-flight. A rotation to
+    ///      the current owner (a re-bond) is exempt from that lifecycle gate.
     /// @dev INCOMING-OWNER CONSENT REQUIRED. `newOwner` must first call
     ///      `approveOwnerStakeBinding(vault)` on sWOOD, or this reverts
     ///      `BindingNotApproved`. Rotation is not a bare title assignment: it
@@ -652,9 +653,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         IGuardianRegistry reg = IGuardianRegistry(guardianRegistry);
         // Registry exposes no `hasOwnerStake` view; inline the equivalent check.
         if (reg.ownerStake(vault) > 0) revert VaultStillStaked();
-        ISyndicateGovernor gov = ISyndicateGovernor(_governorOf[vault]);
-        if (gov.getActiveProposal() != 0) revert ProposalActive();
-        if (gov.openProposalCount() != 0) revert ProposalsOpen();
+        // Same-owner rotation is a re-bond (e.g. after a blocked emergency round), allowed mid-proposal.
+        if (newOwner != currentOwner) {
+            ISyndicateGovernor gov = ISyndicateGovernor(_governorOf[vault]);
+            if (gov.getActiveProposal() != 0) revert ProposalActive();
+            if (gov.openProposalCount() != 0) revert ProposalsOpen();
+        }
 
         SyndicateVault(payable(vault)).rotateOwnership(newOwner);
         // Owner-stake slot lives on sWOOD.

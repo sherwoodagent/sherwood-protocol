@@ -61,9 +61,11 @@ interface ISyndicateVault {
     error NotARegisteredStrategy(address target);
     /// @notice A governor batch called `asset().transferFrom` with a `from` other than the vault.
     error TransferFromNotVault(address from);
-    /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
-    ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
+    /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata.
     error MalformedAssetCall(bytes4 selector);
+    /// @notice A governor batch called `asset()` with a selector other than `transfer`,
+    ///         `transferFrom` or the approve family.
+    error UnrecognizedAssetSelector(bytes4 selector);
     /// @notice `delegate`/`delegateBySig` named anyone but the holder. The vault self-delegates
     ///         every receiver, so votes always equal balance; `delegate(self)` is a no-op.
     error DelegationDisabled();

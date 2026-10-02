@@ -42,7 +42,7 @@ contract DeployRobinhoodMainnetHarness is DeployRobinhoodMainnet {
     }
 
     function exposed_validate(Deployed memory d, address deployer, address ownerMultisig, address wood) external view {
-        _validateMainnet(d, deployer, ownerMultisig, wood);
+        _validateMainnet(d, deployer, ownerMultisig, wood, RobinhoodParams.AGENT_REGISTRY);
     }
 }
 
