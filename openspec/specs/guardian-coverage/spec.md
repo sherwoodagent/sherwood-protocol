@@ -3,15 +3,20 @@
 ## Purpose
 
 Dollar-denominated coverage accounting for the guardian economic-security model: guardians who approve a coverage-consuming proposal book USD exposure against their slashable WOOD bond, execution requires the covering approvers' aggregate bond to meet the proposal's required coverage, and a live challenge freezes the committed coverage so accused collateral cannot exit. Implemented by `src/ExposureLedger.sol` (interface `src/interfaces/IExposureLedger.sol`), consumed by `GuardianRegistry` (recording at approve-vote time), `SyndicateGovernor` (covered-TVL check at propose, approve quorum at execute, guardian fee at settlement), `ChallengeGame` (freeze), and `StakedWood` (exit gate).
-
 ## Requirements
-
 ### Requirement: Slashable bond valuation
-The ledger SHALL value a guardian's slashable bond in USD (8-decimal price) as `ownStake(g) × woodPriceX8() / 1e8`, where `ownStake` is read from sWOOD's `guardianStake`. Only the guardian's own stake counts — there is no delegated-inbound term (delegation is out of scope for v1).
+The ledger SHALL value a guardian's slashable bond in USD (8-decimal price) as `ownStake(g) × woodPriceX8() / 1e8`. Only the guardian's own stake counts — there is no delegated-inbound term. The stake basis SHALL depend on the read:
+
+- The public `slashableBondUsd` view and the free-budget cap in `recordApproval` read the guardian's LIVE stake (`swood.guardianStake`).
+- Every per-proposal read that values a lock — the approval slot floor and the execute-time quorum (anchored at the current block), and after execution `coverageUsdOf`, `liabilityUsd` / `unsharedLiabilityUsd` and `slashBpsFor` (anchored at `executedAt`) — SHALL use `swood.slashableStakeAt(g, anchor)`, the basis the verdict slash recovers from, so stake added at or after the anchor instant is never counted as coverage for that proposal.
 
 #### Scenario: Bond priced from own stake
 - **WHEN** `slashableBondUsd(guardian)` is called for a guardian with staked WOOD
-- **THEN** it returns the guardian's own stake multiplied by the current haircut WOOD/USD price, with no delegated component
+- **THEN** it returns the guardian's own live stake multiplied by the current haircut WOOD/USD price, with no delegated component
+
+#### Scenario: Post-execution top-up is not coverage
+- **WHEN** a guardian tops up its stake after the proposal it approved has executed, and a post-execution coverage read (coverage, liability, or slash rate) values that guardian
+- **THEN** the guardian is valued at its stake as of the execution instant (clamped to live), and the top-up moves none of the proposal's coverage figures
 
 ### Requirement: WOOD pricing is feed-first with governance fallback
 `woodPriceX8()` SHALL return the Chainlink WOOD/USD feed price normalised to 8 decimals when a feed is wired and healthy, and SHALL fall back to the owner-set `woodUsdPriceX8` — without reverting — when the feed is unset, returns a non-positive answer, is older than its configured `maxDelay`, or reverts. The haircut `woodHaircutBps` SHALL be applied to BOTH the feed price and the fallback price. `woodPriceDetail()` SHALL expose whether the returned price came from the fallback, so monitoring can observe the degraded path.
@@ -269,3 +274,4 @@ The protocol-wide performance-fee constants SHALL live in a single library (`src
 #### Scenario: Shared ceiling
 - **WHEN** either the governor's `maxPerformanceFeeBps` cap or the vault's agent-fee cap is enforced
 - **THEN** both derive from the same `MAX_PERFORMANCE_FEE_BPS` constant and cannot silently diverge
+
