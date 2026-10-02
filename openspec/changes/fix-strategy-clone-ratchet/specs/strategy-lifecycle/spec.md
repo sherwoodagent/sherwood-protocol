@@ -24,18 +24,14 @@ sub-call of every proposal's batch reaches its target with
 proposal executed can include `clone.execute()` against a clone pre-deployed
 for a different, later proposal, permanently flipping its one-shot
 `Pending → Executed` ratchet and bricking the later proposal with
-`AlreadyExecuted` before it is voted on (issue #150; PoC verified 2026-08-03
-post-#118). The privileged-batch-target denylist deliberately exempts
-strategy entrypoints as the legitimate batch surface, so this check is the
-sole enforcement of proposal identity at the clone.
+`AlreadyExecuted` before it is voted on. A governor batch may call any
+registered strategy, so this check is the sole enforcement of proposal
+identity at the clone.
 
 The check SHALL be fail-closed: it consumes typed external calls with no
 capability probe, no try/catch, and no degrade-open path. A clone whose vault
-or governor cannot answer the binding views SHALL refuse to execute. This is
-the deliberate inversion of the propose-time target validation's degrade-open
-posture: that check has an authoritative guard behind it; this check IS the
-enforcement, and a refused execute is recoverable (redeploy) where a flipped
-ratchet is not.
+or governor cannot answer the binding views SHALL refuse to execute: a refused
+execute is recoverable (redeploy) where a flipped ratchet is not.
 
 #### Scenario: Unrelated proposal's batch cannot flip a foreign clone's ratchet
 
@@ -71,8 +67,10 @@ invariant prevents any other proposal's batch from existing. The unguarded
 `settle()` is load-bearing for recovery: a clone orphaned in `Executed`
 (its proposal settled through owner-supplied emergency calls that bypassed
 it) SHALL remain settleable by a later proposal's batch, returning its held
-funds to the vault. Any future change adding a proposal-binding check to
-`settle()` MUST first account for orphaned-clone fund recovery.
+funds to the vault. The vault can also pull any single token off a clone,
+in any state, through the vault-only `rescueTo(token)`. Any future change
+adding a proposal-binding check to `settle()` MUST first account for
+orphaned-clone fund recovery.
 
 #### Scenario: Orphaned clone remains settleable
 

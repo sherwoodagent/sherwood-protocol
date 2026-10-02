@@ -1,8 +1,3 @@
-## Purpose
-
-Keep both LP-flow locks on one predicate from Draft creation to settle (v1-deploy's
-deposit lock, restored in the v2 merge), and refuse delegation away from the holder.
-
 ## MODIFIED Requirements
 
 ### Requirement: Vote checkpointing and auto-delegation
@@ -17,7 +12,7 @@ The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`
 - **WHEN** anyone transfers 0 shares to a holder that is not self-delegated
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
-#### Scenario: Delegation to another address is refused
+#### Scenario: Delegation away from the holder is refused
 - **WHEN** a holder calls `delegate` or `delegateBySig` with a delegatee that is not itself (another holder, the queue, or `address(0)`)
 - **THEN** the call reverts `DelegationDisabled` and the holder's shares keep voting for the holder
 
@@ -29,37 +24,78 @@ The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`
 
 While no proposal is open, instant `withdraw`/`redeem` SHALL be available up to the
 holder's balance, capped by instant capacity = available float (idle balance minus
-the queue's reserved assets). From Draft creation through settle,
+the queue's reserved assets). From Draft creation until the proposal reaches a
+terminal state (settled, cancelled, rejected or expired, as committed on-chain),
 `maxWithdraw`/`maxRedeem` SHALL return 0 for every holder except the bound withdrawal
 queue, and exits route through the async queue — full stop. The lock starts at Draft
-creation, ahead of the vote snapshot and the electorate stamp, so no exit can land on
-either side of the stamp: every share in the recorded electorate SHALL be capital at
-risk for the cycle, and whoever can vote on a proposal SHALL remain exposed to its
-outcome. A requested exit whose assets plus the queue reserve exceed the idle balance
-SHALL revert `QueueReserveBreached`; the vault SHALL NOT pull capital from a strategy
-to serve an exit.
+creation, ahead of the vote snapshot and the electorate stamp, so no instant exit can
+land on either side of the stamp. Because the exit views cap every holder at the
+available float, an over-float `withdraw`/`redeem` SHALL revert in the ERC-4626 max
+check (`ERC4626ExceededMaxWithdraw` / `ERC4626ExceededMaxRedeem`); the vault SHALL
+NOT pull capital from a strategy to serve an exit.
 
 #### Scenario: Exit served from float
 
-- **WHEN** no proposal is active and a holder withdraws no more than the available
+- **WHEN** no proposal is open and a holder withdraws no more than the available
   float
 - **THEN** the withdrawal is served instantly from the vault's idle balance
+
+#### Scenario: Exit beyond available float reverts
+
+- **WHEN** a withdrawal's assets exceed the available float (idle balance minus the
+  queue reserve)
+- **THEN** the withdrawal reverts `ERC4626ExceededMaxWithdraw` (a redeem,
+  `ERC4626ExceededMaxRedeem`)
+
+#### Scenario: Active proposal means queue-only
+
+- **WHEN** a proposal is open, Draft included
+- **THEN** `maxWithdraw` and `maxRedeem` return 0 for every holder except the bound
+  withdrawal queue
 
 #### Scenario: Exit during a collaborative Draft
 
 - **WHEN** a proposal is in Draft and a holder tries an instant redeem
-- **THEN** it reverts (`maxRedeem` is 0); the holder's path is `requestRedeem`, and
-  the shares stay in the electorate recorded at the later Draft → Pending transition
+- **THEN** it reverts (`maxRedeem` is 0), and the holder's path is `requestRedeem`
+
+#### Scenario: Queue bypasses caps it owns
+
+- **WHEN** the bound withdrawal queue is the caller/owner of a withdrawal
+- **THEN** the reserve cap and the open-proposal gate do not apply (the reserved
+  float belongs to the queue)
+
+#### Scenario: maxRedeem excludes queued shares
+
+- **WHEN** shares are escrowed in the queue (`pendingQueueShares`)
+- **THEN** `maxRedeem` treats them as unavailable supply, and redeemable shares are
+  further capped by shares convertible from instant capacity when the holder's
+  balance exceeds it
+
+#### Scenario: Views return zero when paused
+
+- **WHEN** the vault is paused
+- **THEN** `maxWithdraw` and `maxRedeem` return 0
+
+#### Scenario: Missing governor fails closed in exit views
+
+- **WHEN** the factory resolves a zero governor for an unpaused vault and the owner is
+  not the withdrawal queue
+- **THEN** `maxWithdraw`/`maxRedeem` revert `GovernorNotSet` (via
+  `redemptionsLocked()`) rather than reporting instant capacity
 
 ### Requirement: Async redemption requests (Lane B)
 
-`requestRedeem(shares, owner)` SHALL be callable only while `redemptionsLocked()` is
-true (Draft creation through settle), the vault is not paused, and a withdrawal queue is
-bound; zero shares SHALL revert `InsufficientShares`, an unset queue
-`WithdrawalQueueNotSet`, and an unlocked vault `RedemptionsNotLocked`. A caller other
-than the share owner SHALL spend ERC-20 allowance. The shares SHALL be transferred
-(not burned) into queue custody, tagged with the active proposal id, and a request id
-strictly greater than 0 SHALL be returned with `RedeemRequested` emitted.
+`requestRedeem(shares, owner)` SHALL be callable only while the vault is not paused,
+a withdrawal queue is bound, and `redemptionsLocked()` is true (any proposal open,
+Draft included), checked in that order: a paused vault reverts `EnforcedPause`, an
+unset queue `WithdrawalQueueNotSet`, an unlocked vault `RedemptionsNotLocked`, and
+zero shares `InsufficientShares`. A caller other than the share owner SHALL spend
+ERC-20 allowance. The shares SHALL be transferred (not burned) into queue custody,
+tagged with the executing proposal's id, or while none is executing with the latest
+proposal id (`proposalCount()`), and a request id strictly greater than 0 SHALL be
+returned with `RedeemRequested` emitted. A request is priced only by its proposal's
+settle stamp: a request tagged to a proposal that ends without settling is never
+stamped, and its only exit is the queue's `cancel`.
 
 #### Scenario: Queued exit escrows shares
 
@@ -73,14 +109,7 @@ strictly greater than 0 SHALL be returned with `RedeemRequested` emitted.
 - **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the
   correct path)
 
-### Requirement: Pause and emergency behavior
+#### Scenario: Request tagged to a proposal that never settles
 
-Owner-only `pause`/`unpause` SHALL freeze LP flow (`deposit`/`mint`/`withdraw`/`redeem`), strategy execution (`executeGovernorBatch`), and new queue requests (`requestRedeem`/`requestDeposit`), while leaving queue `cancel` available. Owner rescue paths — `rescueEth`, `rescueERC20` (never the vault asset; `CannotRescueAsset`), `rescueERC721` — SHALL remain callable while paused but SHALL revert `RedemptionsLocked` whenever ANY proposal is open, Drafts included, so the owner cannot siphon strategy-transit assets mid-proposal. The vault SHALL have no `receive`/`fallback` (raw ETH sent directly is rejected). `redemptionsLocked()` and `depositsLocked()` SHALL fail closed: a zero governor address SHALL revert `GovernorNotSet` rather than reporting unlocked.
-
-#### Scenario: Rescue blocked mid-proposal
-- **WHEN** the owner calls a rescue path while any proposal is open, including a Draft
-- **THEN** the call reverts `RedemptionsLocked`
-
-#### Scenario: Missing governor fails closed
-- **WHEN** the factory resolves a zero governor for the vault
-- **THEN** `redemptionsLocked()` (and everything gated on it) reverts `GovernorNotSet` instead of silently unlocking
+- **WHEN** a holder queues a redemption during a Draft or a vote and that proposal is then cancelled, rejected or expires
+- **THEN** the request is never stamped, `claim` keeps reverting, and `cancel` returns the shares

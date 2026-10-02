@@ -9,7 +9,7 @@ For every governor-batch call whose `target` is not the vault's underlying `asse
 - **THEN** `executeGovernorBatch` reverts `NotARegisteredStrategy(target)` before any call executes
 
 #### Scenario: A registered strategy is admitted with any selector
-- **WHEN** a batch approves a registered hand-written strategy and calls it with a selector no registry names, pulling at most `maxNetOutflow`
+- **WHEN** a batch approves a registered hand-written strategy and calls it with a selector no registry names, pulling at most `maxNetOutflow` and within each call's cap
 - **THEN** the batch executes
 
 #### Scenario: A code change de-registers
@@ -49,11 +49,11 @@ For every governor-batch call whose `target` is `asset()`: calldata shorter than
 - **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, spender)` is zero for both, and in the next block `transferFrom(vault, attacker, n)` by the idle spender reverts for insufficient allowance
 
 #### Scenario: transferFrom from the vault is admitted and metered
-- **WHEN** a batch approves the vault itself and calls `asset.transferFrom(vault, x, n)`
+- **WHEN** a batch approves the vault itself and calls `asset.transferFrom(vault, x, n)` with a call cap of at least `n`, and the reserve and buffer checks pass
 - **THEN** the batch executes iff `n <= maxNetOutflow`, else reverts `MaxNetOutflowExceeded`
 
 #### Scenario: transfer is admitted and metered
-- **WHEN** a batch contains `asset.transfer(x, n)`
+- **WHEN** a batch contains `asset.transfer(x, n)` with a call cap of at least `n`, and the reserve and buffer checks pass
 - **THEN** the batch executes iff `n <= maxNetOutflow`, else reverts `MaxNetOutflowExceeded`
 
 #### Scenario: Every recorded spender reads zero allowance after the batch
@@ -67,14 +67,14 @@ For every governor-batch call whose `target` is `asset()`: calldata shorter than
 ## MODIFIED Requirements
 
 ### Requirement: Governor batch execution
-`executeGovernorBatch(calls, callCaps, maxNetOutflow)` SHALL be callable only by the governor resolved live from the factory, only while unpaused, and non-reentrantly. Before executing, the vault SHALL verify the shared executor library's bytecode still matches the codehash stamped at initialization (`ExecutorCodehashMismatch` on drift), run the structural batch guard (registered-strategy targets, asset `transferFrom` from the vault only), then delegatecall the batch, bubbling any failure's revert data. After success it SHALL reset every allowance the batch granted on `asset()` to zero, emit `GovernorBatchExecuted(governor, callCount)`, and enforce, in order: net asset outflow of the batch not exceeding `maxNetOutflow` (`MaxNetOutflowExceeded`), idle balance not below the queue reserve (`QueueReserveBreached`), and the idle-liquidity buffer (`BufferBreached`).
+`executeGovernorBatch(calls, callCaps, maxNetOutflow)` SHALL be callable only by the governor resolved live from the factory, only while unpaused, and non-reentrantly. Before executing, the vault SHALL verify the shared executor library's bytecode still matches the expected codehash, stamped at initialization and re-stamped by the factory-only `setExecutorImpl` re-point (`ExecutorCodehashMismatch` on drift), run the structural batch guard (registered-strategy targets; on the asset, the named selector set with `transferFrom` from the vault only), then delegatecall the library's `executeBatch(calls, asset(), callCaps)`, which meters each call's gross outflow against its cap when `callCaps` is non-empty, bubbling any failure's revert data. After success it SHALL reset every allowance the batch granted on `asset()` to zero, emit `GovernorBatchExecuted(governor, callCount)`, and enforce, in order: net asset outflow of the batch not exceeding `maxNetOutflow` (`MaxNetOutflowExceeded`), idle balance not below the queue reserve (`QueueReserveBreached`), and the idle-liquidity buffer (`BufferBreached`).
 
 #### Scenario: Non-governor caller rejected
 - **WHEN** any address other than the factory-resolved governor calls `executeGovernorBatch`
 - **THEN** the call reverts `NotGovernor`
 
 #### Scenario: Swapped executor bytecode rejected
-- **WHEN** the code at the executor implementation address no longer matches the initialization-time codehash
+- **WHEN** the code at the executor implementation address no longer matches the expected codehash
 - **THEN** the batch reverts `ExecutorCodehashMismatch` before any call executes
 
 #### Scenario: Net-outflow ceiling
@@ -88,8 +88,8 @@ For every governor-batch call whose `target` is `asset()`: calldata shorter than
 **Migration**: `DisallowedBatchTarget` and `isPrivilegedBatchTarget` are deleted from `ISyndicateVault`; a batch naming the queue, the vault or the governor now reverts `NotARegisteredStrategy(target)` at execute and at propose.
 
 ### Requirement: Value-moving selector guard on batches
-**Reason**: An allowlist over calldata the proposer writes is a list of what someone thought of; every audit round found a sibling selector (Permit2, DSToken, ERC1363, ERC4626) the enumeration missed. Non-asset targets are registered strategies, priced rather than recognised; on the asset only `transferFrom` from another account escapes the meter and the reset.
-**Migration**: `DisallowedTransferTarget`, `MalformedCall`, `AdapterVaultMismatch`, `TierRegistryUnresolved`, `DisallowedBatchCallee` and `UnrecognizedAssetSelector` are deleted from `ISyndicateVault`.
+**Reason**: An allowlist over calldata the proposer writes for arbitrary targets is a list of what someone thought of; every audit round found a sibling selector (Permit2, DSToken, ERC1363, ERC4626) the enumeration missed. Non-asset targets are registered strategies, priced rather than recognised; the asset admits only the named selector set in the asset rule above.
+**Migration**: `DisallowedTransferTarget`, `MalformedCall`, `AdapterVaultMismatch`, `TierRegistryUnresolved` and `DisallowedBatchCallee` are deleted from `ISyndicateVault`; `UnrecognizedAssetSelector` remains, raised by the asset rule.
 
 ### Requirement: transferFrom source guard on batches
 **Reason**: Restated as the asset rule above: `transferFrom` on `asset()` with `from != vault` is refused; source-bearing selectors on other tokens are not enumerated because other tokens are not batch targets unless registered.

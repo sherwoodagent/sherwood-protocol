@@ -21,8 +21,8 @@ through the settlement queue, so no flow can change the base mid-proposal.
 
 #### Scenario: Half the duration owes half the fee
 
-- **WHEN** one proposal deploys a given capital base for 30 days and an otherwise
-  identical proposal deploys the same base for 15 days
+- **WHEN** one proposal stays Executed for 30 days on a given fund and an otherwise
+  identical proposal stays Executed for 15 days on the same fund
 - **THEN** the second proposal's management fee is half the first's
 
 #### Scenario: Queued mid-proposal exits do not change the accrual base

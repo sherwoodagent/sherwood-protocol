@@ -8,7 +8,7 @@
 ## ADDED Requirements
 
 ### Requirement: WOOD is priced by the feed, capped by governance, with no fallback
-`woodPriceX8()` SHALL return `haircut(min(feedX8, woodUsdPriceX8))`, floored at 1, where `feedX8` is the wired WOOD/USD feed's answer normalised to 8 decimals. `woodUsdPriceX8` SHALL be an upper cap only and SHALL never be served as a price. `woodPriceX8()` SHALL revert `NoWoodPrice` when the cap is zero or when the feed is unset, codeless, reverts, answers `<= 0`, or is older than its configured `maxDelay`. There is no fallback price and no detail view.
+`woodPriceX8()` SHALL return `haircut(min(feedX8, woodUsdPriceX8))`, floored at 1, where `feedX8` is the wired WOOD/USD feed's answer normalised to 8 decimals. `woodUsdPriceX8` SHALL be an upper cap only and SHALL never be served as a price. `woodPriceX8()` SHALL revert `NoWoodPrice` when the cap is zero or when the feed is unset, codeless, reverts, returns malformed data, answers `<= 0`, normalises to zero, or is older than its configured `maxDelay`. There is no fallback price and no detail view.
 
 #### Scenario: Healthy feed below the cap
 - **WHEN** a WOOD feed is wired, fresh, positive, and below `woodUsdPriceX8`
@@ -37,21 +37,6 @@
 - **WHEN** the owner cuts the cap tenfold in one call
 - **THEN** the update is accepted at once, so bonds are not left over-valued during a crash
 
-### Requirement: Approval recording books a guardian-declared WOOD lock
-`recordApproval(governor, proposalId, guardian, lockWood)` SHALL be callable only by the wired guardian registry and SHALL be idempotent per (proposal, guardian). It SHALL lock `min(lockWood, free budget)` WOOD, where free budget is `kNumerator × guardianStake(guardian) − openExposure(guardian)`, all in WOOD. The lock SHALL be booked into the epoch bucket containing `executeBy + strategyDuration` (floored at the current epoch), recorded per guardian as the single figure that is at once the guardian's booking, pledge and slash base, appended to the ledger's own approver list, and announced via `ExposureRecorded`. There SHALL be no cohort cap: a proposal's locks MAY sum to more than its requirement.
-
-#### Scenario: Successful lock
-- **WHEN** the registry records an approval carrying a WOOD amount for a guardian with free budget on a priceable, in-horizon proposal, and the lock clears the slot floor
-- **THEN** `min(lockWood, free)` is added to the settlement bucket and recorded for the guardian, and the guardian joins the approver list with `ExposureRecorded` emitted
-
-#### Scenario: Unauthorized caller
-- **WHEN** any address other than the wired guardian registry calls `recordApproval` or `releaseApproval`
-- **THEN** the call reverts `NotGuardianRegistry`
-
-#### Scenario: Repeat recording is a no-op
-- **WHEN** `recordApproval` is called again for a (proposal, guardian) that already holds a non-zero lock
-- **THEN** nothing changes (vote-change round trips cannot double-lock)
-
 ## MODIFIED Requirements
 
 ### Requirement: WOOD haircut is bounded
@@ -77,7 +62,7 @@
 - **THEN** the vote reverts `NoWoodPrice`, while a block vote on the same review lands
 
 ### Requirement: Execute-time approve quorum
-`requireApproveQuorum(governor, proposalId, asset, requiredCoverage)` SHALL measure coverage and return `(coverageRaisedUsd, requiredCoverageUsd)`, where `requiredCoverageUsd = coverageUsd(asset, requiredCoverage)` and `coverageRaisedUsd` is the covering approvers' aggregate `Σ min(lock_i, recoverable stake_i) × woodPriceX8()`. The approver set SHALL come from the ledger's own list, never the registry's. It SHALL revert `InsufficientApproveCoverage` only when the approver set is empty or the aggregate is zero; a partial aggregate is returned. `NoWoodPrice` SHALL propagate. The governor SHALL invoke this check at execute for every proposal with a wired ledger and non-zero `requiredCoverage`, at every tier, and SHALL scale `effectiveMaxCapital` and every per-call cap by `coverageRaisedUsd / requiredCoverageUsd` when the aggregate falls short; zero-`requiredCoverage` proposals skip it.
+`requireApproveQuorum(governor, proposalId, asset, requiredCoverage)` SHALL measure coverage and return `(coverageRaisedUsd, requiredCoverageUsd)`, where `requiredCoverageUsd = coverageUsd(asset, requiredCoverage)` and `coverageRaisedUsd` is the covering approvers' running aggregate of `min(lock_i, slashableStakeAt(g_i, now)) × woodPriceX8()`, one price read for the cohort; it MAY stop summing once the aggregate reaches `requiredCoverageUsd`, so a fully covered proposal may report a partial sum. The approver set SHALL come from the ledger's own list, never the registry's. Zero committed approvers SHALL always revert `InsufficientApproveCoverage`, even at zero priced coverage; with approvers listed it SHALL revert `InsufficientApproveCoverage` only when the aggregate is zero and short of the requirement, and otherwise return the aggregate. `NoWoodPrice` and the asset feed's `FeedNotConfigured` / `StalePrice` SHALL propagate. The governor SHALL invoke this check at execute for every proposal with a wired ledger and non-zero `requiredCoverage`, at every tier, and SHALL scale `effectiveMaxCapital` and every per-call cap by `coverageRaisedUsd / requiredCoverageUsd` when the aggregate falls short; zero-`requiredCoverage` proposals skip it.
 
 #### Scenario: Aggregate coverage across a cohort
 - **WHEN** two guardians each lock WOOD worth $600k at execute on a $1M-coverage proposal

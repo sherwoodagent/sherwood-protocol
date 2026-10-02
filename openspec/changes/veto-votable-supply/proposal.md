@@ -1,5 +1,7 @@
 # Proposal: Record the veto electorate at propose
 
+> **Archive note (2026-10-02 sync).** The shipped formula reads past checkpoints, not live balances: `votableSupply = E(snapshotTimestamp)` with `E(t) = getPastTotalSupply(t) - getPastVotes(queue, t)`, lowered at each vote to `E(snapshotTimestamp + 1)`, and the threshold is floored at one vote. The archived spec text states that; the live-read formula below is history.
+
 ## Why
 
 The veto bar is a fraction of "the electorate", and the governor reconstructs

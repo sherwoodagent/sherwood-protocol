@@ -1,5 +1,7 @@
 # Bound the WOOD governance price with a DEX TWAP ceiling
 
+> **Archived 2026-10-02 without a spec sync (`--skip-specs`).** The intent shipped in a different shape: the market source is `src/pricing/WoodPoolFeed.sol` (a Chainlink-shaped feed taking the lower of a V2 and a V3 TWAP), wired through `ExposureLedger.setWoodFeed`, and `woodPriceX8()` is `haircut(min(feed, woodUsdPriceX8))` with no fallback and no `woodPriceDetail()`. There is no `WoodTwapOracle`. The normative text is guardian-coverage "WOOD is priced by the feed, capped by governance, with no fallback" and the deployment-docs WOOD-feed requirements. The delta under `specs/` is history and was never applied.
+
 > ## ⚠️ THE TWO-NUMBER MODEL BELOW IS SUPERSEDED
 >
 > See `design-revision-2026-08-01.md`. The split into a high emergency ceiling

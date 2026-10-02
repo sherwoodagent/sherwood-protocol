@@ -5,14 +5,16 @@
 ### Requirement: Fork tests run on demand, never on PR cadence
 
 The CI pipeline SHALL provide an opt-in job that runs the fork/integration
-test set excluded from the PR-cadence test job.
+suites (`test/integration/**`) that the PR-cadence test job excludes.
 
 #### Scenario: manual dispatch
 
 - **WHEN** a maintainer triggers the workflow via `workflow_dispatch`
-- **THEN** the job runs `forge test --match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}"`
+- **THEN** the job runs `forge test --fork-url "$BASE_RPC_URL" --match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}"`
   with RPC endpoints sourced from repository secrets
   (`BASE_RPC_URL`, `ROBINHOOD_RPC_URL`), and reports pass/fail normally.
+  (`test/WstETHMoonwellStrategy.t.sol` no longer exists; the glob keeps the
+  two path filters complementary.)
 
 #### Scenario: scheduled run
 
@@ -25,12 +27,13 @@ test set excluded from the PR-cadence test job.
 - **WHEN** a pull request is opened or updated
 - **THEN** the fork-test job does NOT run (PR checks stay deterministic).
 
-#### Scenario: missing secret
+#### Scenario: unset secret
 
-- **GIVEN** a required RPC secret is unset and no public fallback is defined
-  for that endpoint
-- **THEN** the job fails with an explicit message naming the missing secret —
-  it does not silently pass or skip.
+- **GIVEN** an RPC secret is unset
+- **THEN** the job uses that endpoint's public fallback
+  (`https://mainnet.base.org` for `BASE_RPC_URL`,
+  `https://rpc.mainnet.chain.robinhood.com` for `ROBINHOOD_RPC_URL`), so a
+  dispatch works before any secret is configured.
 
 ### Requirement: Coverage is measured and published as an artifact
 
@@ -42,7 +45,9 @@ blocking, but its status SHALL remain visible in the checks list.
 
 - **WHEN** a pull request is opened or updated
 - **THEN** a coverage job runs `forge coverage` under
-  `FOUNDRY_PROFILE=coverage` (the via_ir-off profile in `foundry.toml`),
+  `FOUNDRY_PROFILE=coverage` (the profile in `foundry.toml` that turns via_ir
+  off by default and keeps the contracts too large for legacy codegen on the
+  IR pipeline through per-file `compilation_restrictions`),
   excluding the same fork-test paths the main test job excludes, prints the
   summary table in the job log, and uploads the lcov report as a workflow
   artifact.

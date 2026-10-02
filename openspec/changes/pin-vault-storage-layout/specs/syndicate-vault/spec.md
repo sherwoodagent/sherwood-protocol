@@ -1,6 +1,6 @@
 # syndicate-vault (delta)
 
-<!-- Change: pin-vault-storage-layout (issue #148). Adds one requirement:
+<!-- Change: pin-vault-storage-layout. Adds one requirement:
      the vault's storage layout is pinned by a CI-enforced golden and a
      forge-test pin file. No behavioral requirement is modified. -->
 
@@ -20,7 +20,7 @@ proxy-upgraded contracts:
    storage. `check-layout-goldens.sh` SHALL compare the compiler-emitted
    layout of `SyndicateVault` against this golden via the same
    `check_contract` convention as the other pinned contracts, and CI SHALL
-   run it (the existing "Layout goldens" step).
+   run it (the `storage-layout` job runs the whole script).
 2. A raw-slot pin test (`test/VaultLayoutPins.t.sol`) following the structure
    and assertion style of the existing layout-pin tests: sentinel values
    written through real entry points (or, for fields writable only deep in

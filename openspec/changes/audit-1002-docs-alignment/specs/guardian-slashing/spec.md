@@ -7,12 +7,12 @@
 
 ### Requirement: The slash is the approver's lock, floored at minSlashBps
 
-An approver's slash SHALL be sized from its own WOOD lock on the proposal, not from the proposal's required coverage, the realized loss, or any pro-rata allocation of either. The slash basis is `min(stake at the anchor, live stake)`, anchored at `executedAt` for a verdict and at review open for a blocked review.
+An approver's slash SHALL be sized from its own WOOD lock on the proposal, not from the proposal's required coverage, the realized loss, or any pro-rata allocation of either. The slash basis is `min(max(liability, votable stake) one second before the anchor, live stake)`, anchored at `executedAt` for a verdict and at review open for a blocked review.
 
-- **Verdict.** `ExposureLedger.slashBpsFor` returns `ceil(lock × 10_000 / basis)`, saturating at 10_000 when the lock meets or exceeds the basis. `StakedWood.slashVerdict` clamps it into `[minSlashBps, maxSlashBps]`, so the burn is `max(min(lock, basis), minSlashBps × basis)`.
-- **Blocked review.** The registry multiplies the same lock rate by the block's severity (a quadratic ramp from `minSlashBps` at the block quorum to `maxSlashBps` at a 66.67% block), rounds up, and clamps the result into the `[minSlashBps, maxSlashBps]` envelope snapshotted at review open. An approver whose lock is its whole basis loses all of it only when the block reaches 66.67%.
+- **Verdict.** `ExposureLedger.slashBpsFor` returns `ceil(lock × 10_000 / basis)`, saturating at 10_000 when the lock meets or exceeds the basis. `StakedWood.slashVerdict` clamps it into `[minSlashBps, maxSlashBps]` and burns `basis × clampedRate / 10_000`, so the burn is `min(lock, basis)` rounded up to whole bps, raised to `minSlashBps × basis` and capped at `maxSlashBps × basis`.
+- **Blocked review.** The registry multiplies the same lock rate by the block's severity (a quadratic ramp from `minSlashBps` at the block quorum to `maxSlashBps` at a 66.67% block), rounds up, and clamps the result into the `[minSlashBps, maxSlashBps]` envelope snapshotted at review open. An approver whose lock is its whole basis loses all of it only when the severity reaches 10,000 bps, which takes a block of at least 66.67% with `maxSlashBps` at 10,000.
 
-A zero lock owes nothing and is skipped. `minSlashBps` is the single deterrence floor: a negligible lock still costs `minSlashBps` of the basis. Only an approver whose lock equals its basis can lose its whole bond on a verdict.
+A zero lock owes nothing and is skipped. `minSlashBps` is the single deterrence floor: a negligible lock still costs `minSlashBps` of the basis. Only an approver whose lock meets or exceeds its basis can lose its whole basis on a verdict, and only when `maxSlashBps` is 10,000.
 
 #### Scenario: Approver convicted
 - **WHEN** an approver with a 1,000,000 WOOD basis locked 50,000 WOOD and the proposal is convicted at `minSlashBps` = 10%
@@ -20,7 +20,7 @@ A zero lock owes nothing and is skipped. `minSlashBps` is the single deterrence 
 
 #### Scenario: Approver convicted with a whole-stake lock
 - **WHEN** an approver locked its entire basis and the proposal is convicted
-- **THEN** the rate is 10_000 bps and its whole basis is burned
+- **THEN** the rate is 10_000 bps and, with `maxSlashBps` at 10,000, its whole basis is burned
 
 #### Scenario: Proposal understates its required coverage
 - **WHEN** a proposal declares required coverage below the value actually extractable
@@ -58,11 +58,11 @@ Every slash path SHALL send its proceeds to the burn address. No slash path SHAL
 
 ### Requirement: Approver coverage is an eligibility floor, not an indemnity
 
-The exposure ledger SHALL measure, at execute, the covering approvers' locks at live value against the proposal's required coverage. An empty approver set or a zero aggregate SHALL revert `InsufficientApproveCoverage`; a partial aggregate SHALL scale the proposal's executable capital and every per-call cap by `raised / required`. This measurement SHALL NOT be interpreted or documented as a guarantee that the loss can be recovered.
+The exposure ledger SHALL measure, at execute, the covering approvers' locks, each valued at `min(lock, slashable stake) × woodPriceX8()`, against the proposal's required coverage. An empty approver set or a zero aggregate SHALL revert `InsufficientApproveCoverage`; a partial aggregate SHALL scale the proposal's executable capital and every per-call cap by `raised / required`. This measurement SHALL NOT be interpreted or documented as a guarantee that the loss can be recovered.
 
 #### Scenario: Approvers are under-bonded for the tier
 
-- **WHEN** the committed approvers' aggregate live coverage is a nonzero fraction of the required coverage at execution
+- **WHEN** the committed approvers' aggregate coverage is a nonzero fraction of the required coverage at execution
 - **THEN** execution proceeds with `effectiveMaxCapital = maxCapital × raised / required`
 
 #### Scenario: No covering approver
@@ -72,7 +72,7 @@ The exposure ledger SHALL measure, at execute, the covering approvers' locks at 
 
 #### Scenario: Approvers meet the floor
 
-- **WHEN** the committed approvers' aggregate live coverage meets the required coverage
+- **WHEN** the committed approvers' aggregate coverage meets the required coverage
 - **THEN** execution proceeds at full capital
 - **AND** no promise is made that a subsequent slash recovers the loss
 

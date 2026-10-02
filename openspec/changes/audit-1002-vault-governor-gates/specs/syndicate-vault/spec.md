@@ -40,14 +40,14 @@ The vault owner SHALL control deposit access via an open/closed mode flag (`setO
 - **THEN** owners can still `cancel` and recover their escrow
 
 ### Requirement: Pause and emergency behavior
-Owner-only `pause`/`unpause` SHALL freeze LP flow (`deposit`/`mint`/`withdraw`/`redeem`), queued-deposit claims (`settleDeposit`), strategy execution (`executeGovernorBatch`), and new queue requests (`requestRedeem`/`requestDeposit`), while leaving queue `cancel` available. Owner rescue paths — `rescueEth`, `rescueERC20`, `rescueERC721` — SHALL remain callable while paused but SHALL revert `RedemptionsLocked` whenever a proposal is active, so the owner cannot siphon strategy-transit assets mid-proposal. `rescueERC20` SHALL never move the vault asset (`CannotRescueAsset`) and SHALL send a non-asset token only to a strategy clone of this vault: the protocol strategy factory's `cloneTemplate(to)` SHALL be non-zero and `IStrategy(to).vault()` SHALL equal the vault, both read fail-closed (an unwired factory, a codeless recipient or one that does not answer reverts `RescueRecipientNotStrategy(to)`). Registration through the permissionless `registerStrategy` SHALL NOT qualify a recipient. A token sent there returns to the vault only through a later proposal's batch. The vault SHALL have no `receive`/`fallback` (raw ETH sent directly is rejected). `redemptionsLocked()` SHALL fail closed: a zero governor address SHALL revert `GovernorNotSet` rather than reporting unlocked.
+Owner-only `pause`/`unpause` SHALL freeze LP flow (`deposit`/`mint`/`withdraw`/`redeem`), queued-deposit claims (`settleDeposit`), strategy execution (`executeGovernorBatch`), and new queue requests (`requestRedeem`/`requestDeposit`), while leaving queue `cancel` available. Owner rescue paths — `rescueEth`, `rescueERC20`, `rescueERC721` — SHALL remain callable while paused but SHALL revert `RedemptionsLocked` whenever any proposal is open, Drafts included, so the owner cannot siphon strategy-transit assets mid-proposal. `rescueERC20` SHALL revert `ZeroAddress` for a zero recipient, SHALL never move the vault asset (`CannotRescueAsset`) and SHALL send a non-asset token only to a strategy clone of this vault: the protocol strategy factory's `cloneTemplate(to)` SHALL be non-zero and `IStrategy(to).vault()` SHALL equal the vault, both read fail-closed (an unwired factory, a codeless recipient or one that does not answer reverts `RescueRecipientNotStrategy(to)`). Registration through the permissionless `registerStrategy` SHALL NOT qualify a recipient. A token sent there returns to the vault only through a later proposal's batch. The vault SHALL have no `receive`/`fallback` (raw ETH sent directly is rejected). `redemptionsLocked()` and `depositsLocked()` SHALL fail closed: a zero governor address SHALL revert `GovernorNotSet` rather than reporting unlocked.
 
 #### Scenario: Pause freezes flow and execution
 - **WHEN** the owner pauses the vault
 - **THEN** deposits, withdrawals, queue requests, queued-deposit claims, and governor batches all revert until unpause
 
 #### Scenario: Rescue blocked mid-proposal
-- **WHEN** a proposal is active
+- **WHEN** any proposal is open, including a Draft
 - **THEN** all three rescue functions revert `RedemptionsLocked` regardless of pause state
 
 #### Scenario: Rescued token goes only to a clone of the vault
