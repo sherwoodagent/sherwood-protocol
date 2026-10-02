@@ -6,7 +6,42 @@ branch; file and function are cited so each can be checked.
 ## 1. Scope and branches
 
 - **Audit scope:** the `post-audit-v2` commit named in the handover to the auditor; this file is part
-  of that commit. In scope: the contracts under `src/`.
+  of that commit. The list below was decided by the owner on 2 October 2026.
+- **In scope** (paths under `src/`):
+  - `SyndicateGovernor.sol`
+  - `GovernorParameters.sol`
+  - `GovernorEmergency.sol`
+  - `ProposalLifecycle.sol`
+  - `GovernorBeacon.sol`
+  - `SyndicateVault.sol`
+  - `SyndicateVaultAdminLib.sol`
+  - `queue/VaultWithdrawalQueue.sol`
+  - `BatchExecutorLib.sol`
+  - `AssetCallRules.sol`
+  - `SyndicateFactory.sol`
+  - `ProtocolConfig.sol`
+  - `FeeConstants.sol`
+  - `GuardianRegistry.sol`
+  - `StakedWood.sol`
+  - `ExposureLedger.sol`
+  - `ProposerBondEscrow.sol`
+  - `ChallengeGame.sol`
+  - `TierRegistry.sol`
+  - `StrategyFactory.sol`
+  - `strategies/BaseStrategy.sol`
+  - `strategies/PortfolioStrategy.sol`
+  - `adapters/UniswapSwapAdapter.sol`
+  - `pricing/WoodPoolFeed.sol`
+- **Out of scope:**
+  - `src/strategies/ConcentratedLiquidityStrategy.sol` and `src/strategies/MorphoSupplyStrategy.sol`:
+    not enabled at launch. The Safe un-approves both templates with
+    `StrategyFactory.setTemplateApproval(template, false)` after the ceremony, and they are not
+    re-approved until audited separately.
+  - `src/vendor/**`: third-party code, checked against its upstream by
+    `script/check-vendor-provenance.sh`.
+  - `src/vesting/**`: standalone, not deployed by the ceremony.
+  - `src/interfaces/**`: declarations, provided as reference.
+  - `script/` and `test/`: provided as reference.
 - **`v1-deploy`** at `1d38a28701cf7949f1a420b1bedb4ce36447620c` is an ancestor of the scope. It is the
   code deployed first on Robinhood Chain (chain id 4663). Mainnet later moves to the audited code per
   [upgrade-v1-to-v2-runbook.md](upgrade-v1-to-v2-runbook.md): governors and the guardian registry are
@@ -162,7 +197,7 @@ be as short as 300 s (`MIN_TWAP_WINDOW`); both are proposer-chosen. The 10% pool
 Liquidity added in the same block passes the 10% cap; it is a measurement at one instant. `rerange` is
 permissionless within its trigger, `minInterval` (which may be 0) and `maxReranges` (≤ 20). LP mint
 and withdraw pass `amount0Min = amount1Min = 0` (`_mintPosition`, `_closePosition`). At settle the LP
-withdrawal (zero mins) runs before the TWAP check, which runs only if an `otherToken` balance remains.
+withdrawal (zero mins) runs before the TWAP check, which runs only if an `otherToken` balance remains. The strategy is out of the audit scope and disabled at launch: the Safe un-approves its template (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony.
 
 **5.7 Strategy registration proves shape only.** `StrategyFactory.registerStrategy` is permissionless
 and checks that `vault()`, `proposer()` and `executed()` answer. A batch may call the vault asset or
@@ -221,7 +256,7 @@ ledger prices within `PEG_TOLERANCE_BPS` (1%) of $1, at init and execute
 (`PortfolioStrategy._requireUsdPegged`). Morpho markets are admitted by market id
 (`TierRegistry.isMorphoMarketAllowed`, checked by `MorphoSupplyStrategy` and the CL strategy). A
 non-asset token in a vault can only be sent to a strategy clone of that vault
-(`SyndicateVault.rescueERC20`); one that no clone can sell stays in the vault, outside the share price.
+(`SyndicateVault.rescueERC20`); one that no clone can sell stays in the vault, outside the share price. The Morpho supply and CL strategies, the only consumers of the market-id allowlist, are out of the audit scope and disabled at launch: the Safe un-approves their templates after the ceremony.
 
 **5.13 Share transfers are not gated.** `SyndicateVault._update` applies no depositor check, so a
 whitelisted holder can transfer shares to any address while `depositsRestricted` is on.
@@ -260,7 +295,7 @@ and the settler chooses the block. Portfolio sells each token at the Chainlink v
 `maxSlippageBps` (0.5–10%), with feeds up to 26 h old, treating one asset unit as $1
 (`PortfolioStrategy._sellFloor`, `_feedPrice`). CL settle floors on pool spot within
 `maxTwapDeviationBps` ticks (≤ about 10.5%) of a TWAP that may be 300 s long (`_swapToAsset`). Each
-settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor.
+settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The CL strategy is out of the audit scope and disabled at launch: the Safe un-approves its template after the ceremony.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
 reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at
@@ -269,7 +304,7 @@ relief before settle, so interest
 can push it into Morpho liquidation; if proceeds do not cover the debt, settle reverts until someone
 transfers the asset to the clone (`_repayAndWithdraw`, `_deleverage`). The market-id allowlist is the
 only check. Before allowing an id the Safe must review collateral token, oracle, lltv, irm and
-liquidity.
+liquidity. Both strategies in this item are out of the audit scope and disabled at launch: the Safe un-approves their templates (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony, so no market id needs to be allowed at launch.
 
 **5.20 Portfolio after execute.** The ±1% peg is checked only at init and execute, never at
 `rebalanceDelta` or settle. A depeg loosens the floors, or makes them unreachable and settle revert.
@@ -278,7 +313,7 @@ parameters, each swap floored at feed − `maxSlippageBps`.
 
 **5.21 CL TWAP grief.** On a low-cardinality pool, anyone can make execute, rerange or settle revert
 `TwapUnavailable` with a few small swaps in separate blocks (`_tryTwapTick`). The permissionless remedy
-is `increaseObservationCardinalityNext` on the pool.
+is `increaseObservationCardinalityNext` on the pool. The strategy is out of the audit scope and disabled at launch: the Safe un-approves its template (`StrategyFactory.setTemplateApproval(template, false)`) after the ceremony.
 
 ## 6. Documents
 
@@ -303,14 +338,6 @@ Two change folders remain open under `openspec/changes/`, and neither describes 
 
 Known limits of the specs:
 
-- `## Purpose` paragraphs cannot be changed through an OpenSpec delta, and some still carry history
-  that the requirements beneath them supersede: `epoch-nav` (names `WoodTwapOracle`, the retired
-  `PriceRouter` and a fallback rule), `syndicate-vault` (Lane A), `dimensional-conventions`
-  ("insurance", reserved/allocated subtypes), `guardian-staking` ("age-weighted vote checkpoints"),
-  `guardian-coverage` ("USD exposure"), `challenge-game` (omits the convict-majority condition),
-  `guardian-fleet` and `fee-splits`. `portfolio-strategy`, `strategy-lifecycle` and
-  `continuous-integration` carry the tool's placeholder Purpose. Where a Purpose and a requirement
-  differ, the requirement governs.
 - `guardian-agent` and `guardian-fleet` specify an off-chain daemon that is not in this repository;
   only the on-chain facts they cite were checked.
 - `operator-docs` requires an onboarding checklist that `docs/adapter-onboarding-checklist.md` does
