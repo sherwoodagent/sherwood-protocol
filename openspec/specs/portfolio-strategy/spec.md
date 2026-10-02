@@ -1,7 +1,9 @@
 # portfolio-strategy Specification
 
 ## Purpose
-TBD - created by archiving change portfolio-swap-adapter-allowlist. Update Purpose after archive.
+
+Requirements on `PortfolioStrategy`, the basket template: which swap adapter and price feeds a clone may bind (counterparties in the vault's tier registry, checked fail-closed), when those bindings are re-checked, the slippage floor on every swap, and the rule that a clone runs only on a vault asset the ledger prices at $1. It covers these bindings, not the whole contract.
+
 ## Requirements
 ### Requirement: The proposer-supplied swap adapter must be an allowed counterparty in the vault's tier registry
 

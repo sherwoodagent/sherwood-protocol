@@ -2,7 +2,8 @@
 
 ## Purpose
 
-The dimensional vocabulary for the guardian / insurance layer, expressed as enforceable conventions. Every bug this vocabulary exists to expose has one shape: two quantities of identical Solidity type and precision where only one is correct, with no compiler check between them (`USD18{reserved}` vs `USD18{allocated}`; `WOOD{votable}` vs `WOOD{liability}`; the raw governance WOOD scalar vs the feed-composed price; vote weight vs raw stake). Where this spec disagrees with the source code, the code wins — this is a reading of the code, not a check the code is run against. Anchors are symbol names, never line numbers.
+The dimensional vocabulary for the guardian and coverage layer, expressed as conventions. Each bug it exists to expose has one shape: two quantities of identical Solidity type and precision where only one is correct, with no compiler check between them (`WOOD{votable}` vs `WOOD{liability}`; the raw governance WOOD cap vs the feed-composed price; aged vote weight vs raw stake). Where this spec disagrees with the source code, the code wins; anchors are symbol names, never line numbers.
+
 ## Requirements
 ### Requirement: Notation
 Dimensional annotations SHALL use the form `<PREFIX>{<unit>}` — e.g. `D18{USD}` is a USD amount carried as an integer scaled by `1e18`. A brace tag after a unit (`WOOD{liability}`) SHALL mark a SEMANTIC subtype: same integer scale, NOT interchangeable with sibling subtypes.

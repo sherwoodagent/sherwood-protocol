@@ -1,7 +1,9 @@
 # continuous-integration Specification
 
 ## Purpose
-TBD - created by archiving change ci-fork-and-coverage. Update Purpose after archive.
+
+Requirements on the repository's CI workflows outside the per-PR test job: the opt-in fork and integration test run (manual dispatch and a weekly schedule, never on pull requests) and the advisory coverage report published on every pull request.
+
 ## Requirements
 ### Requirement: Fork tests run on demand, never on PR cadence
 

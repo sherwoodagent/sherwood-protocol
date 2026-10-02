@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Defines the guardian-side economic core of Sherwood held in `StakedWood` (sWOOD), the sole WOOD custodian: guardian registration and staking, the unstake request/cancel/claim lifecycle, age-weighted vote checkpoints, the review-path and verdict-path slash mechanics with their severity envelope, the `authorizedSlasher` role, and the exposure-ledger/coverage-freezer gates on stake release.
+Defines the guardian-side economic core held in `StakedWood` (sWOOD), the sole WOOD custodian: guardian registration and staking, the unstake request/cancel/claim lifecycle, the raw stake checkpoints that guardian votes weigh (plus an age-weighted `getPastVotes` read that no contract consumes), the review-path and verdict-path slashes and their envelope, the `authorizedSlasher` role, and the exposure-ledger gates on stake release.
+
 ## Requirements
 ### Requirement: Guardian staking and registration
 `stakeAsGuardian(amount, agentId)` SHALL transfer `amount` WOOD from the caller into sWOOD custody and credit the caller's guardian stake. On a first stake (previous stake zero) it SHALL record `agentId` and anchor the stake-age clock (`stakedAt`) to the current timestamp; on top-ups the `agentId` argument SHALL be ignored. The resulting total stake MUST be at least `minGuardianStake`, or the call SHALL revert `InsufficientStake`. A guardian with a pending unstake request MUST NOT top up (revert `UnstakeAlreadyRequested`) — topping up while inactive would grow the quorum denominator without creating votable weight. Staking SHALL NOT be gated by any pause mechanism. Each stake SHALL push the guardian's votable-stake checkpoint, the guardian's liability checkpoint, and the global total-stake checkpoint, increase `totalGuardianStake`, and emit `GuardianStaked(guardian, amount, agentId)`.

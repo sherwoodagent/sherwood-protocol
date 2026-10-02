@@ -2,9 +2,8 @@
 
 ## Purpose
 
-Defines how the protocol establishes value: WOOD and vault-asset USD pricing in the `ExposureLedger` with explicit staleness and fallback rules, and the wall-clock epoch schedule that buckets guardian exposure. Per-epoch NAV *checkpointing* (design §3.4a, Plan F) is intentionally absent from v1: a protocol-wide ceiling on strategy duration bounds each commitment to a single covered window instead.
+Defines how `ExposureLedger` prices value for coverage: the WOOD/USD price (the wired feed, on Robinhood the ceremony's `WoodPoolFeed`, capped by the governance-set `woodUsdPriceX8` and haircut, reverting `NoWoodPrice` when unavailable), vault-asset USD pricing that fails closed on staleness, and the wall-clock epoch schedule that buckets guardian exposure. Strategy NAV is not in scope: vault NAV is float-only and defined by the `syndicate-vault` capability. Per-epoch NAV checkpointing does not exist; a protocol-wide ceiling on strategy duration bounds each commitment to one covered window instead.
 
-Strategy NAV is deliberately NOT in scope. The vault-side `PriceRouter` that once priced a live strategy was retired with Lane A (issue #54), so vault NAV is float-only and defined by the `syndicate-vault` capability, not here. What survives in this capability is guardian-bond and coverage pricing — `ExposureLedger` and `WoodTwapOracle` — which never referenced the router. V2 reintroduces strategy pricing together with the lane it serves.
 ## Requirements
 ### Requirement: Coverage epochs are a fixed wall-clock schedule
 

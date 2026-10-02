@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Dollar-denominated coverage accounting for the guardian economic-security model: guardians who approve a coverage-consuming proposal book USD exposure against their slashable WOOD bond, execution requires the covering approvers' aggregate bond to meet the proposal's required coverage, and a live challenge freezes the committed coverage so accused collateral cannot exit. Implemented by `src/ExposureLedger.sol` (interface `src/interfaces/IExposureLedger.sol`), consumed by `GuardianRegistry` (recording at approve-vote time), `SyndicateGovernor` (covered-TVL check at propose, approve quorum at execute, guardian fee at settlement), `ChallengeGame` (freeze), and `StakedWood` (exit gate).
+Coverage accounting for the guardian economic-security model, implemented by `ExposureLedger`: an approving guardian locks WOOD against its own stake, execution measures the approvers' locks valued in USD against the proposal's required coverage and scales the proposal down when they fall short, and a live challenge freezes the locks so accused collateral cannot exit. Consumed by `GuardianRegistry` (approve votes), `SyndicateGovernor` (covered-TVL and horizon checks at propose, quorum at execute, guardian fees at settlement), `ChallengeGame` (freeze and slash rates) and `StakedWood` (exit gate).
+
 ## Requirements
 ### Requirement: Slashable bond valuation
 The ledger SHALL value a guardian's slashable bond in USD (8-decimal price) as `ownStake(g) × woodPriceX8() / 1e8`. Only the guardian's own stake counts — there is no delegated-inbound term. The stake basis SHALL depend on the read:

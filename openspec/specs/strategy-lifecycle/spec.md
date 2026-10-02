@@ -1,7 +1,9 @@
 # strategy-lifecycle Specification
 
 ## Purpose
-TBD - created by archiving change fix-strategy-clone-ratchet. Update Purpose after archive.
+
+Requirements on `BaseStrategy` that every strategy template inherits: a clone's one-shot execute is bound to the proposal that declared it, and its settle stays open so a clone orphaned by an emergency settlement can still return its funds. It covers these lifecycle rules, not each template.
+
 ## Requirements
 ### Requirement: Strategy clone execution is bound to the clone's owning proposal
 

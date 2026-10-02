@@ -1,7 +1,9 @@
 # Syndicate Vault Specification
 
 ## Purpose
-Define the observable behavior of the SyndicateVault: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault that custodies a syndicate's assets, prices shares against float-only NAV, routes all mid-proposal LP flow through a per-vault async request queue (Lane B, the only mid-proposal path), enforces an instant-withdrawal liquidity buffer and queue-reserve seniority against governor strategy batches, and confines all privileged surfaces to owner, factory, governor, and queue roles. Instant entry and exit exist only outside a proposal; Lane A (mid-proposal instant flow at router-priced live NAV) was retired from v1 with issue #54.
+
+Defines the observable behavior of `SyndicateVault`: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault (upgradeable only through its factory) that custodies a syndicate's assets and prices shares against float-only NAV. Instant deposit and exit exist only while no proposal is open; from Draft creation until a proposal ends, all LP flow goes through the vault's async request queue. Governor strategy batches are bounded by structural call rules, per-call caps, a net-outflow budget, queue-reserve seniority and an idle-liquidity buffer, and every privileged surface is confined to the owner, factory, governor and queue roles.
+
 ## Requirements
 ### Requirement: ERC-4626 share accounting and NAV
 

@@ -2,10 +2,8 @@
 
 ## Purpose
 
-Defines how the two depositor-facing fee numbers are divided among the parties that
-earn them — agent, protocol, guardian network, and fund owner — and guarantees that a
-settlement pays the split and rate ceilings that were in force when the proposal was
-made, not whatever governance has since changed them to.
+Defines how the two depositor-facing fees are divided among the parties that earn them — agent, protocol, guardian network and fund owner. A settlement pays the splits recorded when the proposal was made, at a performance-fee rate no higher than the per-vault ceiling in force at propose or at settlement, whichever is lower.
+
 ## Requirements
 ### Requirement: Management split is a three-way division summing to full basis points
 
