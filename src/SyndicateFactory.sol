@@ -104,8 +104,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     address public beacon;
 
     /// @notice ProtocolConfig — global fee parameters (protocol/guardian fee bps
-    ///         + recipients). Each governor reads it at propose time to snapshot
-    ///         the fees onto the proposal. Owner-settable via `setProtocolConfig`.
+    ///         + recipients). Each new governor is initialised with this address
+    ///         and reads it at propose time. `setProtocolConfig` does not reach
+    ///         existing governors.
     address public protocolConfig;
 
     /// @notice Per-vault governor proxy address, deployed at `createSyndicate`.

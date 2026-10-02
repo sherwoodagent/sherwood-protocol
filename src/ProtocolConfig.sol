@@ -8,10 +8,9 @@ import {FeeConstants} from "./FeeConstants.sol";
 /// @title ProtocolConfig
 /// @notice Protocol-level fee params shared by all per-vault governors. Read
 ///         ONLY at propose time and snapshotted into `StrategyProposal`; never
-///         read live at settle. Plain (non-upgradeable) Ownable2Step. If it ever
-///         needs replacement, governors accept a new address via
-///         `setProtocolConfig(address)` (factory-only); snapshotting means no
-///         in-flight proposal is affected.
+///         read live at settle. Plain (non-upgradeable) Ownable2Step. A
+///         replacement reaches only governors created afterwards: no factory
+///         function calls a live governor's factory-only `setProtocolConfig`.
 contract ProtocolConfig is Ownable2Step, IProtocolConfig {
     /// @notice Floor on the protocol-wide strategy-duration ceiling. Guards the
     ///         degenerate setting: a ceiling below the shortest usable strategy
@@ -56,11 +55,10 @@ contract ProtocolConfig is Ownable2Step, IProtocolConfig {
     MgmtSplit private _mgmtSplit;
     PerfSplit private _perfSplit;
 
-    /// @dev Seeded with the launch splits so a config is valid from birth. This
-    ///      contract is not upgradeable, so adopting the two-number fee model
-    ///      means deploying a fresh one and re-pointing governors via
-    ///      `setProtocolConfig` — seeding at that moment removes the "operator
-    ///      forgot to set the split" failure class entirely. Combined with the
+    /// @dev Seeded with the launch splits so a config is valid from birth, which
+    ///      removes the "operator forgot to set the split" failure class. A
+    ///      replacement config reaches only governors created afterwards
+    ///      (see the contract natspec). Combined with the
     ///      setters' sum check, an invalid split is unreachable rather than
     ///      merely discouraged. Governance can still change either at will.
     constructor(address owner_) Ownable(owner_) {

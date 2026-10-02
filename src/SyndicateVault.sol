@@ -112,7 +112,7 @@ contract SyndicateVault is
 
     // ── Governor / Factory storage ──
 
-    /// @notice Vault owner's management fee on strategy profits (basis points, set at init)
+    /// @notice Annual management fee on the whole fund while a proposal is Executed (basis points, set at init)
     uint256 private _managementFeeBps;
 
     /// @notice Factory that deployed this vault (controls upgrades, provides governor address)
@@ -150,9 +150,9 @@ contract SyndicateVault is
     /// @notice Integral of fund assets over time for the live proposal, in
     ///         asset-seconds. The management fee is this figure annualized:
     ///         `fee = assetSeconds * rate / (BPS_DENOMINATOR * 365 days)`.
-    /// @dev Exact under arbitrary mid-proposal flows because the integral is
-    ///      piecewise-constant: every base-changing event closes off the
-    ///      elapsed interval at the base that applied during it, then restamps.
+    /// @dev The base is the whole fund's `totalAssets()`, stamped once by
+    ///      `startManagementAccrual` at execute and not restamped before settle:
+    ///      nothing mid-proposal changes it, so the integral is base x elapsed.
     uint256 private _mgmtAssetSeconds;
 
     /// @notice Fund assets in force since `_mgmtLastUpdate` — the height of the
@@ -950,8 +950,8 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
-    ///         price. The queue pushes the escrowed assets to the vault
+    /// @notice Queue-only: mint `shares` to `to`. The queue prices them live with
+    ///         `previewDeposit` and pushes the escrowed assets to the vault
     ///         immediately before this call.
     /// @dev No `nonReentrant`: the only state-mutating call here is the mint.
     ///      `_initHighWaterMarkIfUnset` reads `pricePerShare()`, which makes only
