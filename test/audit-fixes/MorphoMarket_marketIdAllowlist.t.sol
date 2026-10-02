@@ -215,4 +215,102 @@ contract CLStrategy_marketIdAllowlistTest is CLFixture {
         _settle();
         assertFalse(strategy.executed(), "settled");
     }
+
+    /// @notice A market de-listed after execute blocks rerange; settle still succeeds.
+    function test_rerange_revertsWhenMarketDelisted_settleStillSucceeds() public {
+        _execute();
+        tierRegistry.setMarketDenied(Id.unwrap(mp.id()), true);
+        pool.setTicks(850, 850);
+        vm.warp(vm.getBlockTimestamp() + 2 hours);
+        vm.prank(keeper);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.MorphoMarketNotAllowed.selector, mp.id(), address(tierRegistry)
+            )
+        );
+        strategy.rerange();
+        _settle();
+        assertFalse(strategy.executed(), "settled");
+    }
+
+    /// @notice A registry without `isMorphoMarketAllowed` fails closed at CL init.
+    function test_init_failsClosedWhenRegistryCannotAnswer() public {
+        CounterpartyOnlyRegistry old = new CounterpartyOnlyRegistry();
+        status.setTierRegistry(address(old));
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_defaultParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(ConcentratedLiquidityStrategy.MorphoMarketNotAllowed.selector, mp.id(), address(old))
+        );
+        s.initialize(v, proposer, data);
+    }
+}
+
+/// @notice FP-02 review: the CL Morpho leg against a real, default-deny TierRegistry.
+contract CLStrategy_marketIdRealRegistryTest is CLFixture {
+    using MarketParamsLib for MarketParams;
+
+    TierRegistry realRegistry;
+
+    function setUp() public override {
+        super.setUp();
+        realRegistry = new TierRegistry(address(this));
+        realRegistry.setCounterpartyAllowed(address(adapter), true);
+        realRegistry.setCounterpartyAllowed(address(posm), true);
+        realRegistry.setCounterpartyAllowed(address(morpho), true);
+        realRegistry.setCounterpartyAllowed(factory, true);
+        realRegistry.setCounterpartyAllowed(address(nvda), true);
+        // The old per-address grants: every part of the market is individually acceptable.
+        realRegistry.setCounterpartyAllowed(address(oracle), true);
+        realRegistry.setCounterpartyAllowed(address(spUsdg), true);
+        status.setTierRegistry(address(realRegistry));
+    }
+
+    function _expectRefused(MarketParams memory m) internal {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.marketParams = m;
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(p);
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.MorphoMarketNotAllowed.selector, m.id(), address(realRegistry)
+            )
+        );
+        s.initialize(v, proposer, data);
+    }
+
+    /// @notice The canonical market, never allowlisted, is refused at init.
+    function test_init_unlistedMarketRefused() public {
+        _expectRefused(mp);
+    }
+
+    /// @notice Acceptable parts with another irm form another id, refused though the canonical id is allowlisted.
+    function test_init_nonCanonicalIrmRefused() public {
+        realRegistry.setMorphoMarketAllowed(Id.unwrap(mp.id()), true);
+        MarketParams memory m = mp;
+        m.irm = address(new MockIrm());
+        morpho.createMarket(m);
+        _fundMarket(m);
+        _expectRefused(m);
+    }
+
+    /// @notice Acceptable parts at another lltv form another id, refused though the canonical id is allowlisted.
+    function test_init_nonCanonicalLltvRefused() public {
+        realRegistry.setMorphoMarketAllowed(Id.unwrap(mp.id()), true);
+        MarketParams memory m = mp;
+        m.lltv = 0.86e18;
+        morpho.createMarket(m);
+        _fundMarket(m);
+        _expectRefused(m);
+    }
+
+    /// @notice The same clone initialises once that exact id is allowlisted.
+    function test_init_allowlistedMarketInitialises() public {
+        _expectRefused(mp);
+        realRegistry.setMorphoMarketAllowed(Id.unwrap(mp.id()), true);
+        ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
+        assertEq(Id.unwrap(s.marketId()), Id.unwrap(mp.id()));
+    }
 }

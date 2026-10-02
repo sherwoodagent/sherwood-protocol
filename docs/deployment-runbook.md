@@ -212,8 +212,18 @@ Not one-time steps. Nothing below is enforced on-chain.
   address (no interest ever accrues and the supply can be frozen), if its
   oracle does not price its collateral in its loan token, if its collateral
   equals its loan token, or if its `lltv` is not the one the market was vetted
-  at. For CL the collateral must also be the vault asset or its ERC-4626
-  wrapper (the strategy enforces this on its own).
+  at. The loan == collateral refusal is for the supply strategy: there the
+  vault is the lender, and a market whose borrowers post the loan token itself
+  can let them borrow more than they post or freeze the supply. For CL the loan
+  token is the vault asset and the code accepts collateral that is the vault
+  asset or its ERC-4626 wrapper; allowlist only the wrapper market (spUSDG for
+  USDG), the market the vault actually borrows from, and do not grant a
+  loan == collateral market for CL either, since one id serves both strategies.
+
+  Allowlisting a CL market also means trusting its collateral wrapper: at
+  execute the clone approves the vault asset to that wrapper and deposits into
+  it, and the separate per-address grant that used to vet the wrapper no longer
+  exists, so vet the wrapper's code before granting the market.
 
   The known 4663 USDG market needs one Safe call:
   `TierRegistry.setMorphoMarketAllowed(0x0309c02dabf0be02682af1a2bde9a457f4df0f0b6bc889cde3f948e5315e4114, true)`.
