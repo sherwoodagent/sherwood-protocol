@@ -175,7 +175,8 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
-  `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;
+  `min(needUsd, Σ min(lock_i, slash basis_i at executedAt) × woodPriceX8())`, the basis being
+  `StakedWood.slashableStakeAt` (`ExposureLedger._liabilityUsd`, `_slashBasis`);
   `unsharedLiabilityUsd` returns the same figure, since with no cohort cap there
   is no distinct shared basis. `ChallengeGame.file` sizes the challenger bond
   off it, so a cohort cannot lock surplus WOOD to price challengers out. The cap

@@ -1,3 +1,5 @@
+> **`v1-deploy` history.** This change was written against the v1 game (`disputeTimeoutAtFiling`, `MAX_DISPUTE_TIMEOUT`, `rule`, `autoSlashDelay`, `_refundAll`, `TokenCourt`). On `post-audit-v2` the freeze end is `filedAt + voteWindowAtFiling` (`ChallengeGame.file` → `freezeCoverage`) and the spec delta says so; the v1 mechanics below are history.
+
 ## 1. Reproduce first
 
 - [x] 1.1 Write the SHE-213 reproduction against the lock model: guardian locks on A, A is frozen, warp past A's original bucket expiry, guardian approves B — assert (pre-fix) that B's lock overlaps A's. This is the red test; it must fail before §2 and pass after. (`test_freezeCoverage_frozenLockCannotBeRelockedAfterItsBucketAgesOut`; red confirmed: `openExposure` read 0 while frozen.)

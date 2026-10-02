@@ -41,8 +41,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         loss — that stays whatever voters approved, up to 10_000.
     /// @dev    Why a cap rather than rejecting `maxDrawdownBps == 10_000` at
     ///         propose: rejecting it would make the P&L envelope answer for the
-    ///         stamp's safety, which is the exact conflation this finding is
-    ///         about, and it would invalidate `GovEnvelope.permissive` — the
+    ///         stamp's safety, which is exactly the conflation to avoid, and it would invalidate `GovEnvelope.permissive` — the
     ///         fixture nearly every suite builds on. Capping keeps the two
     ///         questions separate: declare any loss you like, but the price a
     ///         permissionless caller may FREEZE is bounded regardless.
@@ -240,7 +239,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `script/syndicate-governor-layout.golden.json`.
     uint256[26] private __gap;
 
-    /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
+    /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 1h, `RobinhoodParams`).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
     /// @dev Floors are impl-time immutables (bytecode, not storage) forwarded to
     ///      `GovernorParameters`; a testnet impl may deploy lower floors and be
@@ -339,7 +338,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Cancel stamps the deadline too, so cancel+propose cycling cannot keep redemptions locked.
         if (block.timestamp < _cooldownEndsAt) revert CooldownNotElapsed();
         if (!_isRegisteredStrategy(strategy)) revert StrategyNotRegistered(strategy);
-        // A lowered protocol ceiling does not rewrite stored maxima, so it binds here too (FP-13).
+        // A lowered protocol ceiling does not rewrite stored maxima, so it binds here too.
         if (strategyDuration > _params.maxStrategyDuration || strategyDuration > _protocolMaxStrategyDuration()) {
             revert StrategyDurationTooLong();
         }

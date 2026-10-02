@@ -3,15 +3,15 @@
 ### Requirement: The challenge vote — the quorum's denominator and what the admission guard checks
 `file` SHALL pin the challenge's denominator in the same call, as `totalStakeAtFiling = stakedWood.getPastTotalVotes(block.timestamp - 1)` less, for every accused approver, `max(0, getPastStake(accused_i, block.timestamp - 1) - min(getPastStake(accused_i, executedAt - 1), getPastStake(accused_i, p.snapshotTimestamp)))` — the TOTAL staked WOOD, the accused cohort included, but each accused counted at no more than its stake at the approve snapshot (`p.snapshotTimestamp`, the instant its approve weight was read) and at execution. The accused lose their ballot, not their weight in the denominator: subtracting them would make a conviction cheaper the wider the cohort that approved. A top-up after approving SHALL NOT count: the verdict slash is sized by the booked lock, so stake added after the approve snapshot risks nothing, and counting it would let an accused approver stake past `1 - quorum` of the total and have every filing refused. The stamp SHALL be one second before the filing, never the filing instant: an sWOOD checkpoint is keyed on the second a stake changes and a same-key push overwrites. `file` SHALL additionally compute `votable`, that total less `stakedWood.getPastStake(accused_i, block.timestamp - 1)` for every accused approver, saturating at zero, pin it as `votableAtFiling`, and SHALL revert `NoVotableStake` when `votable * 10_000 < challengeQuorumBps * totalStake`, reading the same `challengeQuorumBps` the challenge pins.
 
-What that guard checks is that the stake NOT held by the accused at `filedAt - 1` is at least `challengeQuorumBps` of the pinned total. It does NOT check that the stake able to vote can reach the quorum. Both `votable` and `totalStakeAtFiling` include stake that carries no ballot on this challenge: stake added after the proposal's `snapshotAt` (a ballot is capped at the voter's stake at `snapshotAt`, see "Casting a ballot"), and the stake of the challenger, the proposer and each co-proposer, which `voteOnChallenge` refuses. Such stake raises the bar the eligible electorate must clear and can never help clear it, so a filing MAY be admitted that no set of ballots can win; it then fails at the window's close and the challenger pays the forfeit burn. The guard refuses only filings where the accused cohort alone leaves the rest of the stake below the quorum. The same inflated `votableAtFiling` is the early-settle bar in `resolve`. `file` SHALL also pin the proposal's `proposer` and `snapshotAt`, record each accused approver in an O(1) membership map for the vote's own gate, written in the loop it already runs over the cohort, record each of the proposal's `getCoProposers` entries in a second such map, and SHALL revert `ZeroAddress` when `stakedWood` is unwired.
+What that guard checks is that the stake NOT held by the accused at `filedAt - 1` is at least `challengeQuorumBps` of the pinned total. It does NOT check that the stake able to vote can reach the quorum. Both `votable` and `totalStakeAtFiling` include stake that carries no ballot on this challenge: stake added after the proposal's `snapshotAt` (a ballot is capped at the voter's stake at `snapshotAt`, see "Casting a ballot"), the stake of the challenger, the proposer and each co-proposer, which `voteOnChallenge` refuses, and the stake of any guardian that requests unstake after the filing (`voteOnChallenge` requires `isActiveGuardian`). Such stake raises the bar the eligible electorate must clear and can never help clear it, so a filing MAY be admitted that no set of ballots can win; it then fails at the window's close and the challenger pays the forfeit burn. The guard refuses only filings where the accused cohort alone leaves the rest of the stake below the quorum. The same inflated `votableAtFiling` is the early-settle bar in `resolve`. `file` SHALL also pin the proposal's `proposer` and `snapshotAt`, record each accused approver in an O(1) membership map for the vote's own gate, written in the loop it already runs over the cohort, record each of the proposal's `getCoProposers` entries in a second such map, and SHALL revert `ZeroAddress` when `stakedWood` is unwired.
 
 #### Scenario: Electorate measured one second before the filing
 - **WHEN** a guardian stakes WOOD in the same block as a filing
 - **THEN** that stake is in neither `totalStakeAtFiling` nor any ballot weight — both read `filedAt - 1`
 
 #### Scenario: The accused stay in the denominator
-- **WHEN** the accused cohort holds most of the staked WOOD and one outsider holding all of the remainder votes convict
-- **THEN** the quorum is measured against the total, so that outsider alone does not reach it even though it is the whole of the stake that may vote
+- **WHEN** the accused hold 5/9 of the staked WOOD, two outsiders hold the rest equally, and only one of them votes convict
+- **THEN** the quorum is measured against the total, so that ballot (2/9) does not reach it although it is half of the non-accused stake
 
 #### Scenario: An accused top-up after execution does not raise the bar
 - **WHEN** an accused approver more than triples its stake after the proposal executes, enough that its filing-time stake would put the rest of the network below the quorum
@@ -34,6 +34,34 @@ What that guard checks is that the stake NOT held by the accused at `filedAt - 1
 - **THEN** `file` is admitted, the proposer's ballot reverts `ProposerCannotVote`, and no set of eligible ballots can reach the quorum
 
 ## MODIFIED Requirements
+
+### Requirement: Resolution — a decided conviction settles early, the window's close decides the rest
+`resolve(challengeId)` SHALL be permissionless and choose nothing; the outcome is fixed by the tallies and the clock. Let QUORUM be `totalStakeAtFiling != 0 && convictWeight * 10_000 >= quorumBpsAtFiling * totalStakeAtFiling`. On a `Filed` challenge `resolve` SHALL settle immediately when QUORUM holds AND `2 * convictWeight > votableAtFiling` — the convict side exceeds every acquit ballot still castable (`votableAtFiling - convictWeight`), so the verdict is mathematically decided. Quorum alone is not enough before the window closes: quorum is final once reached but the majority is not, and a bloc holding the quorum could otherwise file, vote and settle in one block before the rest of the electorate has a ballot. Otherwise `resolve` SHALL revert `DelayNotElapsed` before `filedAt + voteWindowAtFiling`; at or after it, it SHALL settle when QUORUM holds AND `convictWeight > acquitWeight`, and fail the challenge otherwise. There is no early-fail path. From any terminal status it SHALL revert `WrongStatus`. `filedAt + voteWindowAtFiling` is therefore the hard end of the accusation: it is the same value `file` books on the ledger as the freeze deadline, and no ballot can be cast from that instant on. Settling, by contrast, has no deadline of its own: `resolve` is permissionless and the challenger, whose bond returns only on settlement, is the party paid to call it, and until the last live challenge terminates the ledger freeze keeps the approvers' locks unreleasable and unretirable (`releaseApproval` and `retireApproval` revert `CoverageFrozen`) and their unstake claims blocked; `filedAt + voteWindow` only sets the bucket the frozen lock counts in.
+
+#### Scenario: A decided conviction settles without waiting for the window
+- **WHEN** on day two of a seven-day window convict weight crosses `quorumBpsAtFiling` of `totalStakeAtFiling` and exceeds half of `votableAtFiling`
+- **THEN** `resolve` executes the conviction path at once and a later `resolve` reverts `WrongStatus`
+
+#### Scenario: A quorum bloc cannot settle before the rest of the electorate votes
+- **WHEN** a freshly staked bloc holding exactly the quorum, but less than half of `votableAtFiling`, votes convict in the filing block
+- **THEN** `resolve` reverts `DelayNotElapsed`; the remaining guardians can still vote, and if they acquit with more weight the challenge fails at the window's close
+
+#### Scenario: Quorum and a convict majority settle at the window's close
+- **WHEN** the window closes with convict weight at the quorum and above the acquit weight, but never past half of `votableAtFiling`
+- **THEN** `resolve` settles the challenge
+
+#### Scenario: A quorum outweighed by the acquit side convicts nobody
+- **WHEN** convict weight is past the quorum but below the acquit weight
+- **THEN** `resolve` reverts `DelayNotElapsed` while the window is open and fails the challenge once it closes
+
+#### Scenario: Silent window fails the challenge
+- **WHEN** the window closes with no ballot cast either way
+- **THEN** `resolve` fails the challenge: nothing is slashed, coverage is unfrozen, `forfeitBurnBpsAtFiling` of the bond is burned and the remainder returns to the challenger
+
+#### Scenario: Resolve before the window, short of quorum
+- **WHEN** `resolve` is called with convict weight below the bar and the window still open
+- **THEN** it reverts `DelayNotElapsed` — the cohort still has time to convict
+
 
 ### Requirement: Filing a bonded challenge
 `ChallengeGame.file(governor, proposalId, predicate, adapterTarget, adapterSelector, evidenceURI)` SHALL be permissionless and SHALL accept a filing only against an EXECUTED proposal (`executedAt != 0`, read from the governor; otherwise revert `NotExecuted`), and only while `block.timestamp <= max(executedAt + strategyDuration + challengeWindow, challengeableUntil[reviewKey])` (otherwise revert `WindowClosed`), where `executedAt` and `strategyDuration` come from the same `getProposal` read and `challengeWindow` is the game's live value. The deadline MUST be recomputed as a max against that live baseline on every call, never read as a stored absolute, so the extension can only ever raise it. The cited predicate (one of `OutOfAdapterOutflow`, `OraclePriceDeviation`, `ProposerLinkedOutflow`, `RogueAllowance`, `DrawdownBreach`) SHALL be a classification label only — recorded and emitted in `ChallengeFiled` but branching no logic; there is no on-chain predicate verification. `evidenceURI` SHALL be carried unindexed in `ChallengeFiled` as the off-chain evidence anchor. The review key SHALL be `keccak256(abi.encode(governor, proposalId))`, matching the ledger and registry derivation.
@@ -194,5 +222,5 @@ Gate 3 SHALL be skipped entirely when `coverageFreezer` is the zero address: wit
 ## REMOVED Requirements
 
 ### Requirement: The challenge vote — the quorum's denominator is the whole staked set
-**Reason**: It said the `NoVotableStake` guard refuses any filing no conviction could clear. The guard checks only the stake outside the accused cohort; stake added after `snapshotAt` and the stake of the challenger, proposer and co-proposers sit in the base and cannot vote.
+**Reason**: It said the `NoVotableStake` guard refuses any filing no conviction could clear. The guard checks only the stake outside the accused cohort; stake added after `snapshotAt`, the stake of the challenger, proposer and co-proposers, and the stake of guardians that request unstake after the filing sit in the base and cannot vote.
 **Migration**: Replaced by "The challenge vote — the quorum's denominator and what the admission guard checks".

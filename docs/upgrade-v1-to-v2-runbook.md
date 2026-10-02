@@ -1,7 +1,7 @@
 # Upgrade runbook — live `v1-deploy` → `post-audit-v2`
 
 Operator procedure for upgrading a LIVE `v1-deploy` deployment on Robinhood (4663)
-to `post-audit-v2`. Source: audit of 2026-10-01, findings V2-01, V2-02, V2-07.
+to `post-audit-v2`. Source: the internal review of 2026-10-01.
 The guards this runbook relies on are pinned by
 `test/audit-fixes/Upgrade_keepLedgerRotateGame.t.sol`.
 
@@ -26,7 +26,7 @@ is the v2 `ChallengeGame` deployed in step 1.
 | `TierRegistry` | Keep (default) or redeploy (optional, §5) | Every function v2 calls on it exists on the v1 registry |
 | `TokenCourt` | Retire after the drain | v2 has no court; keep it running until every old challenge is ruled or timed out |
 
-**Why the ledger and escrow are kept (V2-01).** A fresh `ExposureLedger` knows none
+**Why the ledger and escrow are kept.** A fresh `ExposureLedger` knows none
 of the live approver locks, freezes or pins. Re-pointing staking at it lets the
 approvers of still-challengeable executed proposals claim their unstake, and those
 proposals become unchallengeable (`file` reverts `NothingToFreeze`) — proven by
@@ -85,7 +85,7 @@ the new game after step 1b). `TierRegistry`, `ExposureLedger`, `ChallengeGame` a
 | 2 | Upgrade every governor | Safe | `GovernorBeacon.upgradeTo(govImplV2)` | `govImplV2.MIN_VOTING_PERIOD()` / `MIN_COOLDOWN_PERIOD()` equal the live implementation's |
 | 3 | Upgrade the registry | Safe | `GuardianRegistry.upgradeToAndCall(regImplV2, "")` | `regImplV2.minReviewPeriod()` equals the live implementation's |
 | 4 | Drain the old game | anyone / court | `oldGame.resolve(id)` once due; disputed challenges: `TokenCourt.refer` → `vote` → `finalize` (which calls `oldGame.rule`). Keep the old game as `swood.authorizedSlasher` and `tierRegistry.authorizedDemoter`, and keep `TokenCourt` wired, until done | See §4 for the choice about old-game filings |
-| 5 | Rotate roles — **one Safe transaction through `MultiSendCallOnly` (so `msg.sender` is the Safe for every call), in this order** | Safe | 1. `swood.setAuthorizedSlasher(newGame)` 2. `newGame.setStakedWood(swood)` 3. `tierRegistry.setAuthorizedDemoter(newGame)` 4. `ledger.setCoverageFreezer(newGame)` | (a) `ledger.frozenCoverageCount() == 0`; (b) for every executed proposal: `oldGame.liveChallengeCountOf(governor, proposalId) == 0`; (c) for every executed proposal: `oldGame.challengeableUntil(keccak256(abi.encode(governor, proposalId))) < block.timestamp` (V2-02). Only (a) is enforced on-chain, so once (a)–(c) hold: `oldGame.setFilingsPaused(true)`, re-check (a)–(c), then execute the batch |
+| 5 | Rotate roles — **one Safe transaction through `MultiSendCallOnly` (so `msg.sender` is the Safe for every call), in this order** | Safe | 1. `swood.setAuthorizedSlasher(newGame)` 2. `newGame.setStakedWood(swood)` 3. `tierRegistry.setAuthorizedDemoter(newGame)` 4. `ledger.setCoverageFreezer(newGame)` | (a) `ledger.frozenCoverageCount() == 0`; (b) for every executed proposal: `oldGame.liveChallengeCountOf(governor, proposalId) == 0`; (c) for every executed proposal: `oldGame.challengeableUntil(keccak256(abi.encode(governor, proposalId))) < block.timestamp`. Only (a) is enforced on-chain, so once (a)–(c) hold: `oldGame.setFilingsPaused(true)`, re-check (a)–(c), then execute the batch |
 | 6 | Optional: redeploy `TierRegistry` | Safe | §5 | Step 5 done |
 | 7 | Re-point governors — ONLY if a factory pointer changed (e.g. §5) | Safe | `factory.setTierRegistry(TR2)` once, then `factory.pushWiring(governor)` for each governor, each inside its post-proposal cooldown | `governor.openProposalCount() == 0` for that governor; afterwards assert its `tierRegistry()`, `exposureLedger()`, `bondEscrow()` (§7) |
 
@@ -140,7 +140,7 @@ against each other. No ordering avoids both costs. Precondition 5(c) holds eithe
 | Choice | How | Cost |
 |---|---|---|
 | A. Pause | `oldGame.setFilingsPaused(true)` at the start of step 4 | Bounded drain: the longest live challenge's `disputeTimeoutAtFiling` (30 days default, 60 max), plus up to one `challengeWindow` (14 days) for the re-arms it produces. Every proposal is unchallengeable while paused; any filing window — ordinary or re-armed — that ends before step 5 is lost for good. Retiring `TokenCourt` makes re-arms likely: every disputed challenge the court never rules on ends in one |
-| B. Keep filings open | Leave the old game accepting filings; run step 5 at the first instant 5(a)–(c) all hold | No window is lost. Unbounded: anyone can postpone the rotation by filing, and the v1 game re-arms with no once-per-proposal limit. v1-only behaviours (e.g. V1-09) stay live for the whole wait |
+| B. Keep filings open | Leave the old game accepting filings; run step 5 at the first instant 5(a)–(c) all hold | No window is lost. Unbounded: anyone can postpone the rotation by filing, and the v1 game re-arms with no once-per-proposal limit. v1-only behaviours (e.g. the sibling-challenge referral through `TokenCourt.refer`) stay live for the whole wait |
 
 Rotating with a re-armed window outstanding (skipping 5(c)) is a third option only if
 the Safe explicitly accepts, per named proposal, that it becomes unchallengeable and its
@@ -192,10 +192,10 @@ Morpho market id a live strategy holds.
 - Do not redeploy `ExposureLedger` or `ProposerBondEscrow`, and do not call
   `StakedWood.setExposureLedger`, `GuardianRegistry.setExposureLedger`,
   `ChallengeGame.setExposureLedger` or `factory.setExposureLedger` at all during this
-  migration (V2-01).
+  migration (a fresh ledger knows none of the live locks).
 - Do not set the factory's `exposureLedger` to zero (§2.3).
 - Do not call `ledger.setCoverageFreezer` while any old-game challenge is live or any
-  `oldGame.challengeableUntil` is in the future (V2-02).
+  `oldGame.challengeableUntil` is in the future.
 - Do not split step 5 across transactions.
 - Do not run `DeployAll`, `DeployPlanD` or `verify-robinhood.sh` against the live chain
   as part of this migration (§2.5, §2.6).

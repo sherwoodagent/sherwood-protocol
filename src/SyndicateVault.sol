@@ -1131,7 +1131,7 @@ contract SyndicateVault is
         if (to == address(0)) revert ZeroAddress();
         address asset = asset();
         if (token == asset) revert CannotRescueAsset();
-        // A factory-made clone bound here, read fail-closed; `registerStrategy` is permissionless (FP-04).
+        // A factory-made clone bound here, read fail-closed; `registerStrategy` is permissionless.
         address factory_ = _strategyFactory();
         if (
             factory_ == address(0)

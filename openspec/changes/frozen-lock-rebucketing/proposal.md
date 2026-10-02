@@ -1,3 +1,5 @@
+> **`v1-deploy` history.** This change was written against the v1 game (`disputeTimeoutAtFiling`, `MAX_DISPUTE_TIMEOUT`, `rule`, `autoSlashDelay`, `_refundAll`, `TokenCourt`). On `post-audit-v2` the freeze end is `filedAt + voteWindowAtFiling` (`ChallengeGame.file` → `freezeCoverage`) and the spec delta says so; the v1 mechanics below are history.
+
 ## Why
 
 A guardian's lock is booked into an epoch bucket that expires on a wall clock, at `bucketEnd + challengeWindow`. A freeze (a challenge was filed) or a pin keeps that lock alive and unretirable past the bucket's expiry — but `openExposure` stops counting it the moment the bucket ages out. The guardian's free budget then over-reports, and they can lock again on top of a lock they are still fully on the hook for (SHE-213, audit Medium). The existing freeze requirement already guards the sWOOD *unstake* claim against exactly this wall-clock gap; the *capacity* check was never given the same protection.

@@ -20,6 +20,9 @@ Documents only. No executable source changes.
   a stale feed from making filing impossible. The filing deadline keeps running during an outage.
 - **Deadline.** `executedAt + strategyDuration + challengeWindow`, in `file` and in both reclaim gates
   of `SyndicateGovernor.reclaimProposerBond`; the spec omitted `strategyDuration`.
+- **Freeze lifetime.** The spec said a settlement after `filedAt + voteWindow` may find the locks
+  already retired. The freeze holds until the last live challenge terminates, and while it does
+  `releaseApproval` / `retireApproval` revert `CoverageFrozen`.
 - **Smaller drift.** Bond default 150 bps; `freezeCoverage` is called on every filing (the refcount
   governs only the unfreeze); the adapter membership test covers execute and settlement calls;
   `setStakedWood` / `setExposureLedger` require the counterpart role (`RoleNotGranted`).
@@ -32,7 +35,8 @@ Documents only. No executable source changes.
 ### Modified Capabilities
 
 - `challenge-game`: filing deadline, challenger bond and price read, freeze on every filing, adapter
-  membership over both call legs, the admission guard, wiring role checks, reclaim deadlines.
+  membership over both call legs, the admission guard, the freeze lifetime in resolution, wiring role
+  checks, reclaim deadlines.
 
 ## Archive order
 
@@ -44,4 +48,5 @@ change states what the code does and must be archived after it. "Casting a ballo
 
 ## Impact
 
-`openspec/changes/audit-1002-v2-challenge-game-docs/`, `docs/`. No storage, ABI or behaviour change.
+`openspec/changes/audit-1002-v2-challenge-game-docs/`, `docs/`, the `frozen-lock-rebucketing` delta
+(freeze end `filedAt + voteWindowAtFiling`), and comments in `src/`. No storage, ABI or behaviour change.

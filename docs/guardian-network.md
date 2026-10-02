@@ -310,9 +310,9 @@ file (bond = 1.5% of liability)
       │      plus the prosecutor fee out of the proposer's bond
       └─ the window closes short of that
            → FAILED: forfeitBurnBps (20%) of the bond burns, the rest returns.
-             An acquittal that itself reached the quorum spends the
-             proposal's challenge window; anything less is silence and
-             re-arms it, once.
+             An acquittal that itself reached the quorum does not
+             re-arm the window; anything less is silence and re-arms
+             it, once.
 ```
 
 `resolve` is permissionless and exercises no discretion. Before the window closes it
@@ -323,9 +323,10 @@ acquit ballot still castable; otherwise it reverts `DelayNotElapsed`. At or afte
 `convictWeight > acquitWeight` and fails otherwise (`ChallengeGame.resolve`). The
 majority clause matters on its own: 30% convict against 70% acquit convicts nobody. Settling a reached quorum has no deadline
 of its own: `resolve` is permissionless and the challenger, whose bond returns only
-on settlement, is the party paid to call it, while the ledger freeze covers only
-`filedAt + voteWindow` — so a settlement left until after that may find the
-approvers' locks already retired. No transfer anywhere in the game reaches
+on settlement, is the party paid to call it, and until the last live challenge terminates, the freeze keeps the approvers' locks
+unreleasable and unretirable and blocks their unstake claims (`ChallengeGame._releaseFreeze`;
+`ExposureLedger.releaseApproval` / `retireApproval` revert `CoverageFrozen`);
+`filedAt + voteWindow` only sets the bucket the frozen lock counts in. No transfer anywhere in the game reaches
 an approver or the proposer: the challenger's burns go to `0x…dEaD`, the slash
 burns inside sWOOD, and the prosecutor fee comes out of the convicted proposer's
 own escrowed bond.
@@ -354,7 +355,8 @@ own escrowed bond.
   the stake approved could be convicted by a few percent of it. The accused lose
   their ballot, not their weight. The same base also holds stake that has no ballot
   on this challenge: stake added after `snapshotAt`, and the stake of the
-  challenger, the proposer and the co-proposers.
+  challenger, the proposer and the co-proposers, and of any guardian that requests
+  unstake after the filing (`voteOnChallenge` requires `isActiveGuardian`).
 - **Who cannot vote:** the challenger (`ChallengerCannotVote`), the challenged
   proposal's pinned proposer and each of its co-proposers (`ProposerCannotVote`), and
   the accused approvers (`AccusedCannotVote`). Co-proposers are named on-chain and
@@ -378,7 +380,7 @@ D6 parameters. These are launch defaults and await an economics run:
 |---|---|---|---|
 | `voteWindow` (`setVoteWindow`) | 7 d | `MIN_VOTE_WINDOW` = 2 d – `MAX_VOTE_WINDOW` = 60 d (the ledger's `MAX_COVERAGE_HORIZON`) | yes |
 | `challengeQuorumBps` (`setChallengeQuorumBps`) | 3 000 bps (30%) of the TOTAL staked WOOD | owner-set in [1 000, 10 000] | yes |
-| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, accused included | `file` reverts `NoVotableStake` when the total less the accused cohort is under `challengeQuorumBps` of the total; stake that cannot vote is not subtracted, so a filing that passes can still be unwinnable | yes |
+| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, each accused counted at min(stake at `executedAt − 1`, stake at `snapshotAt`, stake at `filedAt − 1`) | `file` reverts `NoVotableStake` when the total less the accused cohort is under `challengeQuorumBps` of the total; stake that cannot vote is not subtracted, so a filing that passes can still be unwinnable | yes |
 | convict majority | `convictWeight > acquitWeight`, required on top of the quorum | — | — |
 | `forfeitBurnBps` — no conviction (`setForfeitBurnBps`) | 20% of the challenger bond burns, the remainder returns | 0 – 50% | yes |
 | `settleBurnBps` — conviction (`setSettleBurnBps`) | 5% burns; the challenger takes `bond − settleBurn` | 0 – 50% | yes |
@@ -406,7 +408,8 @@ during the outage ([coverage.md](coverage.md)).
   Once the accused hold more than `1 − quorum` of the base — 70% at the 3 000 bps
   default — `file` reverts `NoVotableStake` rather than taking a bond that could only
   burn. The guard subtracts only the accused. Stake added after `snapshotAt` and the
-  stake of the challenger, proposer and co-proposers stay in both the base and
+  stake of the challenger, proposer, co-proposers and guardians that request unstake
+  after the filing stay in both the base and
   `votableAtFiling` but cannot vote, so a filing can pass the guard and still be
   unwinnable: a non-approving address that stakes more than
   `honest × 10 000 / quorumBps − (honest + accused)` after `snapshotAt` puts a
@@ -414,10 +417,13 @@ during the outage ([coverage.md](coverage.md)).
   much from before `snapshotAt`. The filer then pays `forfeitBurnBps` of its bond.
   A challenger should compute the eligible stake (held at `snapshotAt`, not barred)
   against `quorumBps × totalStakeAtFiling` before filing.
-- **An acquittal ends the matter only at the quorum.** An acquit side that clears the
-  same bar a conviction must has decided, so the challenge fails *and* the proposal's
-  challenge window is spent. Below that bar nothing was adjudicated: the failure
-  counts as silence and re-arms the window, so one dust ballot cannot foreclose it.
+- **Only a sub-quorum failure re-arms.** A quorum acquittal does not re-arm the
+  window; the proposal stays challengeable until its existing deadline, and the one
+  re-arm remains available to a later silent failure. Below that bar the failure
+  counts as silence and re-arms the window (`ChallengeGame._fail`), so one dust
+  ballot cannot foreclose it. A re-arm raises the deadline to
+  `max(existing, now + challengeWindow)`, so a silent failure early in the window
+  spends the re-arm flag without extending anything (`_rearmChallengeWindow`).
   This holds for a substantial minority too — 25% acquit against 20% convict at a
   30% quorum still reads as silence — because the bar is the quorum, not the balance
   of the two sides.
@@ -433,8 +439,9 @@ during the outage ([coverage.md](coverage.md)).
 
 Anti-griefing details:
 
-- All rates **and the clock** are **pinned at filing** — no owner change can re-rate
-  or re-time a live challenge. `filingsPaused` gates `file` alone and is never read
+- The challenger's terms, the quorum and its base, and the vote window are pinned at
+  filing; approvers' slash rates are read at settlement (`_settle` → `slashBpsFor`)
+  and clamped by sWOOD's live `minSlashBps` / `maxSlashBps`. `filingsPaused` gates `file` alone and is never read
   in `resolve`, so the owner can stop new challenges but never strand a live one.
 - One live challenge per challenger per proposal. The slot is per *challenger*
   precisely so an accused cohort cannot buy immunity by self-filing to occupy the

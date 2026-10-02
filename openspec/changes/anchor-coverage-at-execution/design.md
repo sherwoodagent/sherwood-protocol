@@ -1,3 +1,5 @@
+> **`v1-deploy` history.** References below to `TokenCourt`, `refer`, an `Inconclusive` ruling or the reservation model describe `v1-deploy` or earlier designs; `post-audit-v2` has no court.
+
 # Design: anchor-coverage-at-execution
 
 ## Context

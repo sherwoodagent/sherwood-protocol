@@ -133,7 +133,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
         _requireAllowedMarket(registry, marketId);
     }
 
-    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone (FP-02).
+    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone.
     function _requireAllowedMarket(address registry, Id id) private view {
         bytes memory call_ = abi.encodeCall(ITierBindingPath.isMorphoMarketAllowed, (Id.unwrap(id)));
         if (!_readAllowed(registry, call_)) revert MorphoMarketNotAllowed(id, registry);

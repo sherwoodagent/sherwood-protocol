@@ -79,7 +79,7 @@ Cross-contract timing invariants (all enforced at the setters):
 - `ChallengeGame.voteWindow ≥ MIN_VOTE_WINDOW (2 d)` — every filing gets a window the
   guardian cohort can realistically notice and decide inside, and the window a
   challenge actually receives is pinned at filing so no later change can close one the
-  accused is still inside (`ChallengeGame.sol:50`). At deployed values: 7 d ≥ 2 d.
+  accused is still inside (`ChallengeGame.MIN_VOTE_WINDOW`, `voteWindowAtFiling`). At deployed values: 7 d ≥ 2 d.
 
 ## Step by step
 
@@ -195,7 +195,7 @@ Cross-contract timing invariants (all enforced at the setters):
 
 ### 6. After settlement — challenge window and bond reclaim
 
-`reclaimProposerBond` (`src/SyndicateGovernor.sol:705`) is permissionless and always
+`SyndicateGovernor.reclaimProposerBond` is permissionless and always
 pays the recorded proposer, but for executed proposals only after **three** gates:
 
 1. `executedAt + strategyDuration + ledger.challengeWindow` (default 14 d) has passed,
