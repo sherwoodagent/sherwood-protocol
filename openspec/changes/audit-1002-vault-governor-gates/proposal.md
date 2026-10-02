@@ -16,4 +16,4 @@
 
 - Specs: `syndicate-vault` (depositor access control, request cancellation, pause and emergency behavior) and `epoch-nav` (the protocol ceiling clamps at propose). The governor's proposal-validation requirement is left to `epoch-nav` because four open changes already amend it.
 - `src/SyndicateVault.sol`, `src/SyndicateGovernor.sol`, `src/GovernorParameters.sol` (`_protocolMaxStrategyDuration` becomes `internal`), `src/interfaces/ISyndicateVault.sol` (new error). No storage change, no new external function.
-- Operations: a stray token in the vault can no longer be handed to the owner or a third party. To recover one, rescue it to a clone of the vault and settle that clone in a later proposal.
+- Operations: a stray token in the vault can no longer be sent to the owner, the Safe, or back to a mistaken sender. It comes back to LPs as the vault asset only through a clone of the vault whose template can sell it (a Portfolio basket slot with a certified price source for it, or the CL strategy's other token or collateral); with no such clone it stays in the vault.

@@ -18,6 +18,7 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
@@ -71,12 +72,14 @@ contract RescueAggregator {
     }
 }
 
-/// @notice Stand-in for another vault: answers `governor()` so a template clone can initialise against it.
+/// @notice Stand-in for another vault: answers `governor()` and `asset()` so a template clone can initialise against it.
 contract OtherVaultStub {
     address public governor;
+    address public asset;
 
-    constructor(address governor_) {
+    constructor(address governor_, address asset_) {
         governor = governor_;
+        asset = asset_;
     }
 }
 
@@ -195,6 +198,10 @@ contract Vault_rescueERC20StrategyOnlyTest is Test {
         vm.prank(registry.factory());
         registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
+        // Portfolio's $1 asset check reads governor.exposureLedger(); only the getter is mocked.
+        MockAssetLedger usdLedger = new MockAssetLedger();
+        usdLedger.setPrice(address(usdc), 1e8);
+        vm.mockCall(address(governor), abi.encodeWithSignature("exposureLedger()"), abi.encode(address(usdLedger)));
         vm.prank(owner);
         swood.setRegistry(address(registry));
 
@@ -338,7 +345,7 @@ contract Vault_rescueERC20StrategyOnlyTest is Test {
     /// @notice A template clone bound to another vault is refused.
     function test_rescueToCloneOfAnotherVaultReverts() public {
         _basketRescuedIntoVault();
-        address other = _factoryClone(address(new OtherVaultStub(address(governor))));
+        address other = _factoryClone(address(new OtherVaultStub(address(governor), address(usdc))));
         assertTrue(sf.cloneTemplate(other) != address(0), "factory clone");
         _expectRescueRefused(other);
     }

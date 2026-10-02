@@ -132,9 +132,12 @@ A queued deposit stays cancellable until it is claimed.
   siphoned mid-flight.
 - **Rescued tokens stay with the fund.** `rescueERC20` never moves the vault asset,
   and sends any other token only to a strategy clone of this vault (made by the
-  strategy factory, `vault()` equal to this vault). A later proposal's batch settles
-  that clone and the value returns to the vault. The owner cannot send such a token
-  to itself or anyone else.
+  strategy factory, `vault()` equal to this vault). Such a token comes back to LPs as
+  the vault asset only if that clone's template can sell it: a Portfolio basket slot
+  with a certified price source for the token, or the CL strategy's other token or
+  collateral. Otherwise `rescueTo` only returns the same token to the vault, so a
+  stray token with no such clone has no exit and stays in the vault. Tokens can no
+  longer be sent to the owner, the Safe, or back to a mistaken sender.
 
 ## Timing summary for an LP
 
