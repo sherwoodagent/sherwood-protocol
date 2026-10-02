@@ -427,11 +427,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // timestamp would admit stake planted in this very block.
         IStakedWood swood = stakedWood;
         if (address(swood) == address(0)) revert ZeroAddress();
-        uint256 snapshotAt = block.timestamp - 1;
-        uint256 votable = swood.getPastTotalVotes(snapshotAt);
+        uint256 filingSnapshot = block.timestamp - 1;
+        uint256 votable = swood.getPastTotalVotes(filingSnapshot);
         uint256 accusedAtExecution;
         for (uint256 i = 0; i < accused.length; i++) {
-            uint256 w = swood.getPastStake(accused[i], snapshotAt);
+            uint256 w = swood.getPastStake(accused[i], filingSnapshot);
             votable = votable > w ? votable - w : 0;
             // The accused count only up to their stake at the approve snapshot and at
             // execution: a top-up after approving raises no slash, so it must not raise the bar.

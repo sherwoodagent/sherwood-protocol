@@ -222,7 +222,8 @@ Asserted inside the handler that performs the call.
   by exactly the bond, live count for the key incremented by 1.
 - [ ] **SP-04** `SHOULD-HOLD` — after `voteOnChallenge(id, convict)`: `hasVotedOn` is
   true for the caller, exactly one of `convictWeight`/`acquitWeight` increased by the
-  caller's `getPastStake(voter, filedAt - 1)`, and the other is unchanged.
+  caller's `min(getPastStake(voter, filedAt - 1), getPastStake(voter, snapshotAt))`
+  (`snapshotAt` = the proposal's `snapshotTimestamp`, pinned at filing), and the other is unchanged.
 - [ ] **SP-05** `SHOULD-HOLD` — after `resolve(id)`: status is `Settled` iff
   `convictWeight * 10_000 >= quorumBpsAtFiling * totalStakeAtFiling` AND
   `convictWeight > acquitWeight`, else `Failed` and only at or after

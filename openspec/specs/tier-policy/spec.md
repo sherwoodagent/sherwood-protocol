@@ -105,6 +105,10 @@ The registry SHALL maintain exactly one owner-managed counterparty (venue) allow
 - **WHEN** code is replaced at a listed counterparty after the grant
 - **THEN** `isCounterpartyAllowed` returns false without any state write, until the owner re-grants
 
+#### Scenario: A template binds only a listed venue
+- **WHEN** a template's `initialize` names a venue whose `isCounterpartyAllowed` is false
+- **THEN** the clone reverts at init with the template's own "not allowed" error naming the venue and the registry (`MorphoNotAllowed(morpho, registry)`, `AdapterNotAllowed(swapAdapter, registry)`, `PriceSourceNotAllowed(priceSource, registry)`, `CounterpartyNotAllowed(counterparty, registry)`)
+
 
 ### Requirement: External read surface
 The `ITierRegistry` interface consumed by the vault, the governor and the strategy templates SHALL expose exactly `tierOf(target, selector) → (tier, boundBps)`, `isCounterpartyAllowed(counterparty) → bool`, `classOf(target) → bytes32` and `strategyFactory() → address`. The demoter role and its setter are deliberately not part of this read-side interface.
@@ -112,6 +116,10 @@ The `ITierRegistry` interface consumed by the vault, the governor and the strate
 #### Scenario: Governor-side consumption
 - **WHEN** the governor prices a call's extractable value
 - **THEN** it reads `tierOf` through `ITierRegistry` and gets the effective (post-lazy-demotion) tier and bound
+
+#### Scenario: Template-side consumption
+- **WHEN** a template binds a venue at init
+- **THEN** it reads `isCounterpartyAllowed` through a length-checked raw staticcall, and a codeless registry, a reverting call or an answer that is not exactly one word counts as false
 
 
 ### Requirement: Ownership model

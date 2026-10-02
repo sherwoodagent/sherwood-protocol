@@ -14,7 +14,7 @@ A first cut clamped at `executedAt - 1`. Review showed that only moves the
 commitment point by seconds: a bloc can stake at the end of guardian review, call
 the permissionless `executeProposal` one second later and file one second after
 that, still at full weight. The clamp therefore sits at the propose-time snapshot,
-so an attacker must already be staked before the proposal is public.
+so an attacker must already be staked when the proposal enters Pending (at `propose`, or at the last co-proposer approval on the collaborative path, where the Draft's calls were already public; collaboration is disabled while `ownerOnlyProposals` is on).
 
 ## What Changes
 
@@ -33,7 +33,7 @@ so an attacker must already be staked before the proposal is public.
 
 - Relative to the unclamped rule, conviction and acquittal weight can only
   shrink, so the quorum and the early-settle bar get harder to reach, never easier.
-- Trade-off: an honest guardian who staked after the proposal was proposed cannot
+- Trade-off: an honest guardian who staked after the proposal entered Pending cannot
   vote on its challenge. This is the electorate rule the guardian review itself
   uses (`GuardianRegistry` weighs review ballots at its propose-time `snapshotAt`).
 - Not fixed: post-snapshot stake still enlarges both denominators. That can only

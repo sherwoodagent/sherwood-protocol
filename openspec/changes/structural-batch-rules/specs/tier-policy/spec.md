@@ -51,3 +51,7 @@ The `ITierRegistry` interface consumed by the vault, the governor and the strate
 #### Scenario: Governor-side consumption
 - **WHEN** the governor prices a call's extractable value
 - **THEN** it reads `tierOf` through `ITierRegistry` and gets the effective (post-lazy-demotion) tier and bound
+
+#### Scenario: Template-side consumption
+- **WHEN** a template binds a venue at init
+- **THEN** it reads `isCounterpartyAllowed` through a length-checked raw staticcall, and a codeless registry, a reverting call or an answer that is not exactly one word counts as false
