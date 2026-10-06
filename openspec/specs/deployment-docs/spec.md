@@ -49,7 +49,7 @@ The ceremony SHALL be ONE script, `script/robinhood-mainnet/DeployAll.s.sol:Depl
 
 The Fork posture completes in ONE run. The Mainnet posture completes in TWO runs separated by the WOOD feed's warm-up: the first run mints `WoodPoolFeed`, returns `Checkpoint.AwaitingWoodFeed` and performs NO handoff; the operator then calls `WoodPoolFeed.update()` on a keeper until `latestRoundData()` answers (at least one `window`, 24h minimum); the second run finds the feed answering, deploys the coverage stack and hands off. Between the two runs the deployer key still owns every contract — that window is the price of the warm-up and SHALL be stated in the runbook, not discovered.
 
-The broadcaster SHALL equal the book's `DEPLOYER`, and the script reverts "broadcaster != DEPLOYER in the address book" otherwise. There is no skip flag: WHO ends up owning the protocol is a property of the posture. On Mainnet `OWNER_MULTISIG` is REQUIRED from the book and MUST be a contract (Safe), not an EOA. On Fork the owner is the deployer itself, so the handoff still runs and is a no-op; a Fork book MAY carry `OWNER_MULTISIG` only when it equals `DEPLOYER`, and anything else is REFUSED ("Fork posture hands off to the deployer: OWNER_MULTISIG must be absent or equal DEPLOYER") so a mainnet Safe copied into a fork book cannot become the target. `_handoffAll` SHALL refuse an unset target, which would be unrecoverable.
+The broadcaster SHALL equal the book's `DEPLOYER`, and the script reverts "broadcaster != DEPLOYER in the address book" otherwise. There is no skip flag: WHO ends up owning the protocol is a property of the posture. On Mainnet `OWNER_MULTISIG` is REQUIRED from the book and MUST be a contract (Safe), not an EOA, with ONE exception: a book whose `OWNER_MULTISIG` equals its `DEPLOYER` DEFERS the handoff, so the run completes with the deployer key owning every contract and nothing pending. The handoff then happens in a later run, after the book names the real owner and the deployer has re-pointed the creation-fee recipient to it. On Fork the owner is the deployer itself, so the handoff still runs and is a no-op; a Fork book MAY carry `OWNER_MULTISIG` only when it equals `DEPLOYER`, and anything else is REFUSED ("Fork posture hands off to the deployer: OWNER_MULTISIG must be absent or equal DEPLOYER") so a mainnet Safe copied into a fork book cannot become the target. `_handoffAll` SHALL refuse an unset target, which would be unrecoverable.
 
 `DeployWood` SHALL be skipped — WOOD is already live on 4663 and on the fork, and `DeployWood` now refuses chain 4663 outright. Every protocol contract is minted through CREATE3, so the address table is order-independent.
 
@@ -95,8 +95,12 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 - **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 3600`
 
 #### Scenario: Mainnet ceremony with EOA multisig refused
-- **WHEN** `OWNER_MULTISIG` is an EOA on Mainnet posture
+- **WHEN** `OWNER_MULTISIG` is an EOA other than `DEPLOYER` on Mainnet posture
 - **THEN** the deploy reverts "OWNER_MULTISIG must be a contract (Safe), not an EOA"
+
+#### Scenario: Mainnet ceremony with the handoff deferred
+- **WHEN** the Mainnet book's `OWNER_MULTISIG` equals its `DEPLOYER`
+- **THEN** the run reaches `Checkpoint.Complete` with the deployer owning every contract, no `pendingOwner` armed and the creation fee paid to the deployer, which `test/deploy/DeployAll.t.sol::test_mainnet_ownerMultisigEqualToDeployerDefersTheHandoff` pins
 
 ### Requirement: The strategy template allowlist names only live templates
 

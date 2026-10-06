@@ -81,6 +81,15 @@ Nothing is read from the environment. Every number comes from
    reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
+   **Deferred handoff (v1 launch).** `chains/4663.json` names the deployer as
+   `OWNER_MULTISIG`, so run 2 hands nothing off and this step is skipped: the
+   deployer key owns every contract and receives the creation fee. To hand off
+   later: set `OWNER_MULTISIG` to the real owner (a contract), call
+   `factory.setCreationFee(WOOD, 1_000_000e18, <owner>)` from the deployer, re-run
+   `DeployAll` (it sends only the transfers), then do this step.
+
+   `script/robinhood-mainnet/deploy.sh` wraps steps 2 to 6 and verifies the
+   sources on Blockscout; run it once per stage.
 6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
    address from the book's `CREATE3_FACTORY` and fails on any disagreement, and
    checks that every live governor carries the factory's ledger, escrow and tier

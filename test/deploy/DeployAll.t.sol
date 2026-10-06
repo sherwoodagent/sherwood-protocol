@@ -454,6 +454,36 @@ contract DeployAllTest is DeployAllFixture {
         assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
     }
 
+    /// @notice A Mainnet book naming the DEPLOYER as `OWNER_MULTISIG` completes with no handoff.
+    function test_mainnet_ownerMultisigEqualToDeployerDefersTheHandoff() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        i.ownerMultisig = deployer;
+
+        vm.prank(deployer);
+        (Stack memory first,) = script.deployAll(i);
+        _primeWoodFeed(first.woodUsdFeed);
+        vm.prank(deployer);
+        (Stack memory s, Checkpoint cp) = script.deployAll(i);
+
+        assertTrue(cp == Checkpoint.Complete, "run 2 completes");
+        _assertOneStepOwners(s, deployer);
+        _assertTwoStepPending(s, address(0));
+        assertEq(Ownable(s.exposureLedger).owner(), deployer, "ledger.owner");
+        assertEq(SyndicateFactory(s.core.factoryProxy).creationFeeRecipient(), deployer, "fee goes to the deployer");
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+        assertTrue(script.stageOf(s, deployer) == Stage.Done, "stageOf == Done");
+    }
+
+    /// @notice The Safe pre-flight is waived only for an `OWNER_MULTISIG` that IS the deployer key.
+    function test_preflight_acceptsAnEoaOwnerMultisigThatIsTheDeployer() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        i.deployer = address(0xA11CE);
+        i.ownerMultisig = address(0xA11CE);
+        script.exposed_preflight(i);
+    }
+
     /// @notice Validation refuses a run-1 factory whose owner-only-proposals flag was lifted.
     function test_mainnet_validateAllRefusesLiftedOwnerOnlyProposals() public {
         vm.chainId(MAINNET_CHAIN_ID);

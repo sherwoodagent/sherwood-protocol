@@ -338,6 +338,7 @@ contract DeployAll is
     /// @dev Posture from the chain id alone: 4663 is Mainnet, any other chain with a
     ///      committed book carrying DEPLOYER is a Fork. Who ends up owning the protocol is a
     ///      POSTURE, never a flag: the Safe on Mainnet, the deployer itself on a fork or vnet.
+    ///      A Mainnet book whose OWNER_MULTISIG is its DEPLOYER defers the handoff to a later run.
     function _readInputs() internal view returns (Inputs memory i) {
         require(_fileExists(_chainsPath()), "wrong chain: no chains/<chainid>.json for this chain");
         i.posture = block.chainid == RobinhoodParams.MAINNET_CHAIN_ID ? Posture.Mainnet : Posture.Fork;
@@ -433,7 +434,8 @@ contract DeployAll is
     ///      load-bearing half: the canonical Uniswap mainnet addresses each hold unrelated
     ///      code on 4663, so a code-length check passes and wires the wrong contract.
     function _preflight(Inputs memory i) internal view {
-        if (i.posture == Posture.Mainnet) {
+        // A book naming the DEPLOYER as owner defers the handoff: the deployer keeps every role.
+        if (i.posture == Posture.Mainnet && i.ownerMultisig != i.deployer) {
             require(i.ownerMultisig.code.length != 0, "OWNER_MULTISIG must be a contract (Safe), not an EOA");
         }
         require(CREATE2_DEPLOYER.code.length != 0, "CREATE2 deployer not on this chain");
@@ -461,7 +463,7 @@ contract DeployAll is
     ///      a correct run AFTER the broadcast, with the transactions already sent.
     function _validateAll(Stack memory s, Inputs memory i, Checkpoint cp) internal view {
         address deployer = s.core.deployer;
-        bool handedOff = cp == Checkpoint.Complete && i.posture == Posture.Mainnet;
+        bool handedOff = cp == Checkpoint.Complete && i.posture == Posture.Mainnet && i.ownerMultisig != i.deployer;
         address finalOwner = handedOff ? i.ownerMultisig : deployer;
 
         // Creation stays closed (sentinel registry, no syndicates) until run 2's last step.
