@@ -38,11 +38,12 @@ DEPLOYER=$(book DEPLOYER)
 
 # cast and forge refuse a /dev/fd path, so the password sits in a 0600 temp file for the run.
 PWFILE=$(mktemp); chmod 600 "$PWFILE"; trap 'rm -f "$PWFILE"' EXIT
-read -rsp "Password for the $ACCOUNT keystore: " PW; echo
+IFS= read -rsp "Password for the $ACCOUNT keystore: " PW; echo
 printf '%s' "$PW" >"$PWFILE"; unset PW
 signed() { "$@" --account $ACCOUNT --password-file "$PWFILE"; }
-[ "$(signed cast wallet address | tr 'A-Z' 'a-z')" = "$(echo "$DEPLOYER" | tr 'A-Z' 'a-z')" ] || {
-  echo "$ACCOUNT is not the book's DEPLOYER ($DEPLOYER)"; exit 1; }
+SIGNER=$(signed cast wallet address) || { echo "could not unlock $ACCOUNT: wrong password?"; exit 1; }
+[ "$(echo "$SIGNER" | tr 'A-Z' 'a-z')" = "$(echo "$DEPLOYER" | tr 'A-Z' 'a-z')" ] || {
+  echo "$ACCOUNT is $SIGNER, not the book's DEPLOYER ($DEPLOYER)"; exit 1; }
 echo "deployer $DEPLOYER  balance $(cast balance "$DEPLOYER" --ether --rpc-url $RPC) ETH"
 
 feed_answers() {
