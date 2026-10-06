@@ -100,11 +100,16 @@ def is_verified(addr):
 
 
 def standard_json(addr, source, name, libs):
-    raw = subprocess.run(
-        ["forge", "verify-contract", addr, f"{source}:{name}", "--compiler-version", "0.8.28",
-         "--show-standard-json-input"],
-        capture_output=True, text=True, check=True,
-    ).stdout
+    cmd = ["forge", "verify-contract", addr, f"{source}:{name}", "--compiler-version", "0.8.28",
+           "--show-standard-json-input"]
+    for attempt in range(3):
+        run = subprocess.run(cmd, capture_output=True, text=True)
+        if run.returncode == 0 and "{" in run.stdout:
+            break
+        time.sleep(5)
+    else:
+        raise RuntimeError(f"forge could not build the standard JSON: {run.stderr.strip()[-300:]}")
+    raw = run.stdout
     doc = json.loads(raw[raw.index("{") :])
     linked = doc["settings"].setdefault("libraries", {})
     for lib in libs:
@@ -141,8 +146,14 @@ def main():
         if is_verified(addr):
             print(f"  ok       {name} {addr} (already verified)")
             continue
+        try:
+            doc = standard_json(addr, source, name, libs)
+        except RuntimeError as err:
+            # One contract failing must not stop the rest; it is reported as not verified below.
+            print(f"  SKIPPED  {name} {addr}: {err}")
+            continue
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump(standard_json(addr, source, name, libs), f)
+            json.dump(doc, f)
         reply = curl([
             "-X", "POST", f"{HOST}/api/v2/smart-contracts/{addr}/verification/via/standard-input",
             "-F", f"compiler_version={SOLC}", "-F", f"contract_name={name}", "-F", "license_type=mit",
