@@ -36,8 +36,11 @@ DEPLOYER=$(book DEPLOYER)
 [ "$(book OWNER_MULTISIG)" = "$DEPLOYER" ] || {
   echo "OWNER_MULTISIG != DEPLOYER in $BOOK: this run would hand the protocol off. Aborting."; exit 1; }
 
+# cast and forge refuse a /dev/fd path, so the password sits in a 0600 temp file for the run.
+PWFILE=$(mktemp); chmod 600 "$PWFILE"; trap 'rm -f "$PWFILE"' EXIT
 read -rsp "Password for the $ACCOUNT keystore: " PW; echo
-signed() { "$@" --account $ACCOUNT --password-file <(printf '%s' "$PW"); }
+printf '%s' "$PW" >"$PWFILE"; unset PW
+signed() { "$@" --account $ACCOUNT --password-file "$PWFILE"; }
 [ "$(signed cast wallet address | tr 'A-Z' 'a-z')" = "$(echo "$DEPLOYER" | tr 'A-Z' 'a-z')" ] || {
   echo "$ACCOUNT is not the book's DEPLOYER ($DEPLOYER)"; exit 1; }
 echo "deployer $DEPLOYER  balance $(cast balance "$DEPLOYER" --ether --rpc-url $RPC) ETH"
