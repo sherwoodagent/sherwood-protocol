@@ -154,26 +154,35 @@ def main():
             continue
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(doc, f)
-        reply = curl([
-            "-X", "POST", f"{HOST}/api/v2/smart-contracts/{addr}/verification/via/standard-input",
-            "-F", f"compiler_version={SOLC}", "-F", f"contract_name={name}", "-F", "license_type=mit",
-            "-F", "autodetect_constructor_args=false", "-F", f"constructor_args={ctor}",
-            "-F", f"files[0]=@{f.name};type=application/json",
-        ])
+        # The instance rate-limits by IP; a refused submission is retried after a pause.
+        for _ in range(3):
+            reply = curl([
+                "-X", "POST", f"{HOST}/api/v2/smart-contracts/{addr}/verification/via/standard-input",
+                "-F", f"compiler_version={SOLC}", "-F", f"contract_name={name}", "-F", "license_type=mit",
+                "-F", "autodetect_constructor_args=false", "-F", f"constructor_args={ctor}",
+                "-F", f"files[0]=@{f.name};type=application/json",
+            ])
+            if "Too many requests" not in reply:
+                break
+            time.sleep(60)
         os.unlink(f.name)
-        print(f"  submit   {name} {addr}: {reply.strip()[:120]}")
-        time.sleep(2)
+        if "Too many requests" in reply:
+            # Hammering a throttled instance only extends the throttle.
+            print(f"  RATE LIMITED at {name}: stopping. Re-run this script later; verified contracts are skipped.")
+            break
+        print(f"  submit   {name} {addr}: {reply.strip()[:120]}", flush=True)
+        time.sleep(15)
 
     if dry:
         sys.exit(1 if unknown else 0)
 
     # Verification is asynchronous; give the queue a moment before reading it back.
     pending = [(a, n) for a, _, n, _ in todo]
-    for _ in range(12):
+    for _ in range(6):
+        time.sleep(30)
         pending = [(a, n) for a, n in pending if not is_verified(a)]
         if not pending:
             break
-        time.sleep(10)
     for addr, name in pending:
         print(f"  NOT VERIFIED {name} {addr}")
     failed += len(pending)
