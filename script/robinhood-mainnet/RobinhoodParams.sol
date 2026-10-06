@@ -47,8 +47,7 @@ library RobinhoodParams {
     uint256 internal constant WOOD_HAIRCUT_BPS = 5000;
 
     // WoodPoolFeed
-    // Twice the 30 min floor: both WOOD/WETH pools are thin. The feed warm-up between the two runs is one window.
-    uint256 internal constant TWAP_WINDOW = 1 hours;
+    uint256 internal constant TWAP_WINDOW = 24 hours;
     // 4663's ETH/USD feed heartbeats at 24h, so a bound of exactly 24h halts every WOOD read on a
     // round published one second late. Same 2h allowance as `ASSET_FEED_MAX_DELAY`.
     uint256 internal constant ETH_USD_HEARTBEAT = 1 days;
@@ -71,8 +70,9 @@ library RobinhoodParams {
     uint256 internal constant COVERED_TVL_CAP_USD18 = 1_000_000e18;
     // How far above live spot the WOOD price cap is seated, bps. Both postures DERIVE the cap
     // from the pool at deploy time, so no measured price is ever committed here. Must land
-    // inside the ceremony's [1.25x, 2x] band; the Safe re-reviews the cap monthly after launch.
-    uint256 internal constant CAP_OVER_SPOT_BPS = 15_000;
+    // inside the ceremony's [1.25x, 4x] band; the owner re-reviews the cap monthly after launch.
+    // 4x: the 24h two-pool TWAP is the manipulation control, and a tighter cap binds on an ordinary rally.
+    uint256 internal constant CAP_OVER_SPOT_BPS = 40_000;
 
     /// @notice TierRegistry launch set. Every CHAINLINK_<SYM>_USD_FEED and <SYM> (WETH for ETH) book key is
     ///         REQUIRED. A Solidity constant cannot hold an array, hence a pure accessor.

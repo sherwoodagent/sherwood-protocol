@@ -621,7 +621,7 @@ contract DeployAllTest is DeployAllFixture {
         );
         // The band the ceremony enforces, restated here so a multiplier edit cannot drift out of it.
         assertGe(atSpot.woodPriceCapX8, (spotX8 * 125) / 100, "cap above 1.25x spot");
-        assertLe(atSpot.woodPriceCapX8, spotX8 * 2, "cap below 2x spot");
+        assertLe(atSpot.woodPriceCapX8, spotX8 * 4, "cap at or below 4x spot");
 
         // Ten times the depth is a tenth of the price. A committed cap would not move; this does.
         uniPair.setReserves(WOOD_RESERVE * 10, WETH_RESERVE);

@@ -135,7 +135,7 @@ contract DeployAll is
 
         if (i.posture == Posture.Mainnet) {
             // DERIVED from the live pool, like the fork's: a committed constant is only inside
-            // the [1.25x, 2x] band on the day it was measured, and the band moves with the price.
+            // the [1.25x, 4x] band on the day it was measured, and the band moves with the price.
             Params memory fp = _feedParams(i);
             uint256 spotX8 = _spotWoodUsdX8(fp, fp.uniPair);
             s.woodPriceCapX8 = (spotX8 * RobinhoodParams.CAP_OVER_SPOT_BPS) / 10_000;

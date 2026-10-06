@@ -22,7 +22,7 @@ interface IAggregatorMinimal {
 /**
  * @title  WoodPoolFeed
  * @notice WOOD/USD on the `AggregatorV3` read surface, 8 decimals: the LOWER of
- *         two WOOD/WETH pool TWAPs over a window of at least 30 min, each pool held
+ *         two WOOD/WETH pool TWAPs over a window of at least 24h, each pool held
  *         to a depth floor. One leg is a Uniswap-V2-style pair, synced before
  *         every snapshot so tails are zero; the other is a Uniswap V3 pool. Both
  *         legs average from accumulators this contract snapshots; the V3 leg's
@@ -38,7 +38,7 @@ contract WoodPoolFeed {
 
     /// @dev UQ112x112 scaling factor, the format `UniswapV2Pair` accumulates in.
     uint256 internal constant Q112 = 2 ** 112;
-    uint256 public constant MIN_WINDOW = 30 minutes;
+    uint256 public constant MIN_WINDOW = 24 hours;
     /// @dev Ceiling on the span between the two snapshots a read averages over.
     uint256 public constant MAX_SNAPSHOT_SPAN = 7 days;
     uint8 internal constant MAX_ETH_FEED_DECIMALS = 18;

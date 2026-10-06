@@ -182,7 +182,7 @@ contract WoodPoolFeedRingAttackTest is Test {
     /// @notice WHY A BIGGER RING WAS NEVER THE ANSWER. `Oracle.write` dedupes on
     ///         the block TIMESTAMP, so N slots span at most N-1 SECONDS against a
     ///         writer that swaps every second — and N is a `uint16`, so the
-    ///         longest ring anyone can pay for reaches 18h12m, under this 24h window.
+    ///         longest ring anyone can pay for reaches 18h12m, under MIN_WINDOW.
     function test_noRingCanServeTheWindowAgainstAPerSecondWriter() public {
         uint16 n = 200;
         v3.increaseObservationCardinalityNext(n);
@@ -199,6 +199,6 @@ contract WoodPoolFeedRingAttackTest is Test {
         v3.swap(TICK + 8);
         assertEq(v3.writes(), writesBefore, "one observation per SECOND, not per block");
 
-        assertLt(uint256(type(uint16).max) - 1, feed.window(), "65,534 s < 24 h");
+        assertLt(uint256(type(uint16).max) - 1, feed.MIN_WINDOW(), "65,534 s < 24 h");
     }
 }

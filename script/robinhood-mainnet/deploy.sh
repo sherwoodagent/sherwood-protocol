@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The Robinhood mainnet ceremony in one command: run 1, the WOOD feed warm-up (one TWAP
-# window, 1h), run 2, then verify-robinhood.sh. Every step is idempotent and the stage is
-# read back from the chain, so an interrupted run is resumed by running it again.
+# The Robinhood mainnet ceremony. Run it once for run 1, then again a day later (the WOOD
+# feed warm-up is one 24h TWAP window) for run 2 and verify-robinhood.sh. Every step is
+# idempotent and the stage is read back from the chain, so re-running is always safe.
 #
 # Each stage also verifies the sources of whatever was minted on Blockscout.
 #
@@ -89,7 +89,10 @@ for PASS in 1 2; do
   FEED=$(book WOOD_USD_FEED)
   if has_code "$FEED" && ! feed_answers "$FEED"; then
     WAIT=$(feed_wait "$FEED")
-    if [ "$WAIT" -gt 0 ]; then
+    if [ "$WAIT" -gt 600 ]; then
+      echo; echo "WoodPoolFeed is warming up. Commit $BOOK and re-run this script in $((WAIT / 3600))h$((WAIT % 3600 / 60))m."
+      exit $VERIFIED
+    elif [ "$WAIT" -gt 0 ]; then
       say "WoodPoolFeed warm-up: sleeping ${WAIT}s"
       sleep "$WAIT"
     fi
@@ -133,5 +136,5 @@ if [ -n "${ALLOW_MORPHO_MARKET:-}" ]; then
   fi
 fi
 
-echo; echo "Ceremony complete. Commit $BOOK. WoodPoolFeed.update() stays an hourly keeper job (3h max delay)."
+echo; echo "Ceremony complete. Commit $BOOK. WoodPoolFeed.update() stays a daily keeper job (26h max delay)."
 exit $VERIFIED

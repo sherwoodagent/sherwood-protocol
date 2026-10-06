@@ -229,7 +229,7 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
     /// @notice The V3 leg is averaged over the span between the two snapshots,
     ///         which `update()` rolls no sooner than a whole window apart.
     function test_theV3LegIsAveragedOverExactlyTheConfiguredWindow() public {
-        assertEq(feed.window(), WINDOW, "the fixture window");
+        assertEq(feed.window(), feed.MIN_WINDOW(), "this fixture sits exactly on the minimum window");
 
         v3.setTicks(TICK_HALF_V2, TICK_HALF_V2);
         _prime();
@@ -442,23 +442,10 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         feed.latestRoundData();
     }
 
-    function test_constructorRefusesAWindowBelowTheMinimum() public {
-        assertEq(feed.MIN_WINDOW(), 30 minutes, "the floor");
+    function test_constructorRefusesAWindowBelowTwentyFourHours() public {
         vm.expectRevert(WoodPoolFeed.InvalidParameter.selector);
         new WoodPoolFeed(
-            address(uni),
-            address(v3),
-            WOOD,
-            WETH,
-            address(ethUsd),
-            ETH_MAX_AGE,
-            30 minutes - 1,
-            MIN_WETH,
-            MIN_V3_LIQUIDITY
-        );
-        // Non-vacuity: the floor itself is accepted.
-        new WoodPoolFeed(
-            address(uni), address(v3), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, 30 minutes, MIN_WETH, MIN_V3_LIQUIDITY
+            address(uni), address(v3), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW - 1, MIN_WETH, MIN_V3_LIQUIDITY
         );
     }
 

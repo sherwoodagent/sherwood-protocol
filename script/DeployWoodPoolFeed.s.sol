@@ -109,10 +109,10 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         // INSTANTANEOUS SPOT, FOR SIZING THE CAP ONLY — the manipulable quantity
         // the averaging exists to defeat, never a price. It is printed because the
         // operator's next decision is `WOOD_PRICE_CAP_X8`, which the runbook
-        // requires to sit 1.25-2x ABOVE market.
+        // requires to sit 1.25-4x ABOVE market.
         uint256 spotX8 = _spotWoodUsdX8(p, p.uniPair);
         console.log("spot WOOD/USD x8 (cap-sizing only, NOT a price): %s", spotX8);
-        console.log("suggested WOOD_PRICE_CAP_X8 band 1.25-2x: %s .. %s", (spotX8 * 125) / 100, spotX8 * 2);
+        console.log("suggested WOOD_PRICE_CAP_X8 band 1.25-4x: %s .. %s", (spotX8 * 125) / 100, spotX8 * 4);
 
         console.log("\nNOTE: this deploy transaction's update() WRITES to the live V2 pair");
         console.log("      (permissionless sync()), it does not only read it. Both legs are");
@@ -152,7 +152,7 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         require(p.weth != address(0), "PRE-FLIGHT: WETH unset");
         require(p.ethUsdFeed != address(0), "PRE-FLIGHT: CHAINLINK_ETH_USD_FEED unset");
 
-        require(p.window >= 30 minutes, "PRE-FLIGHT: TWAP_WINDOW below MIN_WINDOW (30 min)");
+        require(p.window >= 24 hours, "PRE-FLIGHT: TWAP_WINDOW below MIN_WINDOW (24h)");
         require(p.window <= 7 days, "PRE-FLIGHT: TWAP_WINDOW above MAX_SNAPSHOT_SPAN (7d)");
         require(p.ethUsdMaxAge != 0, "PRE-FLIGHT: ETH_USD_MAX_AGE zero");
         require(
@@ -257,13 +257,13 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         require(age <= p.ethUsdMaxAge, "PRE-FLIGHT: ETH/USD feed is already staler than ETH_USD_MAX_AGE");
     }
 
-    /// @notice The cap the ledger bounds the governance WOOD price with sits 1.25-2x
+    /// @notice The cap the ledger bounds the governance WOOD price with sits 1.25-4x
     ///         ABOVE spot: below market it binds on every read, far above it bounds
     ///         nothing. Takes both figures so the caller names its own spot source.
     function _requireCapAboveSpot(uint256 capX8, uint256 spotX8) internal pure {
         require(spotX8 != 0, "PRE-FLIGHT: WOOD spot is zero");
         require(capX8 >= (spotX8 * 125) / 100, "PRE-FLIGHT: WOOD_PRICE_CAP_X8 is below 1.25x spot");
-        require(capX8 <= spotX8 * 2, "PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 2x spot");
+        require(capX8 <= spotX8 * 4, "PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 4x spot");
     }
 
     // ── Helpers ──
