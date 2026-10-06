@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# The Robinhood mainnet ceremony, one command per stage. Run it, read where it stopped,
-# run it again: every step is idempotent and the stage is read back from the chain.
-#
-#   run 1  mints the core and WoodPoolFeed, stops at AwaitingWoodFeed
-#   wait   24h later: rolls WoodPoolFeed.update() until the feed answers
-#   run 2  mints the coverage stack, opens creation, then runs verify-robinhood.sh
+# The Robinhood mainnet ceremony in one command: run 1, the WOOD feed warm-up (one TWAP
+# window, 1h), run 2, then verify-robinhood.sh. Every step is idempotent and the stage is
+# read back from the chain, so an interrupted run is resumed by running it again.
 #
 # Each stage also verifies the sources of whatever was minted on Blockscout.
 #
@@ -49,63 +46,74 @@ feed_answers() {
   cast call "$1" 'latestRoundData()(uint80,int256,uint256,uint256,uint80)' --rpc-url $RPC >/dev/null 2>&1
 }
 
-# ── Between the runs: the feed is minted but does not answer yet ──
-FEED=$(book WOOD_USD_FEED)
-if has_code "$FEED" && ! feed_answers "$FEED"; then
-  say "WoodPoolFeed $FEED does not answer yet: rolling update()"
-  signed cast send "$FEED" 'update()' --rpc-url $RPC >/dev/null
-  if ! feed_answers "$FEED"; then
-    python3 script/verify-blockscout.py $CHAIN_ID || true
-    echo; echo "Still warming up. Re-run this script 24h after run 1."
-    exit 0
-  fi
-  echo "the feed answers: continuing to run 2"
-fi
+# Seconds until the feed's baseline snapshot is one window old.
+feed_wait() {
+  local window base
+  window=$(cast call "$1" 'window()(uint256)' --rpc-url $RPC | awk '{print $1}')
+  base=$(cast call "$1" 'latestObservation()(uint256,uint32)' --rpc-url $RPC | sed -n 2p | awk '{print $1}')
+  echo $((base + window + 30 - $(cast block latest -f timestamp --rpc-url $RPC)))
+}
 
-# ── DeployAll: run 1 or run 2, whichever the chain still owes ──
-say "forge build"
-forge build
-
-# The pre-flight wants a V2 trade in the last 5 min, and this pair trades about every 20 min.
 PAIR=$(book WOOD_WETH_V2_PAIR)
 pair_idle() {
   local last
   last=$(cast call "$PAIR" 'getReserves()(uint112,uint112,uint32)' --rpc-url $RPC | sed -n 3p | awk '{print $1}')
   echo $(($(cast block latest -f timestamp --rpc-url $RPC) - last))
 }
-IDLE=$(pair_idle)
-if [ "$IDLE" -gt "$MAX_PAIR_IDLE" ] && [ -n "${SYNC_PAIR:-}" ]; then
-  say "pair idle ${IDLE}s: sending sync()"
-  signed cast send "$PAIR" 'sync()' --rpc-url $RPC >/dev/null
+
+# The pre-flight wants a V2 trade in the last 5 min, and this pair trades about every 20 min.
+await_trade() {
   IDLE=$(pair_idle)
-fi
-if [ "$IDLE" -gt "$MAX_PAIR_IDLE" ]; then
-  say "pair idle ${IDLE}s: waiting up to 3h for a trade (SYNC_PAIR=1 skips the wait)"
-  for _ in $(seq 1 720); do
+  if [ "$IDLE" -gt "$MAX_PAIR_IDLE" ] && [ -n "${SYNC_PAIR:-}" ]; then
+    say "pair idle ${IDLE}s: sending sync()"
+    signed cast send "$PAIR" 'sync()' --rpc-url $RPC >/dev/null
     IDLE=$(pair_idle)
-    [ "$IDLE" -le "$MAX_PAIR_IDLE" ] && break
-    printf '  idle %ss\r' "$IDLE"; sleep 15
-  done
-fi
-[ "$IDLE" -le "$MAX_PAIR_IDLE" ] || { echo "no trade on the pair in 3h; re-run with SYNC_PAIR=1"; exit 1; }
+  fi
+  if [ "$IDLE" -gt "$MAX_PAIR_IDLE" ]; then
+    say "pair idle ${IDLE}s: waiting up to 3h for a trade (SYNC_PAIR=1 skips the wait)"
+    for _ in $(seq 1 720); do
+      IDLE=$(pair_idle)
+      [ "$IDLE" -le "$MAX_PAIR_IDLE" ] && break
+      printf '  idle %ss\r' "$IDLE"; sleep 15
+    done
+  fi
+  [ "$IDLE" -le "$MAX_PAIR_IDLE" ] || { echo "no trade on the pair in 3h; re-run with SYNC_PAIR=1"; exit 1; }
+}
 
-if [ -n "${DRY_RUN:-}" ]; then
-  say "DeployAll, dry run"
-  signed forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll --rpc-url $RPC --sender "$DEPLOYER"
-  exit 0
-fi
-say "DeployAll"
-signed forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll \
-  --rpc-url $RPC --sender "$DEPLOYER" --gas-estimate-multiplier 200 --broadcast --slow
+say "forge build"
+forge build
 
-say "Blockscout source verification"
 VERIFIED=0
-python3 script/verify-blockscout.py $CHAIN_ID || VERIFIED=1
+# Two passes at most: run 1, then run 2 once the feed answers.
+for PASS in 1 2; do
+  FEED=$(book WOOD_USD_FEED)
+  if has_code "$FEED" && ! feed_answers "$FEED"; then
+    WAIT=$(feed_wait "$FEED")
+    if [ "$WAIT" -gt 0 ]; then
+      say "WoodPoolFeed warm-up: sleeping ${WAIT}s"
+      sleep "$WAIT"
+    fi
+    say "rolling WoodPoolFeed.update()"
+    signed cast send "$FEED" 'update()' --rpc-url $RPC >/dev/null
+    feed_answers "$FEED" || { echo "the feed still does not answer; re-run this script"; exit 1; }
+  fi
 
-if ! has_code "$(book EXPOSURE_LEDGER)"; then
-  echo; echo "Run 1 done (AwaitingWoodFeed). Commit $BOOK, then re-run this script in 24h."
-  exit $VERIFIED
-fi
+  await_trade
+  if [ -n "${DRY_RUN:-}" ]; then
+    say "DeployAll, dry run"
+    signed forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll --rpc-url $RPC --sender "$DEPLOYER"
+    exit 0
+  fi
+  say "DeployAll, pass $PASS"
+  signed forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll \
+    --rpc-url $RPC --sender "$DEPLOYER" --gas-estimate-multiplier 200 --broadcast --slow
+
+  say "Blockscout source verification"
+  python3 script/verify-blockscout.py $CHAIN_ID || VERIFIED=1
+
+  has_code "$(book EXPOSURE_LEDGER)" && break
+done
+has_code "$(book EXPOSURE_LEDGER)" || { echo "the coverage stack was not minted; re-run this script"; exit 1; }
 
 # ── Run 2 finished ──
 say "verify-robinhood.sh"
@@ -125,5 +133,5 @@ if [ -n "${ALLOW_MORPHO_MARKET:-}" ]; then
   fi
 fi
 
-echo; echo "Ceremony complete. Commit $BOOK. WoodPoolFeed.update() stays a 24-26h keeper job."
+echo; echo "Ceremony complete. Commit $BOOK. WoodPoolFeed.update() stays an hourly keeper job (3h max delay)."
 exit $VERIFIED

@@ -152,7 +152,7 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         require(p.weth != address(0), "PRE-FLIGHT: WETH unset");
         require(p.ethUsdFeed != address(0), "PRE-FLIGHT: CHAINLINK_ETH_USD_FEED unset");
 
-        require(p.window >= 24 hours, "PRE-FLIGHT: TWAP_WINDOW below MIN_WINDOW (24h)");
+        require(p.window >= 30 minutes, "PRE-FLIGHT: TWAP_WINDOW below MIN_WINDOW (30 min)");
         require(p.window <= 7 days, "PRE-FLIGHT: TWAP_WINDOW above MAX_SNAPSHOT_SPAN (7d)");
         require(p.ethUsdMaxAge != 0, "PRE-FLIGHT: ETH_USD_MAX_AGE zero");
         require(

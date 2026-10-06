@@ -56,7 +56,7 @@ Nothing is read from the environment. Every number comes from
    last step. A vault minted earlier would get a governor with no exposure ledger
    and no bond escrow.
 3. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
-   `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
+   `latestRoundData()` answers — one `window` (`TWAP_WINDOW`, 1h at launch). The deployer
    key owns every contract for this whole interval; that is the cost of the
    warm-up, and it is why step 2 hands nothing off.
    **Before launch, record who holds the WOOD/WETH liquidity**: the V3 full-range

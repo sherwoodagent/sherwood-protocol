@@ -140,7 +140,7 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   single `AggregatorV3`-shaped WOOD/USD feed, takes `min(feed, woodUsdPriceX8)`
   — the cap is never served as a price — and applies `woodHaircutBps`. On chain
   4663 that feed is `WoodPoolFeed`: the lower of two WOOD/WETH TWAPs over a
-  window of at least 24h, converted through ETH/USD. One leg is the Uniswap V2
+  window of at least 30 min (1h at launch), converted through ETH/USD. One leg is the Uniswap V2
   pair, synced before each snapshot so there is no idle tail, held to a WETH
   reserve floor; the other is the Uniswap V3 pool `0xF683…1C69`, held to an
   in-range `liquidity()` floor instead. **Both legs are averaged from
@@ -150,8 +150,8 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   so a crash there is tracked between rolls, not hidden until the next one. A backward `observe([window])` would: the observation ring
   is written by ANY swapper, one slot per SECOND in which the pool is touched,
   and `observationCardinality` is a `uint16`, so the longest ring anyone can pay
-  for reaches 18h12m against a per-second writer and no ring size can serve a 24h
-  window (v1 audit F2). `DeployWoodPoolFeed` pre-flights only that the pool
+  for reaches 18h12m against a per-second writer, and the feed should not depend
+  on history a swapper can evict at any window (v1 audit F2). `DeployWoodPoolFeed` pre-flights only that the pool
   serves `observe([0])`, which any initialised pool does.
   **`min` means the SHALLOWER venue binds**, and today that is the V3 pool
   (~$122k of notional against the V2 pair's ~$330k), so the cost of pushing the

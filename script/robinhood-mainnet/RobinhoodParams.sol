@@ -47,7 +47,8 @@ library RobinhoodParams {
     uint256 internal constant WOOD_HAIRCUT_BPS = 5000;
 
     // WoodPoolFeed
-    uint256 internal constant TWAP_WINDOW = 24 hours;
+    // Twice the 30 min floor: both WOOD/WETH pools are thin. The feed warm-up between the two runs is one window.
+    uint256 internal constant TWAP_WINDOW = 1 hours;
     // 4663's ETH/USD feed heartbeats at 24h, so a bound of exactly 24h halts every WOOD read on a
     // round published one second late. Same 2h allowance as `ASSET_FEED_MAX_DELAY`.
     uint256 internal constant ETH_USD_HEARTBEAT = 1 days;
