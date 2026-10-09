@@ -128,8 +128,15 @@ Re-record the constant deliberately; never to get a build green.
 
 ```bash
 forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood \
-  --sig "run(address[],uint256[],uint256)" "[0x…,0x…]" "[<whole WOOD>,<whole WOOD>]" <reserve, whole WOOD>
+  --sig "run(address,address[],uint256[],uint256)" <Safe> "[0x…,0x…,0x…]" "[<whole WOOD>,…]" <reserve, whole WOOD>
 ```
+
+The first argument is the Safe that holds the WOOD (`0x0aEB…04F3` on 4663), given
+explicitly because the launch book names the deployer as `OWNER_MULTISIG` until
+the handoff. The v1 plan (SHE-355, `docs/launch-notes.md`): three approving keys
+at 10M each (voter-2, voter-3, voter-4) and a 70M reserve. voter-1 stays veto-only
+and is not part of this ceremony; if it needs `minGuardianStake` to vote Block, it
+stakes 10k from itself and is never listed as an approving key.
 
 1. The Safe's two signers (not the deployer) submit the printed calls as one batch: `WOOD.transfer` to each approving key, then `WOOD.approve(sWOOD, reserve)` and `sWOOD.stakeAsGuardian(reserve, 0)`.
 2. Each approving key, from itself: `WOOD.approve(sWOOD, amount)`, then `sWOOD.stakeAsGuardian(amount, 0)`.

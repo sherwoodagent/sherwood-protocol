@@ -14,18 +14,24 @@ import {StakedWood} from "../../src/StakedWood.sol";
 ///         so the topology must be final before the first stake (SHE-351).
 ///
 ///   forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood \
-///     --sig "run(address[],uint256[],uint256)" "[0xA,0xB]" "[2000000,2000000]" 60000000
+///     --sig "run(address,address[],uint256[],uint256)" 0x0aEB6792F3d7cE56460F96a66ff5abf518Ed04F3 \
+///     "[0xA,0xB,0xC]" "[10000000,10000000,10000000]" 70000000
+///
+///   The Safe that holds the WOOD is an argument, not the book's `OWNER_MULTISIG`: during the
+///   deferred-handoff launch the book names the deployer there, and the stake happens before run 2
+///   while the deployer still owns everything.
 contract StakeFleet is ScriptBase {
     struct Call {
         address target;
         bytes data;
     }
 
+    /// @param safe The Safe that holds the fleet's WOOD and stakes the juror reserve under its own address.
     /// @param keys Approving keys.
     /// @param wood Each key's stake, in whole WOOD.
     /// @param reserve The juror reserve, in whole WOOD.
-    function run(address[] memory keys, uint256[] memory wood, uint256 reserve) external view {
-        address safe = _readAddress("OWNER_MULTISIG");
+    function run(address safe, address[] memory keys, uint256[] memory wood, uint256 reserve) external view {
+        require(safe.code.length != 0, "StakeFleet: the Safe must be a contract, not an EOA");
         StakedWood swood = StakedWood(_readAddress("STAKED_WOOD"));
 
         for (uint256 i; i < wood.length; ++i) {
@@ -63,6 +69,7 @@ contract StakeFleet is ScriptBase {
         uint256 total = reserve;
         calls = new Call[](keys.length + 2);
         for (uint256 i; i < keys.length; ++i) {
+            require(keys[i] != address(0), "StakeFleet: zero key");
             require(keys[i] != safe, "StakeFleet: the Safe is the reserve and never approves");
             for (uint256 j; j < i; ++j) {
                 require(keys[j] != keys[i], "StakeFleet: duplicate key");

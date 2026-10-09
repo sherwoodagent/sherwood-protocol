@@ -111,4 +111,15 @@ contract StakeFleetTest is Test {
         vm.expectRevert(bytes("StakeFleet: Safe holds too little WOOD"));
         script.plan(swood, safe, k, w, 96_000_000e18);
     }
+
+    function test_refusesAZeroKey() public {
+        address[] memory k = new address[](2);
+        uint256[] memory w = new uint256[](2);
+        k[0] = makeAddr("k0");
+        k[1] = address(0);
+        w[0] = 2_000_000e18;
+        w[1] = 2_000_000e18;
+        vm.expectRevert(bytes("StakeFleet: zero key"));
+        script.plan(swood, safe, k, w, 60_000_000e18);
+    }
 }
