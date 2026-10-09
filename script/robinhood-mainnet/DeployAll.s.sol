@@ -161,6 +161,11 @@ contract DeployAll is
         s.challengeGame = deploy(_planDBook(s, i));
         _deployCourt(s);
         _wireCourt(s);
+        // Beta posture (SHE-352, audit 2026-10-08 D-1/D-2): no challenge may be filed until the fleet's
+        // juror reserve is 30 days old, or one aged 10k-WOOD outsider (or 7 days of silence) convicts
+        // every approving key. Gates `file` only; the owner lifts it with setFilingsPaused(false).
+        ChallengeGame game = ChallengeGame(s.challengeGame);
+        if (!game.filingsPaused()) game.setFilingsPaused(true);
 
         _requireNoPredictionDrift(c3, s, i.posture);
 
@@ -504,6 +509,7 @@ contract DeployAll is
         require(TokenCourt(s.tokenCourt).challengeGame() == s.challengeGame, "wiring: court.challengeGame");
         require(TokenCourt(s.tokenCourt).stakedWood() == s.core.swoodProxy, "wiring: court.stakedWood");
         require(ChallengeGame(s.challengeGame).court() == s.tokenCourt, "wiring: game.court");
+        require(ChallengeGame(s.challengeGame).filingsPaused(), "game.filingsPaused");
 
         // Plan B pre-flight 10 in its new home. The ledger's owner is the slashing and
         // freeze authority; on Mainnet it must end up at a CONTRACT (the Safe), and a

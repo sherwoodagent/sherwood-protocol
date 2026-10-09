@@ -233,6 +233,8 @@ check "game.stakedWood (reciprocal)"  "$(call "$GAME" 'stakedWood()(address)')" 
 check "game.exposureLedger"           "$(call "$GAME" 'exposureLedger()(address)')"      "$LEDGER"
 check "game.tierRegistry"             "$(call "$GAME" 'tierRegistry()(address)')"        "$TIERS"
 check "game.challengeWindow == ledger" "$(call "$GAME" 'challengeWindow()(uint256)')"    "$(call "$LEDGER" 'challengeWindow()(uint256)')"
+# Beta posture (SHE-352): filings stay paused until the juror reserve is 30 days old.
+check "game.filingsPaused (beta posture)" "$(call "$GAME" 'filingsPaused()(bool)')"      "true"
 
 if [ -n "$COURT" ]; then
 echo; echo "── TokenCourt ──"
