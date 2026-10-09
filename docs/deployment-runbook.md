@@ -115,6 +115,27 @@ Re-record the constant deliberately; never to get a build green.
 
 ---
 
+## 1b. Fleet stake — before run 2, before any outsider
+
+`StakedWood` has been live since run 1 and staking is permissionless. Whoever stakes first owns the TokenCourt until the other side's stake is 30 days old. A 10k-WOOD outsider who stakes first can convict alone while every fleet juror is still refused. So the fleet stakes from the Safe **before run 2 opens creation**. `stakeAsGuardian` does not read the ledger, so this works before run 2.
+
+**Topology first, then stake.** A top-up re-anchors `stakedAt` to the stake-weighted average, which resets part of the 30-day clock. Fix the topology before the first stake:
+
+- **Approving keys**: small dedicated keys whose stake ≈ the lock they will carry, each ≥ `minGuardianStake` (10,000 WOOD). Only these keys approve. The review-path burn is 10% of *approving* stake.
+- **Juror reserve**: staked by the Safe under its own address. It never approves and never funds counter-bonds. Size it at least as large as the largest plausible aged outside stake: a reserve that never votes still raises the court floor and the 3F/7 blocking bar.
+
+**Run** (prints the plan, broadcasts nothing; it refuses any key or the Safe that already holds stake, the Safe as an approving key, a duplicate key, an amount under the minimum, and a plan the Safe cannot fund):
+
+```bash
+FLEET_APPROVERS=0x…,0x… FLEET_APPROVER_WOOD=<whole WOOD>,<whole WOOD> FLEET_RESERVE_WOOD=<whole WOOD> \
+  forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood
+```
+
+1. The Safe's two signers (not the deployer) submit the printed calls as one batch: `WOOD.transfer` to each approving key, then `WOOD.approve(sWOOD, reserve)` and `sWOOD.stakeAsGuardian(reserve, 0)`.
+2. Each approving key, from itself: `WOOD.approve(sWOOD, amount)`, then `sWOOD.stakeAsGuardian(amount, 0)`.
+3. **Record** in the launch notes which address plays which role, each key's `stakedAt`, and `totalGuardianStake`. That timestamp starts the 30-day court maturation that gates unpausing filings, and with it general access.
+4. No fleet key approves until the per-vault lock cap (SHE-299) is live on the voters.
+
 ## 2. Per-syndicate seeding — required, and not part of any script
 
 Three risk parameters ship inert, and no deploy script can seed them: they live
