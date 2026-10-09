@@ -300,7 +300,7 @@ commit; re-derive them if it moves. Values not listed here are read from
 | `MIN_SLASH_BPS` / `MAX_SLASH_BPS` | `:32`, `:33` | 1000 / 10,000 | `StakedWood.initialize`; Plan B pre-flight requires the 10,000 ceiling |
 | `AGE_FLOOR_BPS` | `:34` | 2500 | `StakedWood.initialize`; court pre-flight 4 compares against it |
 | `MATURATION` | `:35` | 30d | `StakedWood.initialize` |
-| `EPOCH_LENGTH` | `:38` | 28d | `ExposureLedger` constructor, immutable |
+| `EPOCH_LENGTH` | `:38` | 7d (28d before SHE-356) | `ExposureLedger` constructor, immutable |
 | `EXPECTED_CHALLENGE_WINDOW` | `:39` | 14d | Plan B / Plan D drift guard |
 | `WOOD_HAIRCUT_BPS` | `:41` | 5000 | `setWoodHaircutBps`; sits ON the ledger's `MIN_WOOD_HAIRCUT_BPS` floor |
 | `TWAP_WINDOW` | `:44` | 24h | `WoodPoolFeed` constructor |

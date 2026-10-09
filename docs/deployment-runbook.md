@@ -69,6 +69,13 @@ Nothing is read from the environment. Every number comes from
    TokenCourt deploy, and as its last step before the handoff the run opens
    creation by pointing the factory at the real ERC-8004 registry (refusing if any
    syndicate exists). Creation then costs the invite-only fee (1M WOOD to the Safe).
+   The run also leaves `ChallengeGame.filingsPaused() == true` (SHE-352): no
+   challenge can be filed until the fleet's juror reserve is 30 days old, because
+   until then one aged 10k-WOOD outsider, or 7 days of silence, convicts every
+   approving key (audit 2026-10-08, D-1/D-2). The owner lifts it with
+   `setFilingsPaused(false)` once `StakedWood.stakedAt(reserve) + 30d` has passed
+   and the counter-bond treasury and keeper are live (SHE-361). `verify-robinhood.sh`
+   expects the flag set.
    The handoff runs and `deployAll` returns `Checkpoint.Complete`. Addresses are
    written to `chains/4663.json` last. If a `WoodPoolFeed` with a different
    `ethUsdMaxAge` was already deployed on the target chain, the run refuses to

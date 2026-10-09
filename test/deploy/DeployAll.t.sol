@@ -452,6 +452,24 @@ contract DeployAllTest is DeployAllFixture {
         assertTrue(script.stageOf(s, address(safe)) == Stage.Done, "stageOf == Done");
         // Pinned literally, not via RobinhoodParams, so zeroing or mistyping the constant fails here.
         assertEq(address(factory.agentRegistry()), 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, "ERC-8004 registry");
+        // Beta posture (SHE-352): the game ships with filings paused; the owner lifts it later.
+        assertTrue(ChallengeGame(s.challengeGame).filingsPaused(), "filings paused at the end of run 2");
+        // The one-shot epoch length is the launch value (SHE-356).
+        assertEq(ExposureLedger(s.exposureLedger).epochLength(), 7 days, "epochLength 7d");
+    }
+
+    /// @notice Validation refuses a finished ceremony whose challenge filings were unpaused.
+    function test_mainnet_validateAllRefusesUnpausedFilings() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        (Stack memory first,) = _runCeremony(Posture.Mainnet);
+        _primeWoodFeed(first.woodUsdFeed);
+        (Stack memory s,) = _runCeremony(Posture.Mainnet);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        vm.prank(deployer);
+        ChallengeGame(s.challengeGame).setFilingsPaused(false);
+
+        vm.expectRevert(bytes("game.filingsPaused"));
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
     }
 
     /// @notice A Mainnet book naming the DEPLOYER as `OWNER_MULTISIG` completes with no handoff.

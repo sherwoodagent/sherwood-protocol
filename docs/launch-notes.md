@@ -120,3 +120,40 @@ The bound multiplies capacity; nothing else does.
 Carlos supplies the figure. Until it lands, the plan is sized for **$250k**
 with 30-day strategies; a 7-day cadence needs the 500 bps bound or a third of
 the TVL.
+
+## Run-2 constants (SHE-356, 2026-10-09)
+
+- `EPOCH_LENGTH` **7d** (was 28d; SHE-250). Ana's capacity plan above prices it at
+  +17% capacity at 30-day cadence and +28% at 7-day, for free; the audit (F-3) confirms
+  7d and 28d both pass the 16-bucket scan bound and keep every lock past the challenge
+  deadline. Cost: any future `challengeWindow` is capped at 38d. Constructor immutable.
+- `CAP_OVER_SPOT_BPS` stays **40_000** (PR #381). The audit (F-2) recommends ≤ 20_000:
+  at 4× with the 50% haircut a source the cap admits can value bonds at up to 2× true
+  worth, and the spec's band says 2×. Carlos kept Ana's 4× (the 24h two-pool TWAP is the
+  manipulation control; a tighter cap binds on an ordinary rally) and the cap is
+  owner-settable after deploy (`setWoodUsdPrice`), reviewed monthly.
+
+## Challenge filings paused through the beta (SHE-352, 2026-10-09)
+
+Run 2 ends with `ChallengeGame.setFilingsPaused(true)`. Reason (audit 2026-10-08,
+D-1/D-2/D-1b/F-9): `file` is permissionless; silence for 7 days convicts every approving
+key for the 10% floor, and if the fleet counter-bonds, TokenCourt bars the accused and one
+outsider with 10k WOOD staked 30 days earlier convicts alone. With filings paused every
+court path is unreachable, so the fleet can approve from the first beta proposal.
+Cost: no ex-post challenge backstop for depositors during the beta. Accepted because every
+depositor is whitelisted by its own vault owner and `ownerOnlyProposals` is on. Unpause
+(SHE-361) once the juror reserve staked under the Safe is 30 days old and the counter-bond
+treasury (47.4M liquid WOOD in the Safe) and the keeper's `ChallengeFiled` watcher
+(sherwood-guardian #84, `COUNTER_BOND_MAX_WOOD` > 0) are live.
+
+## Expected beta TVL (SHE-355, Carlos, 2026-10-09)
+
+At most $10k per vault, median $100–1k, and under $100k for the cohort in total. Against
+the table above at EPOCH 7d: a $100k beta of 30-day strategies needs ≈ 28M approving WOOD
+at the 2,000 bps Portfolio bound (PR #324) and ≈ 142M uncertified; at 7-day cadence ≈ 65M
+at 2,000 bps and ≈ 325M uncertified. So the 30M approving tranche carries the cohort
+**only with the Portfolio class certified at ≤ 2,000 bps** (SHE-235); uncertified it
+carries ≈ $20k. A 7-day cadence needs a second 30M tranche in new keys or the 500 bps
+bound. Lighter is in scope for the beta (Carlos): it is an uncertified community template,
+so each Lighter proposal books 2× its capital at full notional out of the same tranche,
+and the audit's G-1/G-2 (SHE-365) must be closed before the template is approved on 4663.
