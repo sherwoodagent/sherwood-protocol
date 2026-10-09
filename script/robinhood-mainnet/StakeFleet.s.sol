@@ -13,18 +13,18 @@ import {StakedWood} from "../../src/StakedWood.sol";
 /// @dev    Refuses any key (or the Safe) that already holds stake: a top-up re-anchors `stakedAt`,
 ///         so the topology must be final before the first stake (SHE-351).
 ///
-///   FLEET_APPROVERS=0xA,0xB FLEET_APPROVER_WOOD=2000000,2000000 FLEET_RESERVE_WOOD=60000000 \
-///     forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood
+///   forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood \
+///     --sig "run(address[],uint256[],uint256)" "[0xA,0xB]" "[2000000,2000000]" 60000000
 contract StakeFleet is ScriptBase {
     struct Call {
         address target;
         bytes data;
     }
 
-    function run() external view {
-        address[] memory keys = vm.envAddress("FLEET_APPROVERS", ",");
-        uint256[] memory wood = vm.envUint("FLEET_APPROVER_WOOD", ",");
-        uint256 reserve = vm.envUint("FLEET_RESERVE_WOOD");
+    /// @param keys Approving keys.
+    /// @param wood Each key's stake, in whole WOOD.
+    /// @param reserve The juror reserve, in whole WOOD.
+    function run(address[] memory keys, uint256[] memory wood, uint256 reserve) external view {
         address safe = _readAddress("OWNER_MULTISIG");
         StakedWood swood = StakedWood(_readAddress("STAKED_WOOD"));
 

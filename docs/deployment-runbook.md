@@ -127,8 +127,8 @@ Re-record the constant deliberately; never to get a build green.
 **Run** (prints the plan, broadcasts nothing; it refuses any key or the Safe that already holds stake, the Safe as an approving key, a duplicate key, an amount under the minimum, and a plan the Safe cannot fund):
 
 ```bash
-FLEET_APPROVERS=0x…,0x… FLEET_APPROVER_WOOD=<whole WOOD>,<whole WOOD> FLEET_RESERVE_WOOD=<whole WOOD> \
-  forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood
+forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood \
+  --sig "run(address[],uint256[],uint256)" "[0x…,0x…]" "[<whole WOOD>,<whole WOOD>]" <reserve, whole WOOD>
 ```
 
 1. The Safe's two signers (not the deployer) submit the printed calls as one batch: `WOOD.transfer` to each approving key, then `WOOD.approve(sWOOD, reserve)` and `sWOOD.stakeAsGuardian(reserve, 0)`.
