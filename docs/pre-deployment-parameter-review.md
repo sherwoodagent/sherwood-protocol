@@ -300,7 +300,7 @@ commit; re-derive them if it moves. Values not listed here are read from
 | `MIN_SLASH_BPS` / `MAX_SLASH_BPS` | `:32`, `:33` | 1000 / 10,000 | `StakedWood.initialize`; Plan B pre-flight requires the 10,000 ceiling |
 | `AGE_FLOOR_BPS` | `:34` | 2500 | `StakedWood.initialize`; court pre-flight 4 compares against it |
 | `MATURATION` | `:35` | 30d | `StakedWood.initialize` |
-| `EPOCH_LENGTH` | `:38` | 28d | `ExposureLedger` constructor, immutable |
+| `EPOCH_LENGTH` | `:38` | 7d (28d before SHE-356) | `ExposureLedger` constructor, immutable |
 | `EXPECTED_CHALLENGE_WINDOW` | `:39` | 14d | Plan B / Plan D drift guard |
 | `WOOD_HAIRCUT_BPS` | `:41` | 5000 | `setWoodHaircutBps`; sits ON the ledger's `MIN_WOOD_HAIRCUT_BPS` floor |
 | `TWAP_WINDOW` | `:44` | 24h | `WoodPoolFeed` constructor |
@@ -336,10 +336,10 @@ cohort is willing to underwrite in a single approval — not a derivation. Owner
 with no bounds and read live on every propose, so it is a starting point: lowering it
 after launch is one Safe transaction and takes effect on the next proposal.
 
-**`CAP_OVER_SPOT_BPS` (`15_000` = 1.5x).** No WOOD price is committed. BOTH postures
+**`CAP_OVER_SPOT_BPS` (`40_000` = 4x).** No WOOD price is committed. BOTH postures
 DERIVE the cap at deploy time as `spot * CAP_OVER_SPOT_BPS / 10_000` from the live
 WOOD/WETH pair and the ETH/USD feed, and the ceremony still refuses anything outside
-`[1.25x, 2x]` of that same spot. The cap is the manipulation ceiling: `min(market,
+`[1.25x, 4x]` of that same spot. The cap is the manipulation ceiling: `min(market,
 cap)`, never served as a price, and it SHALL sit ABOVE market.
 
 - Committing a measured price is the shape this replaces, and it does not survive

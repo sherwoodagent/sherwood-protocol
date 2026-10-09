@@ -121,7 +121,7 @@ A healthy feed answer SHALL be normalized to 8 decimals using the feed decimals 
 
 ### Requirement: Coverage epochs are a fixed wall-clock schedule
 
-The `ExposureLedger` SHALL derive coverage epochs from an immutable schedule: `epochLength` is set at construction (non-zero; 28 days initial per design §5), `epochGenesis` is the deployment timestamp, and `currentEpoch() = (block.timestamp - epochGenesis) / epochLength`. Guardian exposure SHALL be bucketed by epoch so that open exposure counts only buckets whose challenge window has not elapsed — bounding each commitment at one epoch plus the challenge window regardless of strategy duration. See `openspec/specs/exposure-ledger/spec.md` for the bucket accounting itself.
+The `ExposureLedger` SHALL derive coverage epochs from an immutable schedule: `epochLength` is set at construction (non-zero; 7 days at the v1 launch per SHE-356, 28 days in design §5), `epochGenesis` is the deployment timestamp, and `currentEpoch() = (block.timestamp - epochGenesis) / epochLength`. Guardian exposure SHALL be bucketed by epoch so that open exposure counts only buckets whose challenge window has not elapsed — bounding each commitment at one epoch plus the challenge window regardless of strategy duration. See `openspec/specs/exposure-ledger/spec.md` for the bucket accounting itself.
 
 #### Scenario: Epoch index advances on wall clock
 

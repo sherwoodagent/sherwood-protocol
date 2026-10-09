@@ -49,6 +49,6 @@ struct Stack {
     address challengeGame;
     address tokenCourt;
     // The WOOD manipulation ceiling this run seats. Mainnet takes the reviewed constant; a fork
-    // derives it from its own spot, so both postures clear the same [1.25x, 2x] band.
+    // derives it from its own spot, so both postures clear the same [1.25x, 4x] band.
     uint256 woodPriceCapX8;
 }

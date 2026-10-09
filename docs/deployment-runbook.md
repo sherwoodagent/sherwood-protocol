@@ -69,6 +69,13 @@ Nothing is read from the environment. Every number comes from
    TokenCourt deploy, and as its last step before the handoff the run opens
    creation by pointing the factory at the real ERC-8004 registry (refusing if any
    syndicate exists). Creation then costs the invite-only fee (1M WOOD to the Safe).
+   The run also leaves `ChallengeGame.filingsPaused() == true` (SHE-352): no
+   challenge can be filed until the fleet's juror reserve is 30 days old, because
+   until then one aged 10k-WOOD outsider, or 7 days of silence, convicts every
+   approving key (audit 2026-10-08, D-1/D-2). The owner lifts it with
+   `setFilingsPaused(false)` once `StakedWood.stakedAt(reserve) + 30d` has passed
+   and the counter-bond treasury and keeper are live (SHE-361). `verify-robinhood.sh`
+   expects the flag set.
    The handoff runs and `deployAll` returns `Checkpoint.Complete`. Addresses are
    written to `chains/4663.json` last. If a `WoodPoolFeed` with a different
    `ethUsdMaxAge` was already deployed on the target chain, the run refuses to
@@ -81,6 +88,15 @@ Nothing is read from the environment. Every number comes from
    reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
+   **Deferred handoff (v1 launch).** `chains/4663.json` names the deployer as
+   `OWNER_MULTISIG`, so run 2 hands nothing off and this step is skipped: the
+   deployer key owns every contract and receives the creation fee. To hand off
+   later: set `OWNER_MULTISIG` to the real owner (a contract), call
+   `factory.setCreationFee(WOOD, 1_000_000e18, <owner>)` from the deployer, re-run
+   `DeployAll` (it sends only the transfers), then do this step.
+
+   `script/robinhood-mainnet/deploy.sh` wraps steps 2 to 6 and verifies the
+   sources on Blockscout; run it once per stage.
 6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
    address from the book's `CREATE3_FACTORY` and fails on any disagreement, and
    checks that every live governor carries the factory's ledger, escrow and tier
