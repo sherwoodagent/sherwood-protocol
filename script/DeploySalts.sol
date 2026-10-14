@@ -18,6 +18,9 @@ library DeploySalts {
     bytes32 internal constant VAULT_IMPL = keccak256("sherwood.robinhood.v1.vault-impl");
     bytes32 internal constant PROTOCOL_CONFIG = keccak256("sherwood.robinhood.v1.protocol-config");
     bytes32 internal constant GOVERNOR_IMPL = keccak256("sherwood.robinhood.v1.governor-impl");
+    // 30-minute timing floors (2026-10-14): the impls `LowerTimingFloors` seats behind the live proxies.
+    bytes32 internal constant GOVERNOR_IMPL_30M = keccak256("sherwood.robinhood.v1.governor-impl-30m");
+    bytes32 internal constant REGISTRY_IMPL_30M = keccak256("sherwood.robinhood.v1.guardian-registry-impl-30m");
     bytes32 internal constant GOVERNOR_BEACON = keccak256("sherwood.robinhood.v1.governor-beacon");
     bytes32 internal constant SWOOD_IMPL = keccak256("sherwood.robinhood.v1.staked-wood-impl");
     bytes32 internal constant SWOOD_PROXY = keccak256("sherwood.robinhood.v1.staked-wood-proxy");

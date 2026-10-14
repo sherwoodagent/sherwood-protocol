@@ -191,6 +191,44 @@ The ceremony wires `WoodPoolFeed` (24h stored snapshots, rolled by a keeper). Th
 
 Standing rule after the swap: the cap is static while WOOD moves. When the feed falls below `cap / 2.5`, lower the cap with `setWoodUsdPrice` to 2x the feed within a day.
 
+## 1d. 30-minute timing floors — after run 2
+
+`MIN_VOTING_PERIOD` (governor impl) and `minReviewPeriod` (registry impl) are
+constructor immutables, so lowering them from 1h/6h to 30 min is a new
+implementation behind each live proxy. Storage is untouched and the operating
+values do not move: the owner lowers `reviewPeriod` and each vault's
+`votingPeriod` afterwards, as separate calls.
+
+A 30-minute review window is only as good as the fleet's uptime inside it: an
+unopened or unquorate review resolves `Cleared`, which is passage. Execution
+still needs an approver's coverage, and the LATE_VOTE_LOCKOUT_BPS tail makes the
+last 10% of the window unvotable (3 minutes of a 30-minute one). Before seating
+30 minutes, confirm the voters poll fast enough to decide inside it and that the
+block quorum survives one voter being down.
+
+1. **Upgrade both implementations** (the owner of the beacon and the registry, one run):
+   ```bash
+   forge script script/robinhood-mainnet/LowerTimingFloors.s.sol:LowerTimingFloors \
+     --rpc-url robinhood --account sherwood-deployer --broadcast --slow
+   ```
+   It mints both impls at their own CREATE3 salts, refuses an impl whose floors
+   are not the booked ones or that would move `MIN_COOLDOWN_PERIOD`, refuses a
+   re-run once the live floors are already at or below 30 min, and asserts after
+   each swap that the floor moved and the registry's storage did not.
+2. **Seat the operating values.** The floors only permit the shorter windows;
+   nothing shortens on its own. From the registry owner:
+   `registry.setReviewPeriod(1800)` — bounded above by `sWOOD.coolDownPeriod()`
+   (7 d) and below by the new floor. Per vault, from the vault owner:
+   `governor.setVotingPeriod(1800)` (`whenNoActiveProposal`).
+3. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` checks
+   `registry.minReviewPeriod == 1800` and `governorImpl.MIN_VOTING_PERIOD == 1800`.
+
+Rehearse on an anvil fork with `--disable-code-size-limit`: the governor
+implementation is 37,012 bytes, which 4663 accepts (ArbOS caps code at 98,304)
+and vanilla revm rejects at the standard 24,576. Without the flag the governor
+impl deploy fails with status 0 and the beacon keeps the old implementation,
+which looks like a script bug and is not.
+
 ---
 
 ## 2. Per-syndicate seeding — required, and not part of any script

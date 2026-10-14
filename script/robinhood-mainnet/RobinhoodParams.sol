@@ -19,12 +19,14 @@ library RobinhoodParams {
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
     // Invite-only window: 1M WOOD (~$5.9k) per unsponsored fund, so sponsorship is the way in.
     uint256 internal constant INVITE_ONLY_CREATION_FEE = 1_000_000e18;
-    // Governor-impl IMMUTABLE, so this deploy is the only chance to set it. Held at the
-    // per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod` itself;
-    // the operating value is the factory's 24h default, which owners may now lower.
-    uint256 internal constant MIN_VOTING_PERIOD = 1 hours;
+    // Governor-impl IMMUTABLE: changing it is a new impl behind the beacon (`LowerTimingFloors`).
+    // Held at the per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod`
+    // itself; the operating value is the factory's 24h default, which owners may lower.
+    // 30 min (2026-10-14): the fleet is autonomous, and the veto is bounded by coverage.
+    uint256 internal constant MIN_VOTING_PERIOD = 30 minutes;
     uint256 internal constant MIN_COOLDOWN_PERIOD = 1 hours;
-    uint256 internal constant MIN_REVIEW_PERIOD = 6 hours;
+    // Registry-impl IMMUTABLE; same upgrade path. Operating value is `reviewPeriod` (owner-set).
+    uint256 internal constant MIN_REVIEW_PERIOD = 30 minutes;
     uint256 internal constant MAX_STRATEGY_DURATION = 30 days;
 
     // Guardian registry

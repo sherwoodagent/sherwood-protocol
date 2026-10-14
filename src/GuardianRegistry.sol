@@ -274,7 +274,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     uint256[48] private __gap;
 
     /// @notice Per-deployment hard floor for `reviewPeriod` (impl-time immutable;
-    ///         mainnet 6h). Lives in bytecode, not storage, so the layout is
+    ///         mainnet 30 min). Lives in bytecode, not storage, so the layout is
     ///         unchanged and the value resolves through the UUPS proxy. A testnet
     ///         impl may deploy a lower floor; the 7-day ceiling and the
     ///         `reviewPeriod <= sWOOD.coolDownPeriod()` invariant still hold.
@@ -285,7 +285,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     uint256 internal constant ABSOLUTE_MIN_REVIEW_FLOOR = 1 minutes;
 
     // ── Initializer ──
-    /// @param minReviewPeriod_ Per-deployment `reviewPeriod` floor (mainnet 6h).
+    /// @param minReviewPeriod_ Per-deployment `reviewPeriod` floor (mainnet 30 min).
     /// @dev Bounded `[1 minutes, 3 days]` so an arg-less deploy reverts rather than
     ///      silently seating a 0 floor (which would let `setReviewPeriod(0)` disable
     ///      the review window).
@@ -1113,7 +1113,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev Enforces the absolute `[6 hours, 3 days]` bounds AND the
+    /// @dev Enforces the `[minReviewPeriod, 3 days]` bounds AND the
     ///      `coolDownPeriod >= reviewPeriod` cross-contract invariant: the review
     ///      window may not exceed sWOOD's guardian unstake cooldown, or an
     ///      approver could unstake and escape the slash before `resolveReview`.

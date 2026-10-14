@@ -289,9 +289,9 @@ commit; re-derive them if it moves. Values not listed here are read from
 |---|---|---|---|
 | `ROBINHOOD_MAX_CODE_SIZE` | `:9` | 98,304 | CL template size gate |
 | `MANAGEMENT_FEE_BPS` | `:18` | 200 | `deployCore` → factory, stamped per vault |
-| `MIN_VOTING_PERIOD` | `:22` | 1h | governor impl immutable; the per-vault floor (SHE-234), not the operating value |
+| `MIN_VOTING_PERIOD` | `:22` | 30 min | governor impl immutable; the per-vault floor (SHE-234), not the operating value. Lowered from 1h on 2026-10-14 (`LowerTimingFloors`) |
 | `MIN_COOLDOWN_PERIOD` | `:20` | 1h | governor impl immutable |
-| `MIN_REVIEW_PERIOD` | `:21` | 6h | governor impl immutable |
+| `MIN_REVIEW_PERIOD` | `:21` | 30 min | registry impl immutable. Lowered from 6h on 2026-10-14 (`LowerTimingFloors`) |
 | `MAX_STRATEGY_DURATION` | `:22` | 30d | `ProtocolConfig.setMaxStrategyDuration`, seated only when zero |
 | `REVIEW_PERIOD` | `:25` | 24h | `GuardianRegistry.initialize` |
 | `BLOCK_QUORUM_BPS` | `:26` | 3000 | `GuardianRegistry.initialize` |
