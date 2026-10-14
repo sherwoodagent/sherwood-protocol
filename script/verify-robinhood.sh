@@ -45,6 +45,15 @@ bad()  { printf '  \033[31mFAIL\033[0m %-46s %s\n' "$1" "$2"; FAIL=$((FAIL+1)); 
 check() {
   if [ "$(lc "$2")" = "$(lc "$3")" ]; then ok "$1" "$2"; else bad "$1" "got $2 want $3"; fi
 }
+# check_range <label> <actual> <lo> <hi> — inclusive, for an OPERATING value the owner
+# tunes. Pinning a literal here goes stale the first time the owner moves it, and a check
+# that is always red gets ignored; the bound is what the contract itself enforces.
+check_range() {
+  for n in "$2" "$3" "$4"; do
+    case "$n" in ''|*[!0-9]*) bad "$1" "unread (got '$2', bounds '$3'..'$4')"; return;; esac
+  done
+  if [ "$2" -ge "$3" ] && [ "$2" -le "$4" ]; then ok "$1" "$2 (in $3..$4)"; else bad "$1" "$2 outside $3..$4"; fi
+}
 call() { cast call "$1" "$2" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{print $1}'; }
 call1() { cast call "$1" "$2" "$3" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{print $1}'; }
 
@@ -133,9 +142,16 @@ else
 fi
 check "swood.wood"                    "$(call "$SWOOD" 'wood()(address)')"              "$WOOD"
 check "swood.registry"                "$(call "$SWOOD" 'registry()(address)')"          "$REGISTRY"
-check "registry.reviewPeriod == 24h"  "$(call "$REGISTRY" 'reviewPeriod()(uint256)')"   "86400"
-check "registry.blockQuorumBps == 30%" "$(call "$REGISTRY" 'blockQuorumBps()(uint256)')" "3000"
 check "registry.minReviewPeriod == 30m" "$(call "$REGISTRY" 'minReviewPeriod()(uint256)')" "1800"
+# The operating window, bounded by what `setReviewPeriod` enforces: the impl's floor below,
+# and sWOOD's guardian cooldown (capped at the 3d ceiling) above, so an approver can never
+# unstake and escape the slash before `resolveReview`.
+REVIEW_FLOOR=$(call "$REGISTRY" 'minReviewPeriod()(uint256)')
+REVIEW_COOLDOWN=$(call "$SWOOD" 'coolDownPeriod()(uint256)')
+REVIEW_CEIL=259200
+case "$REVIEW_COOLDOWN" in ''|*[!0-9]*) :;; *) [ "$REVIEW_COOLDOWN" -lt "$REVIEW_CEIL" ] && REVIEW_CEIL="$REVIEW_COOLDOWN";; esac
+check_range "registry.reviewPeriod within bounds" "$(call "$REGISTRY" 'reviewPeriod()(uint256)')" "$REVIEW_FLOOR" "$REVIEW_CEIL"
+check "registry.blockQuorumBps == 30%" "$(call "$REGISTRY" 'blockQuorumBps()(uint256)')" "3000"
 check "governorImpl.MIN_VOTING_PERIOD == 30m" "$(call "$BIMPL" 'MIN_VOTING_PERIOD()(uint256)')" "1800"
 check "governorImpl.MIN_COOLDOWN_PERIOD" "$(call "$BIMPL" 'MIN_COOLDOWN_PERIOD()(uint256)')" "3600"
 check "swood.maxSlashBps == 100%"     "$(call "$SWOOD" 'maxSlashBps()(uint256)')"       "10000"

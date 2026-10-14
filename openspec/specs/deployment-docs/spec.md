@@ -92,7 +92,7 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 
 #### Scenario: Post-deploy validation reads
 - **WHEN** `deployAll` returns `Checkpoint.Complete`
-- **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, `registry.minReviewPeriod == 1800`, and `governorImpl.MIN_VOTING_PERIOD() == 1800`
+- **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.minReviewPeriod <= registry.reviewPeriod <= min(3 days, swood.coolDownPeriod())` (a bound, not a literal: the window is an operating value the owner tunes), `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, `registry.minReviewPeriod == 1800`, and `governorImpl.MIN_VOTING_PERIOD() == 1800`
 
 #### Scenario: Mainnet ceremony with EOA multisig refused
 - **WHEN** `OWNER_MULTISIG` is an EOA other than `DEPLOYER` on Mainnet posture
