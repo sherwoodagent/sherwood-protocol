@@ -22,8 +22,7 @@ contract ProtocolFixtureTest is ProtocolFixture {
         assertEq(p.ledger.coverageFreezer(), address(p.game));
         assertEq(p.swood.authorizedSlasher(), address(p.game));
         assertEq(p.tiers.authorizedDemoter(), address(p.game));
-        assertEq(p.game.court(), address(p.court));
-        assertEq(p.court.stakedWood(), address(p.swood));
+        assertEq(address(p.game.stakedWood()), address(p.swood));
         assertEq(address(p.governor.exposureLedger()), address(p.ledger));
         assertEq(address(p.governor.bondEscrow()), address(p.escrow));
         assertEq(address(p.governor.tierRegistry()), address(p.tiers));

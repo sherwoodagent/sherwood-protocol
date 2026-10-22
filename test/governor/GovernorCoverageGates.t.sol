@@ -95,7 +95,7 @@ contract MockFeed {
 ///      arithmetic over those two numbers — the `max`, and the strict
 ///      comparison — and a stub is the only way to drive them independently:
 ///      the real game's own setters forbid exactly the window divergence one of
-///      these tests needs. The full `_refundAll` re-arm arc against the real
+///      these tests needs. The full failure-path re-arm arc against the real
 ///      game lives in `ChallengeEndToEnd.t.sol`.
 contract MockFilingDeadline {
     uint256 public challengeWindow;
@@ -202,6 +202,7 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
 
         // ── Ledger: $0.05 WOOD, $1.00 USDG feed, generous cap, default bps 100.
@@ -252,6 +253,8 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(governor))
         );
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(
             address(this),
             abi.encodeWithSignature("governorOf(address)", address(unwiredVault)),
@@ -708,6 +711,11 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
     ///         and accepted (design D5): execution still proceeds (there IS an
     ///         identified, nonzero-bonded signer, so the R1 floor is met), but
     ///         the batch's net-outflow ceiling is 0.
+    ///
+    /// @dev    SHE-240 keeps this reachable: the slot floor is the SMALLER of
+    ///         one slot's share of the need and the guardian's whole budget, so
+    ///         a guardian this small still takes a slot by committing all of it.
+    ///         What it may not do is take a slot while holding budget back.
     function test_execute_dustCoverage_floorsEffectiveMaxCapitalToZero() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);
@@ -1076,6 +1084,7 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
 
         // lp1 holds the entire share supply; voting Against clears the 4000 bps
         // veto threshold, so the proposal resolves Rejected at voteEnd.
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         vm.warp(governor.getProposal(pid).voteEnd + 1);
@@ -1222,7 +1231,7 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
     }
 
     /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
-    ///         alone. The two windows can diverge with no `Inconclusive`
+    ///         alone. The two windows can diverge with no failed challenge
     ///         anywhere in the picture, and the gate must hold the bond to the
     ///         LATER of the two whichever way they diverge.
     ///
@@ -1259,7 +1268,7 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
         assertEq(
             stubGame.challengeableUntil(keccak256(abi.encode(address(governor), pid))),
             0,
-            "no Inconclusive here -- the divergence IS the two windows"
+            "no failed challenge here -- the divergence IS the two windows"
         );
 
         // Both original gates are open at the ledger's deadline...
@@ -1280,8 +1289,8 @@ contract GovernorCoverageGatesTest is ProtocolFixture {
     }
 
     /// @notice The other arm of the same `max`: a `challengeableUntil` raised
-    ///         above the ordinary window — what `ChallengeGame._refundAll`
-    ///         writes on an `Inconclusive` unwind — holds the bond past
+    ///         above the ordinary window — what `ChallengeGame` writes when a
+    ///         challenge fails on silence — holds the bond past
     ///         `executedAt + challengeWindow`. Placed exactly, from a stub; the
     ///         real unwind that produces it is in `ChallengeEndToEnd.t.sol`.
     function test_reclaimBond_challengeableUntilAboveTheWindow_waitsForIt() public {

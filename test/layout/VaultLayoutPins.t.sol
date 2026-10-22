@@ -108,6 +108,9 @@ contract VaultLayoutPinsTest is ProtocolFixture {
         // mocks (no encoded args) match any argument, mirroring
         // `test/vault/SyndicateVault.t.sol`'s setUp.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(GOV_SENTINEL));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(0)));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
     }

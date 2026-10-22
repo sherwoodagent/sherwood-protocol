@@ -181,8 +181,8 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///
     ///      A DEPOSIT asks "is this an honest instant to mint?" — it carries no
     ///      frozen price at all (it is converted live below), so no stamp is
-    ///      relevant to it. `depositsLocked()` is the whole gate: no proposal
-    ///      executing.
+    ///      relevant to it. `depositsLocked()` is the whole gate: no open
+    ///      proposal.
     function claim(uint256 requestId) external nonReentrant returns (uint256 outAmount) {
         Request storage r = _req(requestId);
         if (r.claimed) revert AlreadyClaimed();

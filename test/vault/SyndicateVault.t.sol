@@ -47,6 +47,7 @@ contract SyndicateVaultTest is ProtocolFixture {
 
         // Deploy ERC-8004 agent registry
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         // Mint ERC-8004 identity NFTs for agents
         agent1NftId = agentRegistry.mint(agentAddr);
@@ -84,6 +85,8 @@ contract SyndicateVaultTest is ProtocolFixture {
         // getActiveProposal → 0 so deposits/withdrawals stay unlocked by default.
         // `redemptionsLocked()` fails closed on governor == address(0).
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
@@ -144,14 +147,14 @@ contract SyndicateVaultTest is ProtocolFixture {
     function test_delegate_toOther_reverts() public {
         _depositLp1();
         vm.prank(lp1);
-        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(lp2);
     }
 
     function test_delegate_toZero_reverts() public {
         _depositLp1();
         vm.prank(lp1);
-        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(address(0));
     }
 
@@ -193,8 +196,23 @@ contract SyndicateVaultTest is ProtocolFixture {
         (uint8 v, bytes32 r, bytes32 sHalf) = vm.sign(pk, digest);
 
         uint256 nonce = vault.nonces(signer);
-        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegateBySig(lp2, nonce, expiry, v, r, sHalf);
+    }
+
+    /// @notice A holder whose delegate is anything but itself is re-self-delegated on its next
+    ///         receipt, even a zero-value one (pins `_update`'s `delegates(to) != to`).
+    function test_zeroValueReceipt_healsAForeignDelegate() public {
+        _depositLp1();
+        address holder = makeAddr("foreignDelegated");
+        // ERC-7201 `openzeppelin.storage.Votes`; `_delegatee` is its first member.
+        bytes32 votesSlot = 0xe8b26c30fad74198956032a3533d903385d56dd795af560196f9c78d4af40d00;
+        vm.store(address(vault), keccak256(abi.encode(holder, votesSlot)), bytes32(uint256(uint160(lp2))));
+        assertEq(vault.delegates(holder), lp2, "fixture: a foreign delegate is forced");
+
+        vm.prank(lp1);
+        vault.transfer(holder, 0);
+        assertEq(vault.delegates(holder), holder, "the zero-value receipt restored self-delegation");
     }
 
     function _depositLp1() internal {
@@ -333,6 +351,8 @@ contract SyndicateVaultTest is ProtocolFixture {
     function test_redemptionsLocked_revertsIfGovernorZero() public {
         // Re-mock the factory to return address(0) as governor.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(0)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         vm.expectRevert(ISyndicateVault.GovernorNotSet.selector);
         vault.redemptionsLocked();
@@ -495,20 +515,17 @@ contract SyndicateVaultTest is ProtocolFixture {
 
     // ==================== RESCUE ERC20 ====================
 
-    /// @dev Sanity check that `rescueERC20` covers stranded non-asset tokens
-    ///      that would previously have been pulled out via `executeBatch`.
-    function test_rescue_covers_strandedTokens() public {
-        // Send WETH (non-asset) directly to the vault
+    /// @notice A stranded non-asset token cannot be rescued to an arbitrary address (FP-04).
+    function test_rescue_strandedToken_toArbitraryAddress_reverts() public {
         weth.mint(address(vault), 1e18);
-        assertEq(weth.balanceOf(address(vault)), 1e18);
-
         address recipient = makeAddr("stranded-weth-recipient");
 
         vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.RescueRecipientNotStrategy.selector, recipient));
         vault.rescueERC20(address(weth), recipient, 1e18);
 
-        assertEq(weth.balanceOf(recipient), 1e18);
-        assertEq(weth.balanceOf(address(vault)), 0);
+        assertEq(weth.balanceOf(recipient), 0);
+        assertEq(weth.balanceOf(address(vault)), 1e18);
     }
 
     function test_rescueERC20_cannotRescueAsset_reverts() public {
@@ -1169,6 +1186,8 @@ contract SyndicateVaultTest is ProtocolFixture {
 
         // Route the vault's `onlyGovernor` through the reentrant target.
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(target)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
         vm.mockCall(

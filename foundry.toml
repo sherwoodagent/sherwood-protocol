@@ -7,12 +7,18 @@ optimizer = true
 optimizer_runs = 50
 via_ir = true
 ffi = false
+# No CBOR metadata: it hashes the SOURCE, so a comment edit anywhere in a CREATE3
+# contract's compilation unit would move its initcode hash and its deployed address.
+bytecode_hash = "none"
+cbor_metadata = false
 # storageLayout in every artifact: the upgradeable contracts' layout goldens run
 # `forge inspect <probe> storageLayout` after incremental builds — without this, a
 # partial rebuild drops the layout from cached artifacts and inspect fails spuriously.
 extra_output = ["storageLayout"]
 fs_permissions = [
   { access = "read-write", path = "chains" },
+  # Read-only: the source-hygiene test greps the ceremony scripts for `vm.env`.
+  { access = "read", path = "script" },
 ]
 
 [profile.default.fmt]
@@ -29,6 +35,29 @@ exclude_lints = ["screaming-snake-case-immutable", "mixed-case-variable"]
 # under IR; coverage remains advisory. Do not reintroduce per-file IR restrictions:
 # forge omits those compilation units from coverage entirely.
 [profile.coverage]
+via_ir = true
+
+# The CREATE3 factory's address is keccak of its own creation code, pinned in DeploySalts.
+# `type(X).creationCode` is emitted by whoever REFERENCES it, so every embedder must build
+# the way the ceremony does or the pin reads as a drift under legacy codegen.
+[[profile.coverage.compilation_restrictions]]
+paths = "script/utils/Create3Factory.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "script/ScriptBase.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "script/robinhood-mainnet/DeployAll.s.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "test/factory/deploy/Create3Bootstrap.t.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "test/factory/deploy/DeployAll.t.sol"
 via_ir = true
 
 # Profile used by the Medusa/Echidna harness under test/fizz/. The fuzzers compile

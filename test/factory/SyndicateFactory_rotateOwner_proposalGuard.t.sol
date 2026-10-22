@@ -15,7 +15,6 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
-import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 
@@ -43,7 +42,6 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
     ERC20Mock public usdc;
     ERC20Mock public wood;
     MockAgentRegistry public agentRegistry;
-    MockL2Registrar public ensRegistrar;
 
     address public owner = makeAddr("factoryOwner");
     address public creator = makeAddr("creator");
@@ -62,7 +60,6 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         executorLib = new BatchExecutorLib();
         vaultImpl = new SyndicateVault();
         agentRegistry = new MockAgentRegistry();
-        ensRegistrar = new MockL2Registrar();
 
         creatorAgentId = agentRegistry.mint(creator);
         newOwnerAgentId = agentRegistry.mint(newOwner);
@@ -121,7 +118,6 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
                     beacon: address(beacon),
                     protocolConfig: address(_hoistedPC),

@@ -17,6 +17,7 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
@@ -31,6 +32,10 @@ contract PermissiveRegistryWithPairs is ITierRegistry {
     }
 
     function isCounterpartyAllowed(address) external pure returns (bool) {
+        return true;
+    }
+
+    function isMorphoMarketAllowed(bytes32) external pure returns (bool) {
         return true;
     }
 
@@ -110,6 +115,7 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         uint256 agentNftId = agentRegistry.mint(agent);
 
         SyndicateVault vaultImpl = new SyndicateVault();
@@ -179,6 +185,8 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         GuardianRegistry regImpl = new GuardianRegistry(6 hours);
@@ -189,6 +197,11 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         vm.prank(registry.factory());
         registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
+        // FP-01: Portfolio reads the $1 check off governor.exposureLedger(); only the getter is
+        // mocked, so the governor's own propose gates stay unwired.
+        MockAssetLedger usdLedger = new MockAssetLedger();
+        usdLedger.setPrice(address(usdc), 1e8);
+        vm.mockCall(address(governor), abi.encodeWithSignature("exposureLedger()"), abi.encode(address(usdLedger)));
 
         vm.prank(owner);
         swood.setRegistry(address(registry));

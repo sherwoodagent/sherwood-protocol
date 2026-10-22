@@ -289,40 +289,40 @@ contract ExposureLedgerPriceAndScopeTest is Test {
     // FINDING 23 — inline try-argument evaluation escapes the guard
     // ══════════════════════════════════════════════════════════════════
 
-    /// @notice A governor whose `getRequiredCoverage` reverts must make
-    ///         `recordApproval` book nothing, not revert the whole APPROVE
-    ///         vote.
+    /// @notice A governor whose `getRequiredCoverage` reverts books nothing and
+    ///         says so: the read is resolved through `_tryResolveCoverageInputs`
+    ///         and its failure surfaces as `CoverageInputsUnreadable`, never as
+    ///         the governor's own revert data escaping the guard.
     ///
-    ///         Fails against the pre-fix code: `gov.getRequiredCoverage(...)`
-    ///         sat as an ARGUMENT to `this.coverageUsd(...)`, evaluated in
-    ///         `recordApproval`'s own frame before the guarded call even
-    ///         began, so its revert propagated straight out of
-    ///         `recordApproval` and this call reverts unexpectedly. Passes
-    ///         against the fix, which resolves the read through its own
-    ///         try/catch first.
-    function test_recordApproval_requiredCoverageReverts_booksNothingInsteadOfReverting() public {
+    ///         Against the pre-fix code the read sat as an ARGUMENT to
+    ///         `this.coverageUsd(...)`, evaluated in `recordApproval`'s own
+    ///         frame before the guarded call began, so the governor's revert
+    ///         propagated verbatim. What finding 23 pinned was that the guard
+    ///         covers the read; the refusal it ends in is the approve-slot rule
+    ///         — a need nobody can read underwrites nothing, so the vote rolls
+    ///         back rather than seating an approver with no lock behind it.
+    function test_recordApproval_requiredCoverageReverts_isRefusedAsUnreadable() public {
         uint256 proposalId = 1;
         mgov.setRevertOnRequiredCoverage(true);
 
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.CoverageInputsUnreadable.selector);
         ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), proposalId);
         assertEq(approvers.length, 0, "guardian must not be booked when required coverage is unreadable");
     }
 
-    /// @notice The other hoisted read: a vault whose `asset()` reverts must
-    ///         likewise make `recordApproval` book nothing rather than revert.
-    ///
-    ///         Fails against the pre-fix code (`IVaultAssetMinimal(pv.vault)
-    ///         .asset()` was called, unguarded, before the try even started),
-    ///         passes against the fix.
-    function test_recordApproval_vaultAssetReverts_booksNothingInsteadOfReverting() public {
+    /// @notice The other hoisted read: a vault whose `asset()` reverts is caught
+    ///         by the same guard and refused with the same error, rather than
+    ///         propagating the vault's revert data.
+    function test_recordApproval_vaultAssetReverts_isRefusedAsUnreadable() public {
         uint256 proposalId = 2;
         vault.setRevertOnAsset(true);
         mgov.set(_requiredCoverage6(1_000e18));
 
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.CoverageInputsUnreadable.selector);
         ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), proposalId);

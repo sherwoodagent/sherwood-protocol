@@ -85,9 +85,10 @@ interface IChallengeGameWindowMinimal {
  *         collapse that had no sound moment to run).
  *
  *         `slashableBondUsd(g)` is `ownStake(g) * priceHaircut`; a guardian's
- *         own bond is the only slashable capital. USD enters at exactly two
- *         places: the execute-time quorum (`requireApproveQuorum`) and the
- *         liability/fee views. Capacity, locks and slash rates are pure WOOD.
+ *         own bond is the only slashable capital. USD enters at the covered-TVL
+ *         cap and the proposer bond (propose), the approve-time slot floor
+ *         (`recordApproval`), the execute-time quorum (`requireApproveQuorum`)
+ *         and the liability/fee views. Capacity, locks and slash rates are WOOD.
  *
  *         Exposure is EPOCH-BUCKETED: an approval consumes one bucket, and open
  *         exposure is the sum of all buckets young enough that their challenge
@@ -112,8 +113,9 @@ interface IChallengeGameWindowMinimal {
  *         WHAT IT COSTS: there is no branch that keeps pricing when all market
  *         data is gone, so `NoWoodPrice` is reachable in production. Halting
  *         semantics are chosen per consumer — see `IExposureLedger.NoWoodPrice`.
- *         In one line: votes still work, nothing new can be proposed, nothing
- *         can execute.
+ *         In one line: block votes still land, approve votes revert, no proposal
+ *         with non-zero required coverage can be proposed or executed, and no
+ *         challenge can be filed.
  *
  * @dev    TRUST MODEL: THE OWNER IS UNRESTRICTED HERE, BY DESIGN.
  *         `setWoodUsdPrice` and `setWoodHaircutBps` impose no rate limit and no
@@ -148,6 +150,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      loop: narrower buckets release a guardian's short commitments
     ///      without waiting on their long ones, at the cost of a longer scan.
     uint256 internal constant MAX_SCAN_BUCKETS = 16;
+
+    /// @dev Mirrors `GuardianRegistry.MAX_APPROVERS_PER_PROPOSAL`; keep in step.
+    ///      Public so the two constants can be asserted equal across contracts.
+    uint256 public constant APPROVER_SLOTS = 100;
 
     /// @dev Floor on `woodHaircutBps`. Valuing bonds below half of market is a
     ///      mis-set parameter, not a conservatism policy.
@@ -245,8 +251,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev THE ONE FIGURE. `wood` is the guardian's lock on this proposal —
     ///      simultaneously its booking (what `_buckets` holds against the
-    ///      batching cap), its pledge (what `pledgedOf`/`freezeCoverage`/
-    ///      `TokenCourt` ask "did this guardian underwrite it?"), and its slash
+    ///      batching cap), its pledge (what `pledgedOf` and `freezeCoverage` ask
+    ///      -- "did this guardian underwrite it?"), and its slash
     ///      base (`slashBpsFor`). Written once by `recordApproval`, erased only
     ///      by `_unwindApproval` (release or retire). Because it is one storage
     ///      slot rather than a booking family and a pledge family, the divergence
@@ -317,7 +323,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         the pin was issued for. `retireApproval` reads THIS, not the max:
     ///         its question is whether THIS proposal's commitment may be swept,
     ///         and a pin against a guardian's OTHER stale proposal must not block
-    ///         that — otherwise one routine `Inconclusive` anywhere in a
+    ///         that — otherwise one routine missed-quorum failure anywhere in a
     ///         guardian's history blocks retirement of its entire book, reopening
     ///         the ~1/N shared-stake decay `retireApproval` exists to close.
     ///         `hasFrozenCoverage` keeps reading the max, because its question is
@@ -467,7 +473,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///         ZERO IS STILL ALLOWED, and is a HARD STOP rather than a $0
     ///         valuation: `_woodPrice` reverts `NoWoodPrice` on a zero cap, so
-    ///         proposing and executing halt while votes continue to land.
+    ///         approving, and proposing or executing with non-zero coverage, halt.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
         uint256 current = woodUsdPriceX8;
         emit WoodUsdPriceSet(current, newPriceX8);
@@ -592,6 +598,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      guardian backs is still fully covered by what remains. That is the
     ///      containment property, and it holds with no pro-rata bookkeeping
     ///      because nothing is ever shared — each lock is its own collateral.
+    ///      It holds only when the CONVICTED lock is at least `minSlashBps` of
+    ///      stake: below that, sWOOD's floored burn exceeds the lock.
     ///
     ///      ANY `k > 1` IS DELIBERATE LEVERAGE THAT TRADES EXACTLY THAT AWAY. A
     ///      guardian may then lock more WOOD across proposals than it holds, and
@@ -705,12 +713,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      THE GUARDIAN DECLARES, THE LEDGER CLAMPS. `lockWood` is what this
     ///      guardian chooses to put behind the proposal; the ledger locks
     ///      `min(lockWood, free budget)` where free budget is
-    ///      `kNumerator x slashableStake - openExposure`, all in WOOD. Nothing
-    ///      here is priced: the lock is WOOD and the cap is WOOD, so a WOOD-feed
-    ///      outage — the failure mode the old USD reservation had to book nothing
-    ///      through — is simply not a case on this path. The adversary a
-    ///      price-dependent capacity check hands a lever to is whoever can starve
-    ///      or inflate that feed; this path gives them nothing to push on.
+    ///      `kNumerator x slashableStake - openExposure`, all in WOOD. The CAP is
+    ///      unpriced — lock and budget are both WOOD, so no feed can move the
+    ///      capacity question. Only the slot floor below is priced, and it is a
+    ///      floor: a starved or inflated feed can refuse a slot, never enlarge
+    ///      one.
+    ///
+    ///      ALL OR NOTHING. Past the idempotent re-entry, an Approve either
+    ///      books a lock the coverage quorum will count or reverts, so a vote
+    ///      can never seat an approver the ledger carries nothing for.
     ///
     ///      NO COHORT CAP, DELIBERATELY. The lock is NOT clamped to the proposal's
     ///      requirement or to the still-uncovered remainder. Clamping to the
@@ -724,10 +735,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      lose on conviction. The execute-time quorum still aggregates, so a
     ///      guardian never has to single-handedly cover a proposal.
     ///
-    ///      Consequence: an under-bonded guardian is not rejected at vote time —
-    ///      it locks what it can, and the proposal fails the execute-time quorum
-    ///      unless other approvers make up the rest. The cap is enforced by
-    ///      locking zero, not by reverting the vote.
+    ///      Consequence: an under-bonded guardian books what it can, and the
+    ///      proposal fails the execute-time quorum unless other approvers make
+    ///      up the rest. A guardian small next to the need keeps its voice by
+    ///      putting its WHOLE budget on one proposal, but only while fewer than
+    ///      half the slots are booked; past that a slot costs `1/APPROVER_SLOTS`
+    ///      of the need outright, so a cohort of sub-share underwriters cannot
+    ///      fill the registry's bounded approver array.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood)
         external
         onlyRegistry
@@ -737,25 +751,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // already underwrote the proposal; a second call must not double-book
         // the bucket.
         if (_locks[key][guardian].wood != 0) return;
-        // A zero declaration locks nothing and is not an error: the guardian is
-        // voting on the merits without underwriting, exactly as a guardian with
-        // no free budget does below. Returning before the governor reads keeps
-        // this the cheapest path.
-        if (lockWood == 0) return;
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
         (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
-        if (!resolved) return; // unreadable right now: lock nothing, let the quorum decide
-        //
-        // Called externally so the revert can be caught; `coverageUsd` is a view
-        // on this same contract, and a same-contract call cannot be wrapped.
-        uint256 needUsd;
-        try this.coverageUsd(asset, requiredCoverage) returns (uint256 v) {
-            needUsd = v;
-        } catch {
-            return; // unpriceable right now: lock nothing, let the quorum decide
-        }
-        if (needUsd == 0) return; // zero-coverage: nothing to underwrite
+        if (!resolved) revert CoverageInputsUnreadable();
+        // Unwrapped: `StalePrice` / `FeedNotConfigured` bubble with their own
+        // reason and take the vote with them, rather than seating a slot the
+        // coverage quorum will never see.
+        uint256 needUsd = coverageUsd(asset, requiredCoverage);
 
         // Free budget = k * stake - open exposure, in WOOD. Zero free budget is
         // the batching attack's boundary: this guardian's stake is already fully
@@ -765,21 +768,27 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // core dependency, not an oracle outage, and must not be absorbed.
         uint256 cap = kNumerator * swood.guardianStake(guardian);
         uint256 open = openExposure(guardian);
-        // NO FREE BUDGET -> LOCK NOTHING, DON'T REVERT. Reverting would silence
-        // the approve side entirely for a guardian whose budget is spent while
-        // Block votes still work — disenfranchisement, not a cap. The cap still
-        // binds, and enforcement moves to `requireApproveQuorum` at execute.
-        if (open >= cap) return;
-        uint256 free = cap - open;
+        uint256 free = open >= cap ? 0 : cap - open;
 
         uint256 lock = lockWood < free ? lockWood : free;
+        // A slot costs its share of the need. A guardian whose WHOLE budget is
+        // smaller may pay with all of it for half the slots only; the rest cost
+        // a share outright, so no min-stake cohort fills it (v1 audit F3).
+        uint256 priceX8 = woodPriceX8();
+        uint256 shareUsd = (needUsd + APPROVER_SLOTS - 1) / APPROVER_SLOTS;
+        uint256 budgetUsd = _recoverableUsd(guardian, cap, priceX8, block.timestamp);
+        uint256 floorUsd =
+            (shareUsd < budgetUsd || _approversOf[key].length >= APPROVER_SLOTS / 2) ? shareUsd : budgetUsd;
+        if (lock == 0 || budgetUsd == 0 || _recoverableUsd(guardian, lock, priceX8, block.timestamp) < floorUsd) {
+            revert ApproveLockBelowFloor();
+        }
         // Truncation in the uint128 store below would book a phantom (smaller)
         // lock — fail loudly instead. Unreachable at any sane `kNumerator`
         // (stake is uint128 and WOOD supply is ~1e27), kept as the belt to that
         // brace.
         if (lock > type(uint128).max) revert InvalidParameter();
         (uint256 epoch, bool withinHorizon) = _coverageEpochOrSkip(pv);
-        if (!withinHorizon) return;
+        if (!withinHorizon) revert CoverageHorizonExceeded();
         _buckets[guardian][epoch] += lock;
         // lock bounded to uint128 above; epoch = elapsed / epochLength cannot
         // approach 2^64 on any realistic timescale.
@@ -851,8 +860,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///        - `_pinnedUntil[key][guardian] < block.timestamp` — PER-KEY, not the
     ///          per-guardian max: a pin against some OTHER stale proposal the same
     ///          guardian once approved must not block sweeping this one, or a
-    ///          single routine `Inconclusive` anywhere in its history blocks
-    ///          retirement of the entire book;
+    ///          single routine missed-quorum failure anywhere in its history
+    ///          blocks retirement of the entire book;
     ///        - `block.timestamp` past the SAME expiry `openExposure` uses for
     ///          this booked epoch.
     ///      It then performs `releaseApproval`'s exact unwind, so the two cannot
@@ -899,10 +908,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      pair the list with different numbers — the live booking and the
     ///      pledge — because `settleCoverage` could move the former while a
     ///      challenge was live. There is now one figure, so both read the same
-    ///      storage. Kept as a separate selector because `ChallengeGame.file` and
-    ///      `TokenCourt._recordAccused` ask their question of it by name ("did
-    ///      this guardian underwrite the proposal?"), and that question still
-    ///      wants a name that says PLEDGE rather than BOOKING.
+    ///      storage. Kept as a separate selector because the challenge path asks
+    ///      "did this guardian underwrite it?" of this name, and that question
+    ///      still wants a name that says PLEDGE rather than BOOKING.
     function pledgedOf(address governor, uint256 proposalId)
         external
         view
@@ -945,7 +953,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      blocks (`releaseApproval`) or whose gate it fails (`retireApproval`),
     ///      so nothing can transit a listed guardian's figure through zero while
     ///      the challenge naming them is live. The old booking/pledge split
-    ///      existed precisely because one of the two COULD (audit-181 finding A).
+    ///      existed precisely because one of the two COULD.
     function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (!_frozen[key]) {
@@ -1007,7 +1015,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev EXTENDS THE FREEZE'S REACH PAST ITS OWN RELEASE. `unfreezeCoverage`
     ///      drops the moment no challenge against this key is LIVE — but
     ///      `ChallengeGame` can re-arm a legal re-challenge window that outlives
-    ///      the challenge that just resolved `Inconclusive`. Without this, both of
+    ///      the challenge that just failed on a missed quorum. Without this, both of
     ///      sWOOD's unstake gates read clean while a conviction is still legally
     ///      reachable: the accused claims its stake and the eventual verdict
     ///      recovers nothing.
@@ -1069,8 +1077,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev Bucket containing `t`, clamped to the last bucket `openExposure`
     ///      scans — a target past the horizon would silently un-count the lock.
-    ///      Unlike `recordApproval` (which books nothing past the horizon), the
-    ///      alternative here is not moving, which expires the lock even earlier.
+    ///      Unlike `recordApproval` (which refuses a settlement past the
+    ///      horizon), the alternative here is not moving, which expires the lock
+    ///      even earlier.
     function _horizonClampedEpochOf(uint256 t) internal view returns (uint256) {
         // Callers freeze and pin coverage, so a clock behind genesis is refused
         // rather than clamped. The floor on `t` stays: t == 0 is an unset

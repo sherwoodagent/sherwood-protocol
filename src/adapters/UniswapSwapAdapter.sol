@@ -19,15 +19,6 @@ interface ISwapRouter {
     }
 
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
-
-    struct ExactInputParams {
-        bytes path;
-        address recipient;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-    }
-
-    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
 
 interface IQuoterV2 {
@@ -45,16 +36,6 @@ interface IQuoterV2 {
     function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
         external
         returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
-
-    /// @dev Packed V3 path quoting for mode-1 multi-hop routes.
-    function quoteExactInput(bytes calldata path, uint256 amountIn)
-        external
-        returns (
-            uint256 amountOut,
-            uint160[] memory sqrtPriceX96AfterList,
-            uint32[] memory initializedTicksCrossedList,
-            uint256 gasEstimate
-        );
 }
 
 // ── Uniswap V4 interfaces (minimal, inlined — no v4-core dependency) ──
@@ -122,14 +103,14 @@ interface IV4Quoter {
 
 /**
  * @title UniswapSwapAdapter
- * @notice ISwapAdapter implementation supporting Uniswap V3 (single/multi-hop)
- *         and Uniswap V4 (single-hop, hookless) swaps.
+ * @notice ISwapAdapter implementation supporting Uniswap V3 (single-hop)
+ *         and Uniswap V4 (single/multi-hop, hookless) swaps.
  *
- *   extraData encoding (mode determines swap type):
- *     Mode 0 — V3 single-hop:  abi.encode(uint8(0), abi.encode(uint24 fee))
- *     Mode 1 — V3 multi-hop:   abi.encode(uint8(1), abi.encode(bytes path, uint16 perHopSlippageBps))
- *     Mode 2 — V4 single-hop:  abi.encode(uint8(2), abi.encode(uint24 fee, int24 tickSpacing))
- *     Mode 3 — V4 multi-hop:   abi.encode(uint8(3), abi.encode(PathHop[] hops))
+ *   extraData encoding: one raw mode byte, then the abi-encoded route
+ *     Mode 0 — V3 single-hop:  abi.encodePacked(uint8(0), abi.encode(uint24 fee))
+ *     Mode 2 — V4 single-hop:  abi.encodePacked(uint8(2), abi.encode(uint24 fee, int24 tickSpacing))
+ *     Mode 3 — V4 multi-hop:   abi.encodePacked(uint8(3), abi.encode(PathHop[] hops))
+ *   Any other mode (including the retired V3 multi-hop mode 1) reverts `UnsupportedMode`.
  *
  *   Modes 2/3 target hookless pools. Mode 3 supports a native-ETH currency as an
  *   INTERMEDIATE hop only — endpoints must be ERC20s. V4 flash accounting nets
@@ -214,7 +195,7 @@ contract UniswapSwapAdapter is ISwapAdapter {
             return _swapV4(tokenIn, tokenOut, amountIn, amountOutMin, hops);
         }
 
-        // Modes 0/1 route through the v3 router.
+        // Mode 0 routes through the v3 router.
         IERC20(tokenIn).forceApprove(address(v3Router), amountIn);
 
         if (mode == 0) {
@@ -231,15 +212,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
                     sqrtPriceLimitX96: 0
                 })
             );
-        } else if (mode == 1) {
-            (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
-            require(perHopSlippageBps <= 10_000, "slippage > 100%");
-            address pathStart = _extractFirstAddress(path);
-            if (pathStart != tokenIn) {
-                path = _reversePath(path);
-            }
-            _requireEndpoints(path, tokenIn, tokenOut);
-            amountOut = _chainedSingleHops(path, amountIn, amountOutMin, perHopSlippageBps);
         } else {
             revert UnsupportedMode();
         }
@@ -330,9 +302,8 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
     /// @dev Validate + orient a mode-3 hop list for the requested direction.
     ///      A single stored path (buy: asset→…→token) is reused by strategies
-    ///      for the reverse (sell: token→…→asset), mirroring mode-1's packed-path
-    ///      auto-reverse. Accept the path as-is when it already ends at tokenOut;
-    ///      reverse it when it ends at tokenIn; otherwise revert.
+    ///      for the reverse (sell: token→…→asset). Accept the path as-is when it
+    ///      already ends at tokenOut; reverse it when it ends at tokenIn; otherwise revert.
     function _orientHops(PathHop[] memory hops, address tokenIn, address tokenOut)
         internal
         pure
@@ -363,115 +334,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
         }
     }
 
-    function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin, uint16 perHopSlippageBps)
-        internal
-        returns (uint256 amountOut)
-    {
-        uint256 len = path.length;
-        require(len >= 43 && (len - 20) % 23 == 0, "invalid path length");
-        uint256 numHops = (len - 20) / 23;
-
-        uint256 currentAmount = amountIn;
-        uint256 slipDenom = 10_000 - uint256(perHopSlippageBps);
-
-        for (uint256 i; i < numHops; ++i) {
-            address hopIn = _extractAddressAt(path, i * 23);
-            uint24 fee = _extractFeeAt(path, i * 23 + 20);
-            address hopOut = _extractAddressAt(path, i * 23 + 23);
-
-            bool lastHop = (i == numHops - 1);
-
-            // Approve router for intermediate tokens (first hop was approved in swap())
-            if (i > 0) {
-                IERC20(hopIn).forceApprove(address(v3Router), currentAmount);
-            }
-
-            (uint256 quoted,,,) = quoter.quoteExactInputSingle(
-                IQuoterV2.QuoteExactInputSingleParams({
-                    tokenIn: hopIn, tokenOut: hopOut, amountIn: currentAmount, fee: fee, sqrtPriceLimitX96: 0
-                })
-            );
-            uint256 hopFloor = (quoted * slipDenom) / 10_000;
-            if (lastHop && amountOutMin > hopFloor) hopFloor = amountOutMin;
-
-            currentAmount = v3Router.exactInputSingle(
-                ISwapRouter.ExactInputSingleParams({
-                    tokenIn: hopIn,
-                    tokenOut: hopOut,
-                    fee: fee,
-                    recipient: lastHop ? msg.sender : address(this),
-                    amountIn: currentAmount,
-                    amountOutMinimum: hopFloor,
-                    sqrtPriceLimitX96: 0
-                })
-            );
-        }
-
-        amountOut = currentAmount;
-    }
-
-    /// @dev Extract a 20-byte address at an arbitrary byte offset in a packed path.
-    function _extractAddressAt(bytes memory path, uint256 offset) internal pure returns (address addr) {
-        require(path.length >= offset + 20, "path too short");
-        assembly {
-            addr := shr(96, mload(add(add(path, 32), offset)))
-        }
-    }
-
-    /// @dev Extract a 3-byte uint24 fee at an arbitrary byte offset in a packed path.
-    function _extractFeeAt(bytes memory path, uint256 offset) internal pure returns (uint24 fee) {
-        require(path.length >= offset + 3, "path too short");
-        assembly {
-            fee := shr(232, mload(add(add(path, 32), offset)))
-        }
-    }
-
-    /// @dev Extract the first 20-byte address from a packed V3 path.
-    function _extractFirstAddress(bytes memory path) internal pure returns (address addr) {
-        require(path.length >= 20, "path too short");
-        assembly {
-            addr := shr(96, mload(add(path, 32)))
-        }
-    }
-
-    function _requireEndpoints(bytes memory path, address tokenIn, address tokenOut) internal pure {
-        if (path.length < 20) revert InvalidPath();
-        if (_extractFirstAddress(path) != tokenIn) revert InvalidPath();
-        if (_extractAddressAt(path, path.length - 20) != tokenOut) revert InvalidPath();
-    }
-
-    /// @dev Reverse a packed Uniswap V3 path (addr + fee + addr + fee + ...).
-    ///      Each segment is 20 bytes (address) + 3 bytes (fee). Last element is 20 bytes.
-    function _reversePath(bytes memory path) internal pure returns (bytes memory reversed) {
-        uint256 len = path.length;
-        // path layout: addr(20) [+ fee(3) + addr(20)]* — total = 20 + 23*n
-        require(len >= 20 && (len - 20) % 23 == 0, "invalid path length");
-        uint256 numHops = (len - 20) / 23;
-
-        reversed = new bytes(len);
-        uint256 writePos;
-
-        // Write last address first
-        uint256 lastAddrPos = 20 + numHops * 23;
-        for (uint256 j; j < 20; ++j) {
-            reversed[writePos++] = path[lastAddrPos - 20 + j];
-        }
-
-        // Walk backwards through hops
-        for (uint256 i = numHops; i > 0; --i) {
-            uint256 hopStart = (i - 1) * 23 + 20; // fee starts here
-            // Copy fee (3 bytes)
-            reversed[writePos++] = path[hopStart];
-            reversed[writePos++] = path[hopStart + 1];
-            reversed[writePos++] = path[hopStart + 2];
-            // Copy address before this fee (20 bytes at hopStart - 20)
-            uint256 addrStart = hopStart - 20;
-            for (uint256 j; j < 20; ++j) {
-                reversed[writePos++] = path[addrStart + j];
-            }
-        }
-    }
-
     /// @inheritdoc ISwapAdapter
     function quote(address tokenIn, address tokenOut, uint256 amountIn, bytes calldata extraData)
         external
@@ -488,19 +350,6 @@ contract UniswapSwapAdapter is ISwapAdapter {
                     tokenIn: tokenIn, tokenOut: tokenOut, amountIn: amountIn, fee: fee, sqrtPriceLimitX96: 0
                 })
             );
-        } else if (mode == 1) {
-            bytes memory path = abi.decode(routeData, (bytes));
-            // Match `swap()`'s path orientation: ensure tokenIn is the head
-            // of the path before passing to the quoter.
-            if (_extractFirstAddress(path) != tokenIn) path = _reversePath(path);
-            // Same endpoint binding as `swap()`, and for a sharper reason:
-            // `quoteExactInput` prices the PATH's terminal token, so an
-            // unbound tail returns a quote denominated in something other than
-            // `tokenOut`. Callers build slippage floors out of this number
-            // (`PortfolioStrategy._quoteMinOut`), so a mis-denominated quote
-            // silently mis-scales the floor rather than failing.
-            _requireEndpoints(path, tokenIn, tokenOut);
-            (amountOut,,,) = quoter.quoteExactInput(path, amountIn);
         } else if (mode == 2) {
             if (address(v4Quoter) == address(0)) revert V4Unavailable();
             (uint24 fee, int24 tickSpacing) = abi.decode(routeData, (uint24, int24));

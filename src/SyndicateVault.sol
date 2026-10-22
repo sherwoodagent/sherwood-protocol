@@ -5,6 +5,7 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
@@ -106,12 +107,12 @@ contract SyndicateVault is
     /// @notice If true, anyone can deposit (skip whitelist check)
     bool private _openDeposits;
 
-    /// @notice ERC-8004 agent identity registry (ERC-721)
+    /// @dev Retired: init-time snapshot, never read; `registerAgent` uses the factory's live `agentRegistry()`.
     IERC721 private _agentRegistry;
 
     // ── Governor / Factory storage ──
 
-    /// @notice Vault owner's management fee on strategy profits (basis points, set at init)
+    /// @notice Annual management fee on the whole fund while a proposal is Executed (basis points, set at init)
     uint256 private _managementFeeBps;
 
     /// @notice Factory that deployed this vault (controls upgrades, provides governor address)
@@ -149,9 +150,9 @@ contract SyndicateVault is
     /// @notice Integral of fund assets over time for the live proposal, in
     ///         asset-seconds. The management fee is this figure annualized:
     ///         `fee = assetSeconds * rate / (BPS_DENOMINATOR * 365 days)`.
-    /// @dev Exact under arbitrary mid-proposal flows because the integral is
-    ///      piecewise-constant: every base-changing event closes off the
-    ///      elapsed interval at the base that applied during it, then restamps.
+    /// @dev The base is the whole fund's `totalAssets()`, stamped once by
+    ///      `startManagementAccrual` at execute and not restamped before settle:
+    ///      nothing mid-proposal changes it, so the integral is base x elapsed.
     uint256 private _mgmtAssetSeconds;
 
     /// @notice Fund assets in force since `_mgmtLastUpdate` — the height of the
@@ -290,8 +291,10 @@ contract SyndicateVault is
     ///      Re-querying on every execution would add a per-call external view to
     ///      the hot path and hard-couple the vault to an external registry;
     ///      off-chain monitoring should trigger `removeAgent` instead.
+    ///      The registry is the factory's current one, so the factory owner can re-point or disable it.
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
-        SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, _agentRegistry, owner());
+        IERC721 registry = IERC721(ISyndicateFactory(_factory).agentRegistry());
+        SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, registry, owner());
     }
 
     /// @inheritdoc ISyndicateVault
@@ -303,8 +306,8 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Freezes LP flow (`deposit` / `mint` / `withdraw` / `redeem`) AND
-    ///         strategy execution (`executeGovernorBatch`). Owner rescue paths
+    /// @notice Freezes LP flow (`deposit` / `mint` / `withdraw` / `redeem`, queued-deposit
+    ///         claims) AND strategy execution (`executeGovernorBatch`). Owner rescue paths
     ///         (`rescueEth` / `rescueERC20` / `rescueERC721`) remain callable so
     ///         the owner can respond to incidents. Rescues are still blocked by
     ///         `redemptionsLocked()` whenever a proposal is active.
@@ -336,7 +339,7 @@ contract SyndicateVault is
 
     /// @notice Blocks direct `OwnableUpgradeable` owner rotation. The factory's
     ///         `rotateOwner` is the only legal route — it enforces no active or
-    ///         open proposal, owner-stake clear and registry alignment, then calls
+    ///         open proposal (unless re-bonding the same owner), owner-stake clear and registry alignment, then calls
     ///         `rotateOwnership` here. The inherited setters would desync factory
     ///         and registry records and, via `renounceOwnership`, permanently
     ///         orphan the vault.
@@ -462,7 +465,7 @@ contract SyndicateVault is
                 if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);
                 continue;
             }
-            // A zero first argument (`balanceOf(address(0))`) names no spender; resetting it would revert.
+            // Transfers name no spender (zero); resetting address(0) would revert `ERC20InvalidSpender`.
             address spender = AssetCallRules.spenderOf(address(this), calls[i].data);
             if (spender != address(0)) spenders[n++] = spender;
         }
@@ -552,9 +555,9 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev True from Draft creation to settle: no share is burned while a proposal is
-    ///      open, so no exit can land ahead of the electorate stamp. Fail-closed on a
-    ///      missing governor.
+    /// @dev True from Draft creation to settle: no share is minted or burned while a
+    ///      proposal is open, so the veto denominator cannot move.
+    ///      Fail-closed on a missing governor.
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
@@ -629,16 +632,16 @@ contract SyndicateVault is
             _highWaterPricePerShare = 0;
         }
 
-        if (to != address(0) && delegates(to) == address(0)) {
+        // Self-delegation is total: a receiver whose delegate is anything but itself is corrected.
+        if (to != address(0) && delegates(to) != to) {
             _delegate(to, to);
         }
     }
 
-    /// @dev Voting power never leaves the holder: `delegate`/`delegateBySig` to
-    ///      anyone else would keep shares in the veto denominator while they vote
-    ///      for nobody (or for the queue). Covers the auto-delegate above (self).
+    /// @dev Voting power never leaves the holder, so the veto electorate equals the castable
+    ///      weight. Guards every path, the auto-delegate above (self) included (SHE-293).
     function _delegate(address account, address delegatee) internal override {
-        if (delegatee != account) revert DelegationLocked();
+        if (delegatee != account) revert DelegationDisabled();
         super._delegate(account, delegatee);
     }
 
@@ -668,13 +671,11 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev True only while capital is deployed (execute to settle): that is the one
-    ///      window in which the share price is not knowable. A deposit after the vote
-    ///      snapshot buys no weight, so nothing else needs the gate.
+    /// @dev Same predicate as `redemptionsLocked`. `totalAssets` counts idle balance only: `settleProposal`
+    ///      and `unstick` refuse a strategy still `Executed`, but `finalizeEmergencySettle` can leave
+    ///      capital on the clone, priced as a loss until a later batch settles it.
     function depositsLocked() public view returns (bool) {
-        address gov = _getGovernor();
-        if (gov == address(0)) revert GovernorNotSet();
-        return IProposalStatus(gov).getActiveProposal() != 0;
+        return redemptionsLocked();
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -689,7 +690,12 @@ contract SyndicateVault is
     /// @dev Closed-deposit gate: reverts unless deposits are open OR `who` is
     ///      whitelisted. Shared by `_deposit` / `requestDeposit`.
     function _requireApprovedDepositor(address who) private view {
-        if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
+        if (!_depositsOpen() && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
+    }
+
+    /// @dev Open only if this vault opted in AND the factory's invite-only flag is off.
+    function _depositsOpen() private view returns (bool) {
+        return _openDeposits && !ISyndicateFactory(_factory).depositsRestricted();
     }
 
     // `nonReentrant` lives on the internal `_deposit`, which both `deposit` and `mint` route
@@ -749,7 +755,7 @@ contract SyndicateVault is
     ///      locked, or `receiver` not whitelisted in closed mode (EIP-4626).
     function maxDeposit(address receiver) public view override returns (uint256) {
         if (paused() || depositsLocked()) return 0;
-        if (!_openDeposits && !_approvedDepositors.contains(receiver)) return 0;
+        if (!_depositsOpen() && !_approvedDepositors.contains(receiver)) return 0;
         return type(uint256).max;
     }
 
@@ -774,10 +780,10 @@ contract SyndicateVault is
         _requireApprovedDepositor(receiver);
     }
 
-    /// @dev Instant deposit is allowed until capital is deployed. From execute to
-    ///      settle it reverts and LPs use the async deposit queue (`requestDeposit`),
-    ///      entering at the realized settle price. Auto-delegate to self so
-    ///      shareholders get voting power.
+    /// @dev Instant deposit is allowed only outside an open proposal. During an
+    ///      open proposal (Pending..Executed) it reverts and LPs use the async
+    ///      deposit queue (`requestDeposit`), entering at the realized settle
+    ///      price. Auto-delegate to self so shareholders get voting power.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
@@ -892,8 +898,8 @@ contract SyndicateVault is
     ///         Escrows `assets` in the queue (off-vault, so they never inflate
     ///         `totalAssets` nor get swept into the strategy) and records a claim
     ///         that mints shares at the realized settle price.
-    /// @dev Gated on the executing pid, the same read `depositsLocked()` makes,
-    ///      so exactly one deposit path is always open.
+    /// @dev Gated on `openProposalCount() != 0`, the predicate instant deposit
+    ///      closes on, so exactly one deposit path is always open.
     /// @return requestId Always > 0 (the queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
         external
@@ -903,13 +909,10 @@ contract SyndicateVault is
     {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
-        address gov = _getGovernor();
-        if (gov == address(0)) revert GovernorNotSet();
-        // The executing pid is the deposit lock: nonzero iff `depositsLocked()`.
-        uint256 pid = IProposalStatus(gov).getActiveProposal();
-        if (pid == 0) revert DepositsNotLocked();
+        if (IProposalStatus(_getGovernor()).openProposalCount() == 0) revert NoOpenProposal();
         if (assets == 0) revert ZeroAssets();
         _requireApprovedDepositor(receiver);
+        uint256 pid = _openProposalPid();
         // Escrow assets in the queue (off-vault custody — never counted in
         // totalAssets, never swept into the strategy).
         IERC20(asset()).safeTransferFrom(msg.sender, q, assets);
@@ -947,8 +950,8 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
-    ///         price. The queue pushes the escrowed assets to the vault
+    /// @notice Queue-only: mint `shares` to `to`. The queue prices them live with
+    ///         `previewDeposit` and pushes the escrowed assets to the vault
     ///         immediately before this call.
     /// @dev No `nonReentrant`: the only state-mutating call here is the mint.
     ///      `_initHighWaterMarkIfUnset` reads `pricePerShare()`, which makes only
@@ -959,8 +962,10 @@ contract SyndicateVault is
     ///      or a queue-only first mint would settle its first performance fee
     ///      against an unset mark. Also the re-seed path for the zero-to-nonzero
     ///      supply transition zeroed in `_update`.
-    function settleDeposit(uint256 shares, address to) external {
+    function settleDeposit(uint256 shares, address to) external whenNotPaused {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
+        // Same gates as an instant deposit; a refused claimant exits through the queue's `cancel`.
+        _requireApprovedDepositor(to);
         _mint(to, shares);
         _initHighWaterMarkIfUnset();
     }
@@ -1118,13 +1123,21 @@ contract SyndicateVault is
         Address.sendValue(to, amount);
     }
 
-    /// @notice Rescue ERC-20 tokens accidentally sent to the vault (not the vault asset).
-    ///         Blocked during active proposals to protect strategy position tokens.
+    /// @notice Move a non-asset ERC-20 held by the vault to a strategy clone of this vault, where a
+    ///         later proposal's batch can settle it. Never the vault asset, never to any other
+    ///         address. Blocked during active proposals to protect strategy position tokens.
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
         if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         address asset = asset();
         if (token == asset) revert CannotRescueAsset();
+        // A factory-made clone bound here, read fail-closed; `registerStrategy` is permissionless.
+        address factory_ = _strategyFactory();
+        if (
+            factory_ == address(0)
+                || _readAddress(factory_, abi.encodeCall(IStrategyFactory.cloneTemplate, (to))) == address(0)
+                || _readAddress(to, abi.encodeCall(IStrategy.vault, ())) != address(this)
+        ) revert RescueRecipientNotStrategy(to);
         IERC20(token).safeTransfer(to, amount);
     }
 

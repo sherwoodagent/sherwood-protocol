@@ -3,20 +3,19 @@
 ## Purpose
 
 Requirements on multi-approver test fixtures for `ExposureLedger`, so a fixture's early exits (quorum reached, no free budget) cannot silently shrink the exercised approver set and mask a broken accounting path.
-
 ## Requirements
-
 ### Requirement: Multi-approver fixtures genuinely exercise every approver
-A test constructing a multi-approver set SHALL use the shared fixture helper, which SHALL size each approver's bookable budget strictly smaller than the proposal's requirement (so every approver books a non-zero share) and SHALL assert `approversOf` returns exactly the intended count. `ExposureLedger.t.sol` SHALL carry a comment block naming both early exits (`requireApproveQuorum`'s quorum-reached exit and `recordApproval`'s no-free-budget exit), explaining how each silently shrinks a fixture's effective set, stating the sizing rule, and pointing at the helper. A test that deliberately relies on an early exit SHALL carry an explicit `// EARLY-EXIT INTENDED:` comment stating which exit and why.
+`ExposureLedger.t.sol` SHALL provide a fixture helper, `_wireUnderCoveredApprovers`, that sizes each approver's bookable budget strictly above zero and strictly below the proposal's requirement (so every approver books a non-zero lock and no single lock meets the quorum) and asserts `approversOf` returns exactly the intended count, plus `_assertApproverSet` for the count check alone. A test in that file that relies on every approver of a multi-approver set being read SHALL build the set with the helper or end on `_assertApproverSet`. The early exit that can silently shrink a fixture's effective set is `requireApproveQuorum`'s quorum-reached return, which stops reading approvers once the sum meets the requirement; `recordApproval` with no free budget reverts `ApproveLockBelowFloor` rather than seating nobody silently. A test that deliberately relies on the quorum-reached exit SHALL say so in a comment.
 
 #### Scenario: Fixture built via the shared helper
 - **WHEN** a test constructs a multi-approver set through the shared helper
-- **THEN** each approver's bookable budget is strictly smaller than the proposal's requirement, every approver books a non-zero share, and the helper asserts `approversOf` returns exactly the intended count — so a broken second-approver accounting path cannot pass unnoticed
+- **THEN** each approver's bookable budget is strictly smaller than the proposal's requirement, every approver books a non-zero lock, and the helper asserts `approversOf` returns exactly the intended count — so a broken second-approver accounting path cannot pass unnoticed
 
 #### Scenario: Reader encounters the hazard
-- **WHEN** a test author reads `ExposureLedger.t.sol`
-- **THEN** a comment block names both early exits (`requireApproveQuorum` quorum-reached; `recordApproval` no-free-budget), explains how each silently shrinks a fixture's effective set, states the sizing rule, and points at the helper
+- **WHEN** a test author reads the fixture section of `ExposureLedger.t.sol`
+- **THEN** a comment block explains the quorum-reached early exit, states the sizing rule, and points at the helper
 
 #### Scenario: Intentional early-exit fixture
-- **WHEN** a test deliberately relies on an early exit
-- **THEN** it carries an explicit `// EARLY-EXIT INTENDED:` comment stating which exit and why
+- **WHEN** a test deliberately relies on the quorum-reached exit
+- **THEN** it carries a comment stating that it does and why
+

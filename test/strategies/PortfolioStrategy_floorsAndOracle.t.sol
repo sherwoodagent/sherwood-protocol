@@ -6,6 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 
 /// @notice Minimal vault stand-in exposing `governor()` and a revocable agent set.
@@ -22,8 +23,11 @@ contract MockVaultWithGovernor {
 
     address public governor;
 
-    constructor(address governor_) {
+    address public asset;
+
+    constructor(address governor_, address asset_) {
         governor = governor_;
+        asset = asset_;
     }
 }
 
@@ -31,8 +35,11 @@ contract MockVaultWithGovernor {
 contract MockGovernorWithRegistry {
     address public tierRegistry;
 
-    constructor(address registry_) {
+    address public exposureLedger;
+
+    constructor(address registry_, address ledger_) {
         tierRegistry = registry_;
+        exposureLedger = ledger_;
     }
 
     function getActiveProposal() external pure returns (uint256) {
@@ -104,7 +111,9 @@ contract MockAggregator {
 contract PortfolioStrategy_floorsAndOracleTest is Test {
     PortfolioStrategy public template;
 
-    ERC20Mock public weth;
+    ERC20Mock public usd;
+
+    MockAssetLedger public ledger;
     ERC20Mock public tsla;
 
     address public proposer = makeAddr("proposer");
@@ -115,7 +124,9 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     uint256 constant DEFAULT_MAX_AGE = 26 hours;
 
     function setUp() public {
-        weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        usd = new ERC20Mock("USD Stable", "USD", 18);
+        ledger = new MockAssetLedger();
+        ledger.setPrice(address(usd), 1e8);
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
         template = new PortfolioStrategy();
         vm.warp(START);
@@ -141,16 +152,16 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         address[] memory feeds = new address[](1);
         feeds[0] = feed;
 
-        return abi.encode(address(weth), adapter, tokens, weights, TOTAL_AMOUNT, SLIPPAGE_100, extra, priceDecs, feeds);
+        return abi.encode(address(usd), adapter, tokens, weights, TOTAL_AMOUNT, SLIPPAGE_100, extra, priceDecs, feeds);
     }
 
     /// @dev A working `MockSwapAdapter` pre-funded both directions at the fair 1:1 rate.
     function _deployFundedAdapter() internal returns (MockSwapAdapter adapter) {
         adapter = new MockSwapAdapter();
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
+        usd.mint(address(adapter), 1_000_000e18);
     }
 
     struct Rig {
@@ -169,13 +180,13 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         r.registry = new MockTierRegistry();
         r.registry.setAllowed(address(r.adapter), true);
         r.registry.setAllowed(address(r.feed), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(r.registry));
-        r.vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(r.registry), address(ledger));
+        r.vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         r.strategy = _clone();
-        weth.mint(address(r.vault), TOTAL_AMOUNT);
+        usd.mint(address(r.vault), TOTAL_AMOUNT);
         vm.prank(address(r.vault));
-        weth.approve(address(r.strategy), type(uint256).max);
+        usd.approve(address(r.strategy), type(uint256).max);
 
         r.strategy.initialize(address(r.vault), proposer, _initData(address(r.adapter), address(r.feed)));
 
@@ -214,21 +225,21 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         r.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1 hours);
         vm.warp(START + 1);
 
-        uint256 vaultWethBefore = weth.balanceOf(address(r.vault));
+        uint256 vaultUsdBefore = usd.balanceOf(address(r.vault));
 
         vm.prank(address(r.vault));
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         r.strategy.settle();
 
         assertEq(tsla.balanceOf(address(r.strategy)), TOTAL_AMOUNT, "nothing sold");
-        assertEq(weth.balanceOf(address(r.vault)), vaultWethBefore, "nothing moved");
+        assertEq(usd.balanceOf(address(r.vault)), vaultUsdBefore, "nothing moved");
         assertEq(uint256(r.strategy.state()), uint256(BaseStrategy.State.Executed));
 
         // The feed comes back: the same settle clears at the feed-priced floor.
         r.feed.setUpdatedAt(vm.getBlockTimestamp());
         vm.prank(address(r.vault));
         r.strategy.settle();
-        assertEq(weth.balanceOf(address(r.vault)), vaultWethBefore + TOTAL_AMOUNT, "capital returned");
+        assertEq(usd.balanceOf(address(r.vault)), vaultUsdBefore + TOTAL_AMOUNT, "capital returned");
         assertEq(uint256(r.strategy.state()), uint256(BaseStrategy.State.Settled));
     }
 
@@ -262,10 +273,10 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         Rig memory rPast = _rig();
 
         vm.warp(START + DEFAULT_MAX_AGE);
-        uint256 before = weth.balanceOf(address(rAt.vault));
+        uint256 before = usd.balanceOf(address(rAt.vault));
         vm.prank(address(rAt.vault));
         rAt.strategy.settle();
-        assertEq(weth.balanceOf(address(rAt.vault)), before + TOTAL_AMOUNT, "age == max clears");
+        assertEq(usd.balanceOf(address(rAt.vault)), before + TOTAL_AMOUNT, "age == max clears");
 
         vm.warp(START + DEFAULT_MAX_AGE + 1);
         vm.prank(address(rPast.vault));
@@ -281,12 +292,12 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
 
         vm.warp(START + 7 days + 1);
 
-        rGap.adapter.setRate(address(tsla), address(weth), 0.8e18);
+        rGap.adapter.setRate(address(tsla), address(usd), 0.8e18);
         vm.prank(address(rGap.vault));
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         rGap.strategy.settle();
 
-        rAttack.adapter.setRate(address(tsla), address(weth), 0.5e18);
+        rAttack.adapter.setRate(address(tsla), address(usd), 0.5e18);
         vm.prank(address(rAttack.vault));
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         rAttack.strategy.settle();
@@ -296,13 +307,13 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     ///         pool never reaches the swap, it reverts `StalePrice` first.
     function test_sellFloor_boundary_freshRejectsManipulation_staleRevertsBeforeSwap() public {
         Rig memory rFresh = _rig();
-        rFresh.adapter.setRate(address(tsla), address(weth), 0.5e18); // pool moved 2x against the vault
+        rFresh.adapter.setRate(address(tsla), address(usd), 0.5e18); // pool moved 2x against the vault
         vm.prank(address(rFresh.vault));
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         rFresh.strategy.settle();
 
         Rig memory rStale = _rig();
-        rStale.adapter.setRate(address(tsla), address(weth), 0.5e18);
+        rStale.adapter.setRate(address(tsla), address(usd), 0.5e18);
         rStale.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1);
         vm.warp(START + 1);
         vm.prank(address(rStale.vault));
@@ -316,11 +327,11 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     function test_floorIsFeedPriceMinusMaxSlippage_independentOfPoolState(uint256 rate) public {
         rate = bound(rate, 0.5e18, 1.5e18);
         Rig memory r = _rig();
-        r.adapter.setRate(address(tsla), address(weth), rate);
+        r.adapter.setRate(address(tsla), address(usd), rate);
 
         uint256 floor = (TOTAL_AMOUNT * (10_000 - SLIPPAGE_100)) / 10_000; // feed 1e18, 1% band
         uint256 fill = (TOTAL_AMOUNT * rate) / 1e18;
-        uint256 before = weth.balanceOf(address(r.vault));
+        uint256 before = usd.balanceOf(address(r.vault));
 
         vm.prank(address(r.vault));
         if (fill < floor) {
@@ -329,7 +340,7 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
             assertEq(tsla.balanceOf(address(r.strategy)), TOTAL_AMOUNT, "rejected fill sold nothing");
         } else {
             r.strategy.settle();
-            assertEq(weth.balanceOf(address(r.vault)) - before, fill, "accepted fill pays the pool rate");
+            assertEq(usd.balanceOf(address(r.vault)) - before, fill, "accepted fill pays the pool rate");
         }
     }
 
@@ -345,16 +356,16 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
         registry.setAllowed(address(feed), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         PortfolioStrategy strategy = _clone();
-        weth.mint(address(vault), TOTAL_AMOUNT);
+        usd.mint(address(vault), TOTAL_AMOUNT);
         vm.prank(address(vault));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
         strategy.initialize(address(vault), proposer, _initData(address(adapter), address(feed)));
 
-        adapter.setRate(address(weth), address(tsla), 0.01e18); // 100x against the vault
+        adapter.setRate(address(usd), address(tsla), 0.01e18); // 100x against the vault
 
         vm.prank(address(vault));
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
@@ -383,9 +394,9 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         Rig memory r = _rig();
         r.registry.setAllowed(address(r.feed), false);
 
-        uint256 vaultWethBefore = weth.balanceOf(address(r.vault));
+        uint256 vaultUsdBefore = usd.balanceOf(address(r.vault));
         vm.prank(address(r.vault));
         r.strategy.settle();
-        assertEq(weth.balanceOf(address(r.vault)), vaultWethBefore + TOTAL_AMOUNT);
+        assertEq(usd.balanceOf(address(r.vault)), vaultUsdBefore + TOTAL_AMOUNT);
     }
 }

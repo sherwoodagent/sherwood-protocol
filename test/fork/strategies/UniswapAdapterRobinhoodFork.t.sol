@@ -9,8 +9,8 @@ import {ROBINHOOD_FORK_BLOCK} from "../RobinhoodMainnetIntegrationTest.sol";
 /**
  * @title UniswapAdapterRobinhoodForkTest
  * @notice Fork tests for UniswapSwapAdapter against Robinhood Chain mainnet's
- *         official Uniswap v3 deployment. Exercises mode-0 single-hop and mode-1
- *         chained multi-hop swaps on the live USDG/WETH pools.
+ *         official Uniswap v3/v4 deployments. Exercises mode-0 single-hop swaps on
+ *         the live USDG/WETH pools and the v4 modes 2/3.
  *
  * @dev Small swap sizes (~100-1000 USDG) — mainnet pool liquidity is modest.
  *      Skips if ROBINHOOD_RPC_URL is not set and PINS the shared harness fork
@@ -38,7 +38,6 @@ contract UniswapAdapterRobinhoodForkTest is Test {
     address constant AMD = 0x86923f96303D656E4aa86D9d42D1e57ad2023fdC;
 
     uint24 constant FEE_500 = 500;
-    uint24 constant FEE_3000 = 3000;
     // Live TSLA/USDG v4 pool: 5% fee, tickSpacing 1000, hookless.
     uint24 constant V4_FEE_50000 = 50_000;
     int24 constant V4_TICK_SPACING_1000 = 1000;
@@ -112,30 +111,6 @@ contract UniswapAdapterRobinhoodForkTest is Test {
         console2.log("Reverse WETH->USDG:", usdgOut);
         assertGt(usdgOut, 0, "should receive USDG back");
         console2.log("Roundtrip loss (USDG raw):", usdcIn - usdgOut);
-    }
-
-    // ── Mode 1: chained multi-hop USDG -(500)- WETH -(3000)- USDG ──
-
-    function test_multiHop_USDG_WETH_USDG() public {
-        uint256 amountIn = 500e6; // 500 USDG
-        deal(USDG, caller, amountIn);
-
-        // Path exercises both liquid pools: USDG/WETH fee-500 then WETH/USDG
-        // fee-3000. tokenIn == tokenOut == USDG, so this is a pure plumbing
-        // test of the chained-hop machinery on live liquidity.
-        bytes memory path = abi.encodePacked(USDG, FEE_500, WETH, FEE_3000, USDG);
-        bytes memory extraData = abi.encodePacked(uint8(1), abi.encode(path, uint16(200)));
-
-        vm.startPrank(caller);
-        IERC20(USDG).approve(address(adapter), amountIn);
-        uint256 amountOut = adapter.swap(USDG, USDG, amountIn, 0, extraData);
-        vm.stopPrank();
-
-        console2.log("Multi-hop USDG->WETH->USDG (500 USDG in):", amountOut);
-        assertGt(amountOut, 0, "should receive USDG out");
-        // Two hops of fees → out < in, but should recover most of it.
-        assertLt(amountOut, amountIn, "two-hop roundtrip pays fees");
-        assertEq(IERC20(WETH).balanceOf(address(adapter)), 0, "no WETH stranded in adapter");
     }
 
     // ── Quoter ABI sanity against live QuoterV2 ──

@@ -14,7 +14,6 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
-import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 
@@ -51,7 +50,6 @@ contract StakedWood_ownerStakeBindingConsent is Test {
     ERC20Mock public usdc;
     ERC20Mock public wood;
     MockAgentRegistry public agentRegistry;
-    MockL2Registrar public ensRegistrar;
 
     address public owner = makeAddr("factoryOwner");
     /// @dev The attacker: owns a vault with an empty bond slot.
@@ -77,7 +75,6 @@ contract StakedWood_ownerStakeBindingConsent is Test {
         executorLib = new BatchExecutorLib();
         vaultImpl = new SyndicateVault();
         agentRegistry = new MockAgentRegistry();
-        ensRegistrar = new MockL2Registrar();
 
         malloryAgentId = agentRegistry.mint(mallory);
         aliceAgentId = agentRegistry.mint(alice);
@@ -131,7 +128,6 @@ contract StakedWood_ownerStakeBindingConsent is Test {
                     owner: owner,
                     executorImpl: address(executorLib),
                     vaultImpl: address(vaultImpl),
-                    ensRegistrar: address(ensRegistrar),
                     agentRegistry: address(agentRegistry),
                     beacon: address(beacon),
                     protocolConfig: address(_hoistedPC),

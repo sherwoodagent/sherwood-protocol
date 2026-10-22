@@ -126,6 +126,12 @@ guard structurally cannot see: the strategy's own `forceApprove(swapAdapter,
 …)` calls happen one frame deeper than anything in the governor's batch
 calldata, after `strategy.execute()` has already been dispatched.
 
+A Portfolio clone also initialises and executes only on the vault's own asset,
+and only when the exposure ledger prices one whole unit of it within 1% of $1
+(`PEG_TOLERANCE_BPS`); an unresolved ledger, an unpriced asset or a stale feed
+reverts (`PortfolioStrategy.sol:165-168, 182, 436-447`). Settle and
+`rebalanceDelta` do not check it.
+
 Consequences for onboarding:
 
 - **Allowlisting must precede strategy clone+init, not just batch execution.**
@@ -150,7 +156,7 @@ Consequences for onboarding:
   wiring. The check is init-time only: a strategy already initialized and
   executed against an adapter that is later demoted is not re-checked at
   settle (by design — see
-  `openspec/changes/portfolio-swap-adapter-allowlist/design.md` decision 3).
+  `openspec/changes/archive/2026-10-02-portfolio-swap-adapter-allowlist/design.md` decision 3).
 - **This does not change §2.1–§2.3.** The adapter still must not be a generic
   executor, still needs a written selector inventory, and still must not be a
   proxy — the strategy-side check only enforces the SAME allowlist bit, one
@@ -451,7 +457,7 @@ decision — never a side effect of re-certification.
 because they either don't run `_demote`, or don't persist at all:
 
 - The ChallengeGame calls `demoteByChallenge` **best-effort**, inside a
-  `try/catch` ([`src/ChallengeGame.sol:1141`](../src/ChallengeGame.sol#L1141)).
+  `try/catch` in `_settle` ([`src/ChallengeGame.sol:650`](../src/ChallengeGame.sol#L650)).
   If that call reverts — e.g. `authorizedDemoter` was rotated away
   mid-challenge — no `_demote` runs, so nothing is cleared; the only signal is
   `AdapterDemotionFailed`. This case is structurally uncoverable on-chain: the
@@ -535,6 +541,9 @@ not just one deployment's configuration. Only certify a template where:
    address* is disqualified — see `MorphoSupplyStrategy`, which does exactly
    that and stays address-certifiable only.
 2. Price sources are bound to the tokens they price, not merely allowlisted.
+   For a Morpho market the binding is the market id: `setMorphoMarketAllowed`
+   attests loan token, collateral, oracle, irm and lltv together, and the
+   oracle and collateral addresses are not allowlisted on their own.
 3. It is cloned with `Clones.clone` / `cloneDeterministic` only. Any
    clone-with-immutable-args variant gives each clone distinct bytecode, which
    dissolves the class **silently** — proposals keep working, they just fall
@@ -554,20 +563,28 @@ Step 2 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
 **Certification review invariant (SHE-209).** Class membership admits *every*
 clone of the template as a batch recipient — including clones minted with a
 bare `Clones.clone` outside `StrategyFactory` and initialized permissionlessly,
-which bypass `StrategyFactory.approvedTemplate` entirely. `SyndicateVault`
-binds each member to the paying vault (`vault() == vault`, reverting
-`AdapterVaultMismatch` otherwise), which neutralizes a hostile clone **only
-if** the template derives its fund destination and its counterparty allowlist
-from `vault()` and exposes no payout / recipient / router address settable
-from `initialize` or `updateParams` data. Nothing on-chain checks this. Before
-step 1, the reviewer must confirm it for the template being certified
-(`BaseStrategy._pushToVault` and the shipped templates satisfy it; grep the
-template for `recipient` / `receiver` / `dest` / `beneficiary` params).
+which bypass `StrategyFactory.approvedTemplate` entirely, and including clones
+bound to a **different** vault. The protocol checks code identity and factory
+provenance; it does not read the clone's `vault()`. (It once did — the class
+vault-binding probe and `AdapterVaultMismatch` were deleted by the
+`structural-batch-rules` change, which reduced the batch guard to four
+structural rules.)
 
-Note that the vault binding applies to every class member, **including a clone
-the owner also granted per-address** with `setAdapterAllowed(clone, true)` —
-the explicit grant vets the address, the binding pins that it still pays this
-vault. The exemption is "not a class member", not "explicitly granted".
+What keeps one vault's capital out of another vault's clone is therefore a
+**template** invariant, not a protocol guard: every value-moving entrypoint is
+`onlyVault`, and the template derives its fund destination and its counterparty
+allowlist from `vault()`, exposing no payout / recipient / router address
+settable from `initialize` or `updateParams` data. Nothing on-chain checks
+this. Before step 1, the reviewer must confirm it for the template being
+certified (`BaseStrategy._pushToVault` and the shipped templates satisfy it;
+grep the template for `recipient` / `receiver` / `dest` / `beneficiary` params,
+and for `external` value-moving functions that are not `onlyVault` —
+`ConcentratedLiquidityStrategy.rerange` and `PortfolioStrategy.rebalanceDelta`
+are the shipped examples, both moving value only *within* the clone).
+
+`test/vault/ClassCloneVaultBinding.t.sol` pins both halves: a foreign-bound
+clone is admitted and priced at the class tier, and a template that drops
+`onlyVault` does move the paying vault's capital to its own `vault()`.
 
 ### Verification reads
 

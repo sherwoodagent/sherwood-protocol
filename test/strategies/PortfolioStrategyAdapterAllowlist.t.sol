@@ -7,6 +7,7 @@ import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 
 /// @notice Minimal vault stand-in exposing only `governor()`, mirroring the
 ///         one hop `_requireAllowedAdapter` reads off `vault()`. Has code
@@ -21,8 +22,11 @@ contract MockVaultWithGovernor {
 
     address public governor;
 
-    constructor(address governor_) {
+    address public asset;
+
+    constructor(address governor_, address asset_) {
         governor = governor_;
+        asset = asset_;
     }
 
     function setGovernor(address governor_) external {
@@ -43,8 +47,11 @@ contract MockVaultWithGovernor {
 contract MockGovernorWithRegistry {
     address public tierRegistry;
 
-    constructor(address registry_) {
+    address public exposureLedger;
+
+    constructor(address registry_, address ledger_) {
         tierRegistry = registry_;
+        exposureLedger = ledger_;
     }
 
     function setTierRegistry(address registry_) external {
@@ -155,7 +162,9 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     PortfolioStrategy public template;
     MockSwapAdapter public adapter;
 
-    ERC20Mock public weth;
+    ERC20Mock public usd;
+
+    MockAssetLedger public ledger;
     ERC20Mock public tsla;
 
     address public proposer = makeAddr("proposer");
@@ -164,7 +173,9 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     uint256 constant SLIPPAGE_100 = 100; // 1%, comfortably inside [50, 1000]
 
     function setUp() public {
-        weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        usd = new ERC20Mock("USD Stable", "USD", 18);
+        ledger = new MockAssetLedger();
+        ledger.setPrice(address(usd), 1e8);
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
         adapter = new MockSwapAdapter();
         template = new PortfolioStrategy();
@@ -189,7 +200,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         feeds[0] = address(tsla);
 
         return abi.encode(
-            address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds
+            address(usd), address(adapter), tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds
         );
     }
 
@@ -214,7 +225,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         feeds[0] = feed;
 
         return abi.encode(
-            address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds
+            address(usd), address(adapter), tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds
         );
     }
 
@@ -248,18 +259,18 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
         registry.setAllowed(address(feed), true);
 
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         strategy = _clone();
-        weth.mint(address(vault), TOTAL_AMOUNT);
+        usd.mint(address(vault), TOTAL_AMOUNT);
         vm.prank(address(vault));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
 
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        usd.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
 
         strategy.initialize(address(vault), proposer, _initDataWithFeed(initSlippageBps, address(feed)));
 
@@ -281,8 +292,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     {
         registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
         // Issue #147's price-source binding (audit-181 Finding #5a): the
@@ -292,14 +303,14 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         registry.setAllowed(address(feed), true);
 
         strategy = _clone();
-        weth.mint(address(vault), TOTAL_AMOUNT);
+        usd.mint(address(vault), TOTAL_AMOUNT);
         vm.prank(address(vault));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
 
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        usd.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
 
         strategy.initialize(address(vault), proposer, _initDataWithFeed(initSlippageBps, address(feed)));
 
@@ -311,8 +322,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_nonAllowlistedAdapter_refused() public {
         MockTierRegistry registry = new MockTierRegistry();
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
         // Adapter deliberately NOT allowlisted.
 
         PortfolioStrategy strategy = _clone();
@@ -330,8 +341,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         // #5a) requires that address to be allowlisted too, exactly like the
         // adapter.
         registry.setAllowed(address(tsla), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         PortfolioStrategy strategy = _clone();
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
@@ -367,7 +378,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     }
 
     function test_vaultGovernorReturnsZero_initFailsClosed() public {
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(0));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(0), address(usd));
         PortfolioStrategy strategy = _clone();
         vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
@@ -375,15 +386,15 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_governorWithoutRegistryGetter_initFailsClosed() public {
         MockGovernorNoRegistryGetter governor = new MockGovernorNoRegistryGetter();
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
         PortfolioStrategy strategy = _clone();
         vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
     }
 
     function test_governorTierRegistryZero_initFailsClosed() public {
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
         PortfolioStrategy strategy = _clone();
         vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
@@ -393,8 +404,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_revertingRegistry_failsClosed() public {
         RevertingRegistry registry = new RevertingRegistry();
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         PortfolioStrategy strategy = _clone();
         vm.expectRevert(
@@ -405,8 +416,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_malformedReturnRegistry_failsClosed() public {
         MalformedReturnRegistry registry = new MalformedReturnRegistry();
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         PortfolioStrategy strategy = _clone();
         vm.expectRevert(
@@ -419,26 +430,38 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_initBelowFloor_49_reverts() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault2");
+        address vault_ = _resolvedVault();
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, _initData(49));
+        strategy.initialize(vault_, proposer, _initData(49));
     }
 
     function test_initBelowFloor_zero_reverts() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault3");
+        address vault_ = _resolvedVault();
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, _initData(0));
+        strategy.initialize(vault_, proposer, _initData(0));
     }
 
     function test_initAboveCeiling_stillReverts() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault4");
+        address vault_ = _resolvedVault();
         // Hoisted: a call in argument position would consume the pending
         // `vm.expectRevert` before `initialize` itself runs.
         bytes memory data = _initData(strategy.MAX_SLIPPAGE_CEILING_BPS() + 1);
         vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
-        strategy.initialize(codelessVault, proposer, data);
+        strategy.initialize(vault_, proposer, data);
+    }
+
+    /// @dev A vault whose registry resolves and allows the basket, so init reaches the slippage checks.
+    function _resolvedVault() internal returns (address) {
+        MockTierRegistry registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        registry.setAllowed(address(tsla), true);
+        return address(
+            new MockVaultWithGovernor(
+                address(new MockGovernorWithRegistry(address(registry), address(ledger))), address(usd)
+            )
+        );
     }
 
     function test_initAtExactFloor_succeeds() public {
@@ -448,8 +471,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
         registry.setAllowed(address(tsla), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault_ = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault_ = new MockVaultWithGovernor(address(governor), address(usd));
         strategy.initialize(address(vault_), proposer, _initData(strategy.MIN_SLIPPAGE_BPS()));
         assertEq(strategy.maxSlippageBps(), strategy.MIN_SLIPPAGE_BPS());
     }
@@ -493,15 +516,15 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         registry.setAllowed(address(adapter), true);
         AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
         registry.setAllowed(address(feed), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
-        weth.mint(address(vaultStub), TOTAL_AMOUNT);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor), address(usd));
+        usd.mint(address(vaultStub), TOTAL_AMOUNT);
         vm.prank(address(vaultStub));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        usd.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
 
         strategy.initialize(address(vaultStub), proposer, _initDataWithFeed(strategy.MIN_SLIPPAGE_BPS(), address(feed)));
         vm.prank(address(vaultStub));
@@ -545,18 +568,18 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
         registry.setAllowed(address(feed), true);
 
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         PortfolioStrategy strategy = _clone();
-        weth.mint(address(vault), TOTAL_AMOUNT);
+        usd.mint(address(vault), TOTAL_AMOUNT);
         vm.prank(address(vault));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
 
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        usd.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
 
         strategy.initialize(address(vault), proposer, _initDataWithFeed(SLIPPAGE_100, address(feed)));
 
@@ -598,6 +621,28 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         strategy.rebalanceDelta();
     }
 
+    /// @notice A registry that stops resolving after execute fails `rebalanceDelta` closed.
+    function test_unresolvedRegistry_rebalanceDelta_reverts() public {
+        (PortfolioStrategy strategy,, MockVaultWithGovernor vault,) =
+            _initAndExecuteWithResolvedRegistryAndAggregator(SLIPPAGE_100);
+        MockGovernorWithRegistry(vault.governor()).setTierRegistry(address(0));
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
+        strategy.rebalanceDelta();
+    }
+
+    /// @notice An unresolvable registry never blocks settlement.
+    function test_unresolvedRegistry_settleStillCompletes() public {
+        (PortfolioStrategy strategy,, MockVaultWithGovernor vault,) =
+            _initAndExecuteWithResolvedRegistryAndAggregator(SLIPPAGE_100);
+        MockGovernorWithRegistry(vault.governor()).setTierRegistry(address(0));
+
+        vm.prank(address(vault));
+        strategy.settle();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
     /// @dev Regression guard: a resolved, still-allowlisted adapter must not
     ///      be newly blocked by the live re-check. Exercises `_verifyPrice`
     ///      after the re-check passes — needs a real aggregator, hence the fixture.
@@ -635,15 +680,15 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         registry.setAllowed(address(adapter), true);
         AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
         registry.setAllowed(address(feed), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
-        weth.mint(address(vaultStub), TOTAL_AMOUNT);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor), address(usd));
+        usd.mint(address(vaultStub), TOTAL_AMOUNT);
         vm.prank(address(vaultStub));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        usd.mint(address(adapter), 1_000_000e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
 
         strategy.initialize(address(vaultStub), proposer, _initDataWithFeed(initSlippageBps, address(feed)));
         vm.prank(address(vaultStub));

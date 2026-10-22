@@ -115,6 +115,16 @@ contract BindingTierRegistry {
         return allowed[a];
     }
 
+    mapping(bytes32 => bool) public marketAllowed;
+
+    function setMarketAllowed(bytes32 id, bool v) external {
+        marketAllowed[id] = v;
+    }
+
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool) {
+        return marketAllowed[id];
+    }
+
     /// @dev SHE-209: no class concept in this stand-in — every address is a
     ///      non-member, so the vault's class-binding check never fires.
     function classOf(address) external pure returns (bytes32) {
@@ -176,6 +186,8 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         realMorpho.createMarket(mp);
 
         registry = new BindingTierRegistry();
+        // FP-02: the market is allowlisted by id; this suite is about the singleton.
+        registry.setMarketAllowed(keccak256(abi.encode(mp)), true);
         governor = new BindingGovernorStub(address(registry));
         vaultStub = new BindingVaultStub(address(usdg), address(governor));
         usdg.mint(address(vaultStub), SUPPLY);
@@ -236,6 +248,7 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         MarketParams memory evilParams = mp;
         evilParams.lltv = 0.123e18;
         registry.setAllowed(address(evil), true);
+        registry.setMarketAllowed(keccak256(abi.encode(evilParams)), true);
 
         MorphoSupplyStrategy s = _init(address(evil), evilParams);
 
@@ -342,6 +355,19 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
 
         assertEq(usdg.balanceOf(address(vaultStub)), SUPPLY, "vault float untouched");
         assertEq(usdg.allowance(address(s), address(realMorpho)), 0, "no approval granted");
+    }
+
+    /// @notice A registry that stops resolving between init and execute fails `execute()` closed.
+    function test_execute_revertsWhenRegistryUnresolvedAfterInit() public {
+        registry.setAllowed(address(realMorpho), true);
+        MorphoSupplyStrategy s = _init(address(realMorpho), mp);
+        governor.setTierRegistry(address(0));
+
+        vm.prank(address(vaultStub));
+        usdg.approve(address(s), SUPPLY);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MorphoSupplyStrategy.TierRegistryUnresolved.selector);
+        s.execute();
     }
 
     /// @notice The exit path is NOT gated: a demotion after execute must not be

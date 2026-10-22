@@ -18,7 +18,6 @@ import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {ProposerBondEscrow} from "../../src/ProposerBondEscrow.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
-import {TokenCourt} from "../../src/TokenCourt.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
@@ -45,7 +44,6 @@ abstract contract ProtocolFixture is Test {
         ExposureLedger ledger;
         ProposerBondEscrow escrow;
         ChallengeGame game;
-        TokenCourt court;
         SyndicateVault vault;
         SyndicateGovernor governor;
     }
@@ -100,14 +98,6 @@ abstract contract ProtocolFixture is Test {
         vm.stopPrank();
     }
 
-    function _wireTokenCourt(address owner_, StakedWood swood_, ChallengeGame game_, TokenCourt court_) internal {
-        vm.startPrank(owner_);
-        court_.setChallengeGame(address(game_));
-        court_.setStakedWood(address(swood_));
-        game_.setCourt(address(court_));
-        vm.stopPrank();
-    }
-
     function _deployProtocol(address owner_) internal returns (ProtocolDeployment memory p) {
         p.asset = new ERC20Mock("USD Coin", "USDC", 6);
         p.wood = new ERC20Mock("Sherwood", "WOOD", 18);
@@ -144,7 +134,6 @@ abstract contract ProtocolFixture is Test {
                     owner: owner_,
                     executorImpl: address(p.executor),
                     vaultImpl: address(new SyndicateVault()),
-                    ensRegistrar: address(0),
                     agentRegistry: address(p.agentRegistry),
                     beacon: address(p.beacon),
                     protocolConfig: address(p.config),
@@ -162,7 +151,6 @@ abstract contract ProtocolFixture is Test {
         p.ledger = new ExposureLedger(owner_, address(p.swood), 28 days);
         p.escrow = new ProposerBondEscrow(address(p.wood), address(p.registry), address(p.ledger));
         p.game = new ChallengeGame(owner_, address(p.wood), address(p.ledger), address(p.tiers));
-        p.court = new TokenCourt(owner_);
         MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         MockAggregatorV3 assetFeed = new MockAggregatorV3(8, 1e8);
         vm.startPrank(owner_);
@@ -179,7 +167,6 @@ abstract contract ProtocolFixture is Test {
         p.factory.setBondEscrow(address(p.escrow));
         vm.stopPrank();
         _wireChallengeGame(owner_, owner_, p.swood, p.ledger, p.tiers, p.game);
-        _wireTokenCourt(owner_, p.swood, p.game, p.court);
 
         uint256 agentId = p.agentRegistry.mint(owner_);
         uint256 ownerBond = p.swood.minOwnerStake();

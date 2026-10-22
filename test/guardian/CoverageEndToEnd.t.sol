@@ -164,6 +164,7 @@ contract CoverageEndToEndTest is ProtocolFixture {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         protocolConfig = new ProtocolConfig(owner);
         adapter = new NoopAdapter();
         tierRegistry = new TierRegistry(address(this));
@@ -206,6 +207,8 @@ contract CoverageEndToEndTest is ProtocolFixture {
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vaultA)), abi.encode(address(govA))
         );
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vaultB)), abi.encode(address(govB))
         );
@@ -530,18 +533,15 @@ contract CoverageEndToEndTest is ProtocolFixture {
         );
     }
 
-    // ── N1: budget exhaustion must not silence the approve side ───────────
+    // ── N1: budget exhaustion must not brick the review ───────────────────
 
-    /// @notice N1 (re-review) — a guardian whose budget went on an earlier
-    ///         proposal can still CAST an approve vote on the next one. It
-    ///         books nothing, so the batching cap is untouched, but the vote
-    ///         itself lands.
-    ///
-    ///         Before this, `recordApproval` reverted `ExposureCapExceeded` and
-    ///         took `voteOnProposal` down with it. That is what let the C1 veto
-    ///         survive in a second form: an attacker who front-runs while the
-    ///         cohort is busy still bricks the proposal, because the guardians
-    ///         who would have covered it cannot participate at all.
+    /// @notice N1 (re-review), re-aimed for SHE-240. A guardian whose budget
+    ///         went on an earlier proposal underwrites nothing on the next one,
+    ///         so it is refused an approver slot rather than seated holding no
+    ///         coverage. What N1 protects is unchanged and is what this still
+    ///         asserts: the refusal is confined to that one guardian, the slot
+    ///         stays open, and the review proceeds to execute on the coverage
+    ///         another guardian actually raises.
     function test_n1_spentBudgetStillVotesAndDoesNotBreakTheReview() public {
         // Warm-up on syndicate B consumes g3's budget entirely.
         uint256 pidB = _propose(govB, address(vaultB), agentB);
@@ -553,13 +553,19 @@ contract CoverageEndToEndTest is ProtocolFixture {
         uint256 pidA = _propose(govA, address(vaultA), agentA);
         _openReview(govA, pidA);
 
-        // g3 has nothing left to pledge -- and votes anyway.
-        _vote(govA, pidA, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        // SHE-240 re-aim: g3 has nothing left to pledge, so it cannot take an
+        // approver slot either. The cap still binds exactly as before — nothing
+        // is committed — but the refusal is loud and the slot stays open. g3's
+        // Block vote is untouched, which is the disenfranchisement bound N1
+        // cared about.
+        vm.prank(g3);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        registry.voteOnProposal(address(govA), pidA, IGuardianRegistry.GuardianVoteType.Approve, COVERAGE_WOOD);
         assertEq(ledger.lockOf(address(govA), pidA, g3), 0, "locks nothing: the cap still binds");
 
         (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
-        assertEq(approvers.length, 1, "but the review counted the vote");
-        assertEq(approvers[0], g3);
+        assertEq(approvers.length, 0, "and takes no slot it cannot underwrite");
+        assertEq(ledger.openExposure(g3), FILLER_STAKE, "nothing moved on the refusal");
 
         // g1 still has budget, so the proposal is genuinely coverable.
         _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
@@ -685,8 +691,8 @@ contract CoverageEndToEndTest is ProtocolFixture {
     /// @notice PR #25 review F2/F6: expiry alone is NOT the exit condition while
     ///         an accusation is live. `openExposure` sums epoch buckets on
     ///         pure wall-clock, so coverage ages out on a timer that does not
-    ///         pause for a challenge — and the challenge game's disputed tail
-    ///         (up to `disputeTimeout`, 30d) outlives it by design. The accused
+    ///         pause for a challenge — and the challenge game's live tail
+    ///         (up to `voteWindow`) outlives it by design. The accused
     ///         could therefore request at execution, wait, and walk the whole
     ///         bond out before the challenge could resolve; the conviction then
     ///         priced maximum guilt (`live == 0` saturates `slashBpsFor` at
@@ -1064,6 +1070,128 @@ contract CoverageEndToEndTest is ProtocolFixture {
         ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
     }
 
+    /// @notice SHE-240 — approver slots are bounded (`MAX_APPROVERS_PER_PROPOSAL`)
+    ///         and were granted on vote admission alone, so a guardian at the
+    ///         minimum stake could take one while declaring a zero lock: the
+    ///         ledger booked nothing and never listed it. Enough of them filled
+    ///         the array, every honest approve then hit `NewSideFull`, and the
+    ///         coverage quorum saw an empty ledger list.
+    ///
+    ///         The floor refuses the slot at the FIRST squatter, and a real
+    ///         underwriter still takes one afterwards.
+    function test_approveSlotSquatIsRefused() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+
+        // The squat needs no special identity: any active guardian with free
+        // budget can declare nothing. g2/g3/g4 each hold 20,000 WOOD and could
+        // underwrite this proposal outright -- they simply decline to.
+        address[3] memory squatters = [g2, g3, g4];
+        _openReview(govA, pid);
+
+        // The first squatter is refused; the array never grows.
+        vm.prank(squatters[0]);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+
+        (address[] memory afterSquat,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(afterSquat.length, 0, "a refused vote seats no approver");
+        (address[] memory ledgerListed,) = ledger.approversOf(address(govA), pid);
+        assertEq(ledgerListed.length, 0, "and books no coverage");
+
+        // Every remaining squatter meets the same refusal, so the array cannot
+        // be filled this way at any price.
+        for (uint256 i = 1; i < squatters.length; i++) {
+            vm.prank(squatters[i]);
+            vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+            registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        }
+        (address[] memory stillEmpty,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(stillEmpty.length, 0, "the slots stay open for honest approvers");
+
+        // An honest approver takes its slot and the proposal executes on real
+        // coverage — the censorship the squat bought is gone.
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        (address[] memory honest,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(honest.length, 1, "the honest approve still lands");
+        assertEq(honest[0], g1);
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "and carries real coverage");
+
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "executes on real coverage");
+    }
+
+    /// @notice The cheapest door to the squat was an ordinary feed heartbeat
+    ///         lapse: the ledger could not price the need, booked nothing, and
+    ///         the registry kept the approver slot it had already pushed. The
+    ///         price the ledger cannot read now takes the vote with it, so the
+    ///         slot stays open for whoever can underwrite once the feed is back.
+    function test_approveSlot_staleAssetFeedIsRefused() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+
+        // A heartbeat lapse, expressed as the bound the operator set: the
+        // fixture's feed was stamped at construction and is now past it.
+        vm.prank(ledgerOwner);
+        ledger.setAssetFeed(address(usdg), address(feed), 1);
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        ledger.coverageUsd(address(usdg), MAX_CAPITAL);
+
+        vm.prank(g2);
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, COVERAGE_WOOD);
+
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(approvers.length, 0, "a feed lapse seats no approver");
+        (address[] memory listed,) = ledger.approversOf(address(govA), pid);
+        assertEq(listed.length, 0, "and books no coverage");
+
+        // The feed publishes again and the same vote lands, carrying real
+        // coverage — the liveness cost is the outage, not the proposal.
+        feed.set(1e8);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        (address[] memory honest,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(honest.length, 1, "the slot was still open");
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "and carries real coverage");
+    }
+
+    /// @notice The floor gates the vote-CHANGE call site too, and a refusal
+    ///         there rolls the change back whole: a guardian that blocked and
+    ///         then finds its budget spent elsewhere keeps its Block rather than
+    ///         moving to an approver slot it cannot underwrite.
+    function test_blockThenApproveIsRefusedByTheFloorAndKeepsTheBlock() public {
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govA, pidA);
+        _openReview(govB, pidB);
+
+        // g1 blocks A -- alone it carries the block quorum.
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Block);
+
+        // ...then spends its whole budget underwriting B.
+        _voteLock(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        uint256 spent = ledger.openExposure(g1);
+        assertGt(spent, 0, "fixture: the budget really is committed to B");
+
+        // Changing to Approve on A would seat an approver with nothing left to
+        // pledge, so the ledger refuses and the change never happens.
+        vm.prank(g1);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        registry.voteOnProposal(address(govA), pidA, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
+        assertEq(approvers.length, 0, "no slot taken on the change");
+        assertEq(ledger.openExposure(g1), spent, "and nothing moved on B");
+
+        // The Block weight survived the refusal: A is still blocked.
+        _pastReview(govA, pidA);
+        assertEq(
+            uint256(registry.outcomeOf(address(govA), pidA)),
+            uint256(IGuardianRegistry.ReviewOutcome.Blocked),
+            "the Block vote and its weight are intact"
+        );
+    }
+
     // ── 3. Cold start: a thin cohort BLOCKS execution, it does not force it ──
 
     /// @notice Spec §3.3a cold-start. The guardian cohort collapses to a single
@@ -1270,19 +1398,24 @@ contract CoverageEndToEndTest is ProtocolFixture {
     }
 
     /// @notice Spec scenarios "Negligible declaration still pays the floor" and
-    ///         "Owner cannot raise the floor on a decided review". g1 locks ONE
-    ///         WEI: its lock rate rounds up to 1 bps, the severity leaves it at
-    ///         1 bps, and the envelope floors it at the `minSlashBps` in force
-    ///         AT OPEN — 1,000 bps of the whole bond, a real penalty for a token
-    ///         declaration. The owner raising the floor to 5,000 after the
+    ///         "Owner cannot raise the floor on a decided review". g1 locks the
+    ///         smallest declaration SHE-240 will grant a slot for — one
+    ///         hundredth of the $1,000 need, 200 WOOD of its 30,000 bond. Its
+    ///         lock rate is a fraction of the envelope, the severity leaves it
+    ///         far below the `minSlashBps` in force AT OPEN, and the envelope
+    ///         floors it at 1,000 bps of the whole bond: a real penalty for a
+    ///         token declaration. The owner raising the floor to 5,000 after the
     ///         review opened changes nothing about it; a review opened after the
     ///         raise is floored at 5,000.
     function test_reviewSlash_tokenLockPaysTheAtOpenFloor_ownerCannotRaiseItMidReview() public {
         uint256 pid = _propose(govA, address(vaultA), agentA);
-        _blockedReview(govA, pid, 1);
-        assertEq(ledger.lockOf(address(govA), pid, g1), 1, "a 1-wei lock");
+        // One slot's share of the need: COVERAGE_WOOD backs the whole $1,000.
+        uint256 tokenLock = COVERAGE_WOOD / 100;
+        _blockedReview(govA, pid, tokenLock);
+        assertEq(ledger.lockOf(address(govA), pid, g1), tokenLock, "the smallest declaration that buys a slot");
         (, uint256[] memory rate) = ledger.slashBpsFor(address(govA), pid);
-        assertEq(rate[0], 1, "which rounds up to 1 bps");
+        assertEq(rate[0], (tokenLock * 10_000 + WHALE_STAKE - 1) / WHALE_STAKE, "ceil(lock / bond) in bps");
+        assertLt(rate[0], 1_000, "and far below the at-open floor, which is what makes the floor load-bearing");
 
         // The owner raises the floor AFTER the review opened and the votes are in.
         assertEq(swood.minSlashBps(), 1_000, "fixture floor at open");
@@ -1298,13 +1431,114 @@ contract CoverageEndToEndTest is ProtocolFixture {
         // Control: a review opened AFTER the raise is judged under the new floor.
         uint256 stakeNow = swood.guardianStake(g1);
         uint256 pidB = _propose(govB, address(vaultB), agentB);
-        _blockedReview(govB, pidB, 1);
+        _blockedReview(govB, pidB, tokenLock);
         _pastReview(govB, pidB);
         assertTrue(registry.resolveReview(address(govB), pidB), "blocked");
         assertEq(
             swood.guardianStake(g1),
             stakeNow - (stakeNow * 5_000) / 10_000,
             "the raise applies to reviews opened afterwards"
+        );
+    }
+
+    // ── SHE-168: an unstake request cannot shrink the block-quorum slash basis ──
+
+    /// @dev Blocked review on `pid` (g1 approves, g2/g3 block); returns g1's burn.
+    ///      `flicker`: g1 requests unstake the second BEFORE the open and cancels in
+    ///      the open block, so `openedAt` reads g1's zeroed votable checkpoint.
+    function _she168BlockedReview(uint256 pid, bool flicker) internal returns (uint256 burn) {
+        vm.warp(govA.getProposal(pid).voteEnd + 1);
+        if (flicker) {
+            vm.prank(g1);
+            swood.requestUnstakeGuardian();
+        }
+        vm.warp(vm.getBlockTimestamp() + 1);
+        // Nothing exposes `openedAt`; `GuardianRegistry._openReview` stamps
+        // `block.timestamp - 1` (src/GuardianRegistry.sol:860).
+        uint256 openedAt = vm.getBlockTimestamp() - 1;
+        if (flicker) {
+            vm.prank(g1);
+            swood.cancelUnstakeGuardian();
+            assertEq(swood.getPastStake(g1, openedAt), 0, "fixture: the anchor reads g1's zeroed votable checkpoint");
+        }
+        _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(swood.slashableStakeAt(g1, openedAt + 1), WHALE_STAKE, "slash basis at the anchor is the whole stake");
+
+        uint256 before = swood.guardianStake(g1);
+        _pastReview(govA, pid);
+        assertTrue(registry.resolveReview(address(govA), pid), "blocked");
+        burn = before - swood.guardianStake(g1);
+    }
+
+    /// @notice SHE-168: requesting unstake the block before the review opens and
+    ///         cancelling in the open block zeroes the votable checkpoint at
+    ///         `openedAt`, and the block-quorum slash still burns exactly what it
+    ///         burns without the request.
+    function test_reviewSlash_she168_unstakeRequestBeforeOpenDoesNotShrinkTheSlash() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+
+        uint256 snap = vm.snapshotState();
+        uint256 controlBurn = _she168BlockedReview(pid, false);
+        assertGt(controlBurn, 0, "control: the conviction burns");
+        vm.revertToState(snap);
+
+        uint256 attackBurn = _she168BlockedReview(pid, true);
+        assertEq(attackBurn, controlBurn, "the request-then-cancel flicker changes nothing");
+    }
+
+    /// @notice SHE-168: a requested guardian cannot cast the approve vote at all,
+    ///         so the request-then-vote ordering the issue feared never produces
+    ///         an approver.
+    function test_reviewSlash_she168_requestedGuardianCannotApprove() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        vm.warp(govA.getProposal(pid).voteEnd + 1);
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        vm.prank(g1);
+        vm.expectRevert(IGuardianRegistry.NotActiveGuardian.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
+    }
+
+    /// @notice SHE-168: an approver who requests unstake after voting cannot claim
+    ///         while its coverage is open, and the blocked review burns exactly what
+    ///         the control burns without the request, whatever the resolve time
+    ///         (the control resolves at `reviewEnd + 1`, this one a week later).
+    function test_reviewSlash_she168_unstakeRequestAfterApproveDoesNotShrinkTheSlash() public {
+        vm.startPrank(owner);
+        swood.setExposureLedger(address(ledger));
+        swood.setCooldownPeriod(7 days);
+        vm.stopPrank();
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+
+        uint256 snap = vm.snapshotState();
+        uint256 controlBurn = _she168BlockedReview(pid, false);
+        assertGt(controlBurn, 0, "control: the conviction burns");
+        vm.revertToState(snap);
+
+        _openReview(govA, pid);
+        // `GuardianRegistry._openReview` stamps `block.timestamp - 1` (src/GuardianRegistry.sol:860).
+        uint256 openedAt = vm.getBlockTimestamp() - 1;
+        _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Block);
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        assertEq(swood.slashableStakeAt(g1, openedAt + 1), WHALE_STAKE, "slash basis at the anchor is the whole stake");
+
+        // Past the cooldown, before resolution: only the coverage gate holds the bond.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+
+        uint256 before = swood.guardianStake(g1);
+        assertTrue(registry.resolveReview(address(govA), pid), "blocked");
+        assertEq(
+            before - swood.guardianStake(g1), controlBurn, "the pending request and the later resolve change nothing"
         );
     }
 

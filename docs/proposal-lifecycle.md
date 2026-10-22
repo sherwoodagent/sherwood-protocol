@@ -43,7 +43,7 @@ stateDiagram-v2
 Deadlines derived at proposal creation (`src/SyndicateGovernor.sol:1067-1093`):
 
 ```
-snapshotTimestamp = now − 1            // closes same-block flash-delegate
+snapshotTimestamp = now − 1            // closes same-block acquisition
 voteEnd   = now + votingPeriod
 reviewEnd = voteEnd + registry.reviewPeriod()
 executeBy = reviewEnd + executionWindow
@@ -53,18 +53,21 @@ executeBy = reviewEnd + executionWindow
 
 All governor parameters are **per-vault**, set instantly by the vault owner but frozen
 while any proposal is open (`whenNoActiveProposal`). Bounds are hardcoded in
-`GovernorParameters.sol`.
+`GovernorParameters.sol`. A change takes effect in the same transaction, so the
+owner can set a 1-hour voting period and an 80% veto threshold and propose in
+the same block; an open proposal keeps the `voteEnd` and veto threshold it
+recorded on entering Pending.
 
 | Step | Parameter | Default | Min | Max | Where enforced |
 |---|---|---|---|---|---|
-| 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:280` |
-| 1. LP voting | `votingPeriod` | 24 h | 24 h (mainnet deploy floor; absolute floor 1 min) | 3 d | `GovernorParameters.sol:334` |
-| 1a. LP veto threshold | `vetoThresholdBps` | 20% | 20% | 80% | `GovernorParameters.sol:342` |
+| 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:268` |
+| 1. LP voting | `votingPeriod` | 24 h (factory default) | 1 h (`MIN_VOTING_PERIOD` on the mainnet impl; absolute floor 1 min) | 3 d | `GovernorParameters.sol:323-325` |
+| 1a. LP veto threshold | `vetoThresholdBps` | 20% | 20% | 80% | `GovernorParameters.sol:331-333` |
 | 2. Guardian review | `registry.reviewPeriod` | 24 h | 6 h (mainnet immutable floor; absolute floor 1 min) | 3 d | `GuardianRegistry.sol:1002` |
-| 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:338` |
-| 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:250-268` |
-| 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:350` |
-| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:837-857` |
+| 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:204` |
+| 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:235-258` |
+| 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:260` |
+| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | `reviewPeriod` + 7 d (when registry wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.setChallengeWindow` |
 
 Cross-contract timing invariants (all enforced at the setters):
 
@@ -73,10 +76,10 @@ Cross-contract timing invariants (all enforced at the setters):
 - `ledger.challengeWindow ≥ reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW (7 d)` —
   coverage stays challengeable through the longest possible execution delay
   (`GuardianRegistry.sol:1018`).
-- `ChallengeGame: autoSlashDelay + court.voteWindow + FINALIZE_BUFFER +
-  MIN_REFERRAL_SLACK ≤ disputeTimeout` — a disputed challenge always has room for a
-  full court vote before the timeout, plus 1 h of referral slack
-  (`ChallengeGame.sol:117`). At deployed values: 7 d + 5 d + 1 d + 1 h ≈ 13 d ≤ 30 d.
+- `ChallengeGame.voteWindow ≥ MIN_VOTE_WINDOW (2 d)` — every filing gets a window the
+  guardian cohort can realistically notice and decide inside, and the window a
+  challenge actually receives is pinned at filing so no later change can close one the
+  accused is still inside (`ChallengeGame.MIN_VOTE_WINDOW`, `voteWindowAtFiling`). At deployed values: 7 d ≥ 2 d.
 
 ## Step by step
 
@@ -95,7 +98,8 @@ Cross-contract timing invariants (all enforced at the setters):
   governor cap (see [fees.md](fees.md)).
 - **Proposer bond** pulled into `ProposerBondEscrow`:
   `bondWood = coverageUsd × proposerBondBps (default 1%) / woodPrice`. Fail-closed —
-  unpriceable WOOD blocks proposing (`src/ExposureLedger.sol:951`).
+  unpriceable WOOD blocks proposing any proposal with non-zero required coverage;
+  a zero-coverage proposal needs no bond and no price (`ExposureLedger.proposerBondWood`).
 
   This is **not** the 10k owner stake. The amount **scales** (tier-2 uncertified =
   full notional × ~1% in USD, converted at `woodPriceX8()`). Do not treat a fixed
@@ -105,11 +109,10 @@ Cross-contract timing invariants (all enforced at the setters):
   WOOD (allowance alone is not enough). See [proposer-bond.md](proposer-bond.md).
 - With co-proposers → `Draft`; each co-proposer must `approveCollaboration` within
   `collaborationWindow` or the draft expires. The lead can `rejectCollaboration`.
-- Vault funds: **untouched**. Instant deposits stay open through propose, vote,
-  review and approval — only execution locks them (`depositsLocked`). Instant
-  withdrawals lock from propose, `Draft` included (`redemptionsLocked`): whoever
-  can vote stays at risk for the outcome, and no exit can land ahead of the
-  electorate stamp.
+- Vault funds: **untouched**, but instant deposits and withdrawals lock from
+  propose, `Draft` included, until settle (`depositsLocked` = `redemptionsLocked`):
+  no share is minted or burned while a proposal is open. LPs use the queue lanes
+  (`requestDeposit` / `requestRedeem`) meanwhile.
 
 ### 1. Vote (`vote`, `src/SyndicateGovernor.sol:378`)
 
@@ -117,27 +120,34 @@ Cross-contract timing invariants (all enforced at the setters):
   checkpoints; snapshot is `now − 1` so same-block flash-delegation cannot vote).
 - **Optimistic:** the proposal passes by default when `voteEnd` arrives; it is
   rejected only if AGAINST votes reach `vetoThresholdBps` (20–80%) of the
-  proposal's `votableSupply` — total supply minus the withdrawal queue's
-  balance, recorded at the Draft → Pending transition: live on the direct path
-  (nothing can move between the read and the stamp), at `snapshotTimestamp` on
-  the collaborative path (the redeem lane is open for the whole Draft, so a live
-  queue term could be shrunk by a same-block `requestRedeem` that keeps its weight).
+  proposal's `votableSupply` — supply minus the withdrawal queue at the snapshot,
+  recorded at the Draft → Pending transition and lowered by the first vote to the
+  same read at the end of the propose second, the two instants vote weight reads.
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
-  (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
+  (Draft/Pending). Proposer can `cancelProposal` while Pending (up to `voteEnd`),
+  during guardian review (until `reviewEnd`, and only while block quorum is not
+  reached), and while Approved (`SyndicateGovernor.cancelProposal`). Cancelling
+  after guardians approved leaves their locks booked (see
+  [coverage.md](coverage.md)).
 
 ### 2. Guardian review (`GuardianRegistry`)
 
 - `openReview` — permissionless keeper call once `voteEnd` passes.
-- **Voters:** active staked-WOOD guardians; weight is age-weighted stake at the
-  open snapshot.
+- **Voters:** active staked-WOOD guardians; weight is raw stake
+  (`getPastStake`) at `snapshotAt`, one second before the block in which the
+  proposal entered Pending (the `propose` block, or for a collaborative
+  proposal the last co-proposer approval), with no age discount
+  (`GuardianRegistry.registerReview`, `voteOnProposal`). The denominator is total stake at the same
+  instant.
 - Blocked if blocking stake reaches `blockQuorumBps` (default 30%, bounds 10–100%).
-- Cohort below `MIN_COHORT_STAKE_AT_OPEN` (50 000 sWOOD) → review auto-clears
-  (`cohortTooSmall`).
+- There is no cohort-size floor: any positive total stake decides its own
+  review; only a zero total fails open.
 - Last 10% of the window is vote-locked (`LATE_VOTE_LOCKOUT_BPS`) — no last-second
   swings.
 - `resolveReview` — permissionless once `reviewEnd` passes. A blocked review slashes
-  approving guardians (the *economic commit*, idempotent) at a quadratic severity
-  ramp between `minSlashBps` and `maxSlashBps`.
+  approving guardians (the *economic commit*, idempotent): each approver's rate is
+  its lock over its slash basis, scaled by the block's quadratic severity and
+  clamped into `[minSlashBps, maxSlashBps]` (`GuardianRegistry.resolveReview`).
 - Full detail: [guardian-network.md](guardian-network.md).
 
 ### 3. Execute (`executeProposal`, `src/SyndicateGovernor.sol:402`)
@@ -155,7 +165,7 @@ Cross-contract timing invariants (all enforced at the setters):
   empty / zero aggregate reverts `InsufficientApproveCoverage`) → the voted
   batch runs via `executeGovernorBatch` under that effective cap. See
   [coverage.md](coverage.md).
-- Effects: capital snapshot taken, `_activeProposal = id` (**deposits lock** —
+- Effects: capital snapshot taken, `_activeProposal = id` (deposits and
   redemptions have been locked since propose, `Draft` included), management-fee clock starts.
 - Batch metering: per-call caps (`CallCapExceeded`), net outflow ≤ `maxCapital`
   (`MaxNetOutflowExceeded`), queue reserve untouchable (`QueueReserveBreached`),
@@ -185,16 +195,17 @@ Cross-contract timing invariants (all enforced at the setters):
 
 ### 6. After settlement — challenge window and bond reclaim
 
-`reclaimProposerBond` (`src/SyndicateGovernor.sol:705`) is permissionless and always
+`SyndicateGovernor.reclaimProposerBond` is permissionless and always
 pays the recorded proposer, but for executed proposals only after **three** gates:
 
-1. `executedAt + ledger.challengeWindow` (default 14 d) has passed,
+1. `executedAt + strategyDuration + ledger.challengeWindow` (default 14 d) has passed,
 2. coverage is not frozen by a live challenge,
-3. the challenge game's own deadline — including any inconclusive-verdict re-arm —
-   is strictly past.
+3. the challenge game's own deadline, `executedAt + strategyDuration +
+   game.challengeWindow` or the one re-arm a silent failure grants
+   (`challengeableUntil`), whichever is later, is strictly past.
 
-A guilty or silence conviction in the challenge game forfeits the whole bond:
-prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
+A conviction in the challenge game forfeits the whole bond: prosecutor fee
+(default 20%, which is also the cap) to the challenger, remainder burned.
 
 ## Who can call what (summary)
 

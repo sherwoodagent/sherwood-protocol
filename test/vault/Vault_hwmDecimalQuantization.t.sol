@@ -45,6 +45,7 @@ contract VaultHwmDecimalQuantizationTest is Test {
         weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
 
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(
@@ -63,6 +64,8 @@ contract VaultHwmDecimalQuantizationTest is Test {
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(impl), initData))));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
 

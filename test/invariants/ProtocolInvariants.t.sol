@@ -207,7 +207,6 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 owner: factoryOwner,
                 executorImpl: address(0x1), // stateless lib; not invoked in this harness
                 vaultImpl: address(vaultImpl),
-                ensRegistrar: address(0), // optional — chains without ENS
                 agentRegistry: address(0), // optional — chains without ERC-8004
                 beacon: address(governor),
                 protocolConfig: address(governor),

@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAssetLedger} from "../mocks/MockAssetLedger.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 
 /// @notice Minimal vault stand-in exposing `governor()` — the one hop
@@ -24,8 +25,11 @@ contract MockVaultWithGovernor {
 
     address public governor;
 
-    constructor(address governor_) {
+    address public asset;
+
+    constructor(address governor_, address asset_) {
         governor = governor_;
+        asset = asset_;
     }
 }
 
@@ -38,8 +42,11 @@ contract MockVaultWithGovernor {
 contract MockGovernorWithRegistry {
     address public tierRegistry;
 
-    constructor(address registry_) {
+    address public exposureLedger;
+
+    constructor(address registry_, address ledger_) {
         tierRegistry = registry_;
+        exposureLedger = ledger_;
     }
 
     function getActiveProposal() external pure returns (uint256) {
@@ -192,7 +199,9 @@ contract StrictPairRegistry {
 contract PortfolioStrategy_oracleBindingTest is Test {
     PortfolioStrategy public template;
 
-    ERC20Mock public weth;
+    ERC20Mock public usd;
+
+    MockAssetLedger public ledger;
     ERC20Mock public tsla;
 
     address public proposer = makeAddr("proposer");
@@ -202,7 +211,9 @@ contract PortfolioStrategy_oracleBindingTest is Test {
     uint256 constant START = 10_000_000;
 
     function setUp() public {
-        weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        usd = new ERC20Mock("USD Stable", "USD", 18);
+        ledger = new MockAssetLedger();
+        ledger.setPrice(address(usd), 1e8);
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
         template = new PortfolioStrategy();
         vm.warp(START);
@@ -229,7 +240,7 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         feeds[0] = feed;
 
         return
-            abi.encode(address(weth), adapter, tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds);
+            abi.encode(address(usd), adapter, tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds);
     }
 
     /// @dev Deploys the registry/governor/vault trio, clones, initializes and
@@ -242,13 +253,13 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(adapter, true);
         registry.setAllowed(address(feed), true);
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         strategy = _clone();
-        weth.mint(address(vault), TOTAL_AMOUNT);
+        usd.mint(address(vault), TOTAL_AMOUNT);
         vm.prank(address(vault));
-        weth.approve(address(strategy), type(uint256).max);
+        usd.approve(address(strategy), type(uint256).max);
 
         strategy.initialize(address(vault), proposer, _initData(adapter, address(feed), SLIPPAGE_100));
 
@@ -261,10 +272,10 @@ contract PortfolioStrategy_oracleBindingTest is Test {
     ///      `_initAndExecutePushMode` is used.
     function _deployFundedAdapter() internal returns (MockSwapAdapter adapter) {
         adapter = new MockSwapAdapter();
-        adapter.setRate(address(weth), address(tsla), 1e18);
-        adapter.setRate(address(tsla), address(weth), 1e18);
+        adapter.setRate(address(usd), address(tsla), 1e18);
+        adapter.setRate(address(tsla), address(usd), 1e18);
         tsla.mint(address(adapter), 1_000_000e18);
-        weth.mint(address(adapter), 1_000_000e18);
+        usd.mint(address(adapter), 1_000_000e18);
     }
 
     // ── (a) Unbound price source rejected at init ──
@@ -280,8 +291,8 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         address adapter = makeAddr("adapter");
         registry.setAllowed(adapter, true);
         // Deliberately NOT allowlisting the feed.
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
 
         MockAggregator feed = new MockAggregator(18, int256(1e18), START);
         PortfolioStrategy strategy = _clone();
@@ -316,8 +327,8 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         // pairing is denied.
         registry.setPriceSourceForToken(address(tsla), bytes32(uint256(uint160(address(feed)))), false);
 
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
         PortfolioStrategy strategy = _clone();
 
         vm.expectRevert(
@@ -341,8 +352,8 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         registry.setAllowed(address(feed), true);
         // No `setPriceSourceForToken` call: tsla has no attested feed.
 
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
         PortfolioStrategy strategy = _clone();
         bytes memory data = _initData(adapter, address(feed), SLIPPAGE_100);
 
@@ -368,8 +379,8 @@ contract PortfolioStrategy_oracleBindingTest is Test {
     ///      survivable under per-clone owner review, not under a class
     ///      certification whose claim covers EVERY initialization.
     function test_init_revertsWhenRegistryUnresolvable() public {
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0), address(ledger));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor), address(usd));
         PortfolioStrategy strategy = _clone();
         MockAggregator feed = new MockAggregator(18, int256(1e18), START);
 
@@ -441,14 +452,14 @@ contract PortfolioStrategy_oracleBindingTest is Test {
     ///      the adapter. Post-fix, `_settle` captures the return and reverts
     ///      `SwapFailed` on zero, matching `_execute`'s buy-side check.
     function test_settle_zeroOutputSell_revertsSwapFailed() public {
-        DirectionalZeroSellAdapter adapter = new DirectionalZeroSellAdapter(address(weth), address(tsla));
-        // Fund the adapter so its buy leg (weth -> tsla) can transfer out the
+        DirectionalZeroSellAdapter adapter = new DirectionalZeroSellAdapter(address(usd), address(tsla));
+        // Fund the adapter so its buy leg (usd -> tsla) can transfer out the
         // tsla it owes `_execute()`.
         tsla.mint(address(adapter), 1_000_000e18);
         MockAggregator feed = new MockAggregator(18, int256(1e18), START);
         (PortfolioStrategy strategy, MockVaultWithGovernor vault) = _initAndExecutePushMode(address(adapter), feed);
 
-        // Execute's buy leg (weth -> tsla) filled 1:1 via the adapter's buy
+        // Execute's buy leg (usd -> tsla) filled 1:1 via the adapter's buy
         // branch, so the strategy now holds a non-zero tsla balance to sell.
         assertGt(tsla.balanceOf(address(strategy)), 0);
 

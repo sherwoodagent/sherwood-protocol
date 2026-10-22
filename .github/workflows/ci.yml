@@ -6,11 +6,13 @@ on:
   # surfaces as an EMPTY check list, which reads like "nothing wrong" rather
   # than "nothing verified". Stacked PRs are where CI matters most: the diff is
   # reviewed against a base that is itself unmerged and moving. The `push`
-  # filter below is what keeps post-merge runs scoped to `main`; this one only
+  # filter below scopes post-merge runs to the release lines; this one only
   # bought silence. (Found 2026-08-01: PRs #75/#78/#80 each ran zero checks.)
   pull_request:
   push:
-    branches: [main, audit-fixes-integration]
+    # `v1-deploy` and `post-audit-v2` carry the deploy line; post-merge runs there
+    # are the only signal once a PR's merge ref stops existing.
+    branches: [main, audit-fixes-integration, v1-deploy, post-audit-v2]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -143,10 +143,9 @@ contract ProposerBondEscrow is IProposerBondEscrow {
 
     /// @inheritdoc IProposerBondEscrow
     /// @dev THE BOND'S DOWNSIDE BRANCH, called from `ChallengeGame._settle` — the
-    ///      single point at which a proposal is convicted, by a guilty ruling or
-    ///      by the silence verdict. Takes `governor` explicitly rather than
-    ///      deriving it from `msg.sender`: the convictor is the challenge game,
-    ///      not the governor that locked the bond.
+    ///      single point at which a proposal is convicted. Takes `governor`
+    ///      explicitly rather than deriving it from `msg.sender`: the convictor is
+    ///      the challenge game, not the governor that locked the bond.
     /// @dev AUTHORIZATION — WHO. `msg.sender` must be the live `coverageFreezer`
     ///      of the wired ledger, which is the challenge game and nothing else. The
     ///      precedent is `StakedWood.slashVerdict`'s `authorizedSlasher`; the

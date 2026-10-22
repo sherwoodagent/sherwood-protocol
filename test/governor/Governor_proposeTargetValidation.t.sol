@@ -67,6 +67,7 @@ contract GovernorProposeTargetValidationTest is Test {
         usdc = new BlacklistingERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         uint256 agentNftId = agentRegistry.mint(agent);
 
@@ -122,6 +123,8 @@ contract GovernorProposeTargetValidationTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         // Lane A off (no PriceRouter) — exercises the async Lane B queue paths.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
@@ -156,6 +159,7 @@ contract GovernorProposeTargetValidationTest is Test {
     }
 
     function _voteAndAdvance(uint256 pid) internal {
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.prank(voter);
         governor.vote(pid, ISyndicateGovernor.VoteType.For);
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);

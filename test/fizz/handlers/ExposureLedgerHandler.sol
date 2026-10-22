@@ -3,6 +3,7 @@ pragma solidity >=0.6.2 <0.9.0;
 
 import "../Base.sol";
 import {Properties} from "../Properties.sol";
+import {IExposureLedger} from "../../../src/interfaces/IExposureLedger.sol";
 
 /// @notice Handles the interaction with ExposureLedger
 ///
@@ -20,10 +21,19 @@ import {Properties} from "../Properties.sol";
 ///
 ///      `recordApproval` takes the guardian's DECLARED lock and clamps it to
 ///      the free budget. The dispatcher draws the declaration from
-///      `[0, 2 x guardianStake + 1]` so zero (locks nothing, never listed),
-///      partial, exactly-full and over-budget (clamped) declarations are all
-///      reached.
+///      `[0, 2 x guardianStake + 1]` so zero, partial, exactly-full and
+///      over-budget (clamped) declarations are all reached. Since SHE-240 a
+///      booked lock worth under one approver slot's share of the need buys no
+///      slot and reverts `ApproveLockBelowFloor`; the wrapper below treats that
+///      as the specified answer and lets every other revert surface.
 abstract contract ExposureLedgerHandler is Properties {
+    /// @dev Vacuity guard for the approve path: a campaign in which every draw
+    ///      is refused stops exercising every coverage invariant that depends
+    ///      on a booked lock, and would still pass. Read by the suite so the
+    ///      ratio is measured rather than assumed.
+    uint256 public approveBooked;
+    uint256 public approveRefused;
+
     // ―――――――――――――――――― Challenge economics (GL-51) ―――――――――――――――――
     // The fourth input to `ChallengeGame.honestFilingNetPayoffBps`. It lives
     // here rather than on the game, which is exactly why no single setter can
@@ -98,8 +108,29 @@ abstract contract ExposureLedgerHandler is Properties {
     function _exposureLedger_recordApproval(address governor_, uint256 proposalId, address guardian, uint256 lockWood)
         internal
     {
+        // Read BEFORE: a call that lands on a live lock returns idempotently,
+        // and counting that as a booking would let an all-refusals campaign
+        // still report coverage.
+        uint256 lockBefore = ledger.lockOf(governor_, proposalId, guardian);
         vm.prank(address(registry));
-        ledger.recordApproval(governor_, proposalId, guardian, lockWood);
+        try ledger.recordApproval(governor_, proposalId, guardian, lockWood) {
+            if (lockBefore == 0 && ledger.lockOf(governor_, proposalId, guardian) != 0) approveBooked++;
+        } catch (bytes memory err) {
+            bytes4 sel = bytes4(err);
+            // Below-floor declarations are REFUSED, by design — the campaign
+            // draws plenty of them — and so is every state in which the ledger
+            // cannot size or book a lock: an approve either books coverage or
+            // reverts, so the registry never seats a slot with nothing behind
+            // it. Any OTHER revert is a finding and must not be swallowed here.
+            require(
+                sel == IExposureLedger.ApproveLockBelowFloor.selector || sel == IExposureLedger.NoWoodPrice.selector
+                    || sel == IExposureLedger.StalePrice.selector || sel == IExposureLedger.FeedNotConfigured.selector
+                    || sel == IExposureLedger.CoverageHorizonExceeded.selector
+                    || sel == IExposureLedger.CoverageInputsUnreadable.selector,
+                "recordApproval reverted for a reason other than a specified refusal"
+            );
+            approveRefused++;
+        }
     }
 
     function _exposureLedger_releaseApproval(address governor_, uint256 proposalId, address guardian) internal {

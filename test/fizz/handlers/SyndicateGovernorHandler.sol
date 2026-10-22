@@ -226,19 +226,18 @@ abstract contract SyndicateGovernorHandler is Properties {
         // harness ever executed carried booked coverage. `requiredCoverage`
         // stayed unbacked, `approversOf` came back empty, and
         // `ChallengeGame.file` reverted `NothingToFreeze` on every attempt —
-        // which is why ExposureLedger, ChallengeGame, TokenCourt and
-        // ProposerBondEscrow all flatlined around 30%.
+        // which is why ExposureLedger, ChallengeGame and ProposerBondEscrow
+        // all flatlined around 30%.
         skipTime(p.votingPeriod + 1);
         try registry.openReview(address(governor), pid) {} catch {}
 
-        // Approve with every guardian EXCEPT the reserved court voter. A single
-        // bond rarely covers `requiredCoverage` (`requireApproveQuorum` reverts
+        // Approve with every guardian EXCEPT the reserved voter. A single bond
+        // rarely covers `requiredCoverage` (`requireApproveQuorum` reverts
         // `InsufficientApproveCoverage` when the cohort raises nothing), but
-        // approving with ALL of them makes every guardian `isAccused` and
-        // therefore barred from the TokenCourt vote — which leaves a filed
-        // challenge stranded in `Disputed`, unable to reach a verdict. The
-        // cohort has to be split: approvers back the proposal, the reserve
-        // adjudicates it.
+        // approving with ALL of them makes every guardian one of the accused
+        // and therefore barred from deciding a challenge against the proposal —
+        // which leaves a filed challenge unable to reach a verdict. The cohort
+        // has to be split: approvers back the proposal, the reserve decides it.
         // Called directly rather than through GuardianRegistryHandler — the two
         // handlers are sibling branches off `Properties`, so neither sees the
         // other's functions.

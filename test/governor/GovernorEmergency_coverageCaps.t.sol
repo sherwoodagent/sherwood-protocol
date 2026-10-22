@@ -109,6 +109,7 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistryMock = new MockRegistryMinimal();
 
         // ── Ledger: $0.05 WOOD (via the feed), $1.00 USDG feed, generous cap.
@@ -168,6 +169,8 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         governor.setExposureLedger(address(ledger));
 
@@ -392,6 +395,7 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         targetToken = new ERC20Mock("Target", "TGT", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         agentNftId = agentRegistry.mint(agent);
 
         SyndicateVault vaultImpl = new SyndicateVault();
@@ -464,6 +468,8 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         );
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
         require(address(governor) == predictedGovernor, "governor addr mismatch");
 
         GuardianRegistry regImpl = new GuardianRegistry(6 hours);
@@ -556,14 +562,9 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), scaled, "sanity: stdstore write landed");
     }
 
-    /// @notice THE SIBLING FIX: with `effectiveMaxCapital` scaled down to
-    ///         10,000e6 (of a much larger declared `maxCapital`, since
-    ///         `GovEnvelope.permissive` prices it off the vault's full
-    ///         100,000e6 TVL), an owner-supplied rescue call that nets an
-    ///         outflow of 50,000e6 -- well within the OLD `p.maxCapital`
-    ///         widening, and well past the scaled ceiling -- must now
-    ///         revert `MaxNetOutflowExceeded`. Pre-fix this call would have
-    ///         executed under the full, unscaled `p.maxCapital`.
+    /// @notice An owner rescue that nets 50,000e6 out reverts `MaxNetOutflowExceeded(50_000e6, 0)`: since
+    ///         V1-02 the emergency batch has a zero net egress budget at every coverage level, so the
+    ///         scaled `effectiveMaxCapital` (10,000e6 here) no longer sets the bound.
     function test_finalizeEmergencySettle_scaledCeiling_blocksOversizedRescue() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
@@ -585,10 +586,10 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 50_000e6, 10_000e6));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 50_000e6, 0));
         governor.finalizeEmergencySettle(pid);
 
-        assertEq(usdc.balanceOf(sink), 0, "oversized rescue blocked by the scaled batch ceiling");
+        assertEq(usdc.balanceOf(sink), 0, "oversized rescue blocked by the zero egress budget");
         assertEq(
             uint256(governor.getProposal(pid).state),
             uint256(ISyndicateGovernor.ProposalState.Executed),

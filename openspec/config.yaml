@@ -7,11 +7,12 @@ context: |
 
   Core capabilities are specced under openspec/specs/: syndicate-vault,
   syndicate-governor, guardian-staking, guardian-coverage, challenge-game,
-  token-court, epoch-nav, tier-policy, deployment-docs, dimensional-conventions,
+  epoch-nav, tier-policy, deployment-docs, dimensional-conventions,
   operator-docs, supply-chain, test-fixtures, fee-splits,
   management-fee, performance-fee.
   (`instant-exit-fees` was retired whole with Lane A, issue #54 — V2
-  reintroduces it together with the lane it prices.)
+  reintroduces it together with the lane it prices. `token-court` is retired:
+  a challenge is adjudicated by the guardian vote inside `challenge-game`.)
   Historical design/implementation records (migrated from the former
   docs/superpowers workflow, and reconciled from independently-authored
   OpenSpec change proposals already merged to main) live in
