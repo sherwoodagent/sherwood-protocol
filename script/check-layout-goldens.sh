@@ -257,7 +257,7 @@ check_contract() {
 # LEGITIMATE ONLY BECAUSE THIS IS A FRESH DEPLOYMENT — the same condition as
 # GuardianRegistry and StakedWood below. chains/4663.json records no protocol
 # addresses, so mainnet has no governor lineage to stay compatible with.
-# test/governor/GovernorLayoutPins.t.sol pins the new baseline and states the
+# test/layout/GovernorLayoutPins.t.sol pins the new baseline and states the
 # rule this re-baseline must never be read as licensing: DO NOT cherry-pick the
 # fold onto a beacon that already has live proxies — every governor would read
 # garbage at every slot. Robinhood TESTNET (46630) is exactly such a chain: 9
@@ -291,7 +291,7 @@ check_contract StakedWood script/staked-wood-layout.golden.json
 # golden is the FIRST baseline, not a re-baseline. From the first real
 # deploy onward the layout is frozen and every change must be append-only
 # (carved from the front of __gap) against this golden. In-test twin:
-# test/VaultLayoutPins.t.sol.
+# test/layout/VaultLayoutPins.t.sol.
 check_contract SyndicateVault script/syndicate-vault-layout.golden.json
 
 [ "${UPDATE_GOLDEN:-0}" = "1" ] ||
