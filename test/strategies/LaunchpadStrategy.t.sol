@@ -477,6 +477,35 @@ contract LaunchpadStrategyTest is Test {
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
+    /// @notice deadline = 1 is the value 4663 proposal 6 shipped with; every launch reverted.
+    function test_init_revertsOnExpiredDeadline() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.deadline = 1;
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.DeadlineInPast.selector, 1, block.timestamp));
+        s.initialize(address(vault), proposer, abi.encode(p));
+    }
+
+    function test_init_revertsOnDeadlineEqualToNow() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.deadline = uint64(block.timestamp);
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.DeadlineInPast.selector, p.deadline, block.timestamp));
+        s.initialize(address(vault), proposer, abi.encode(p));
+    }
+
+    function test_init_acceptsDeadlineOneSecondAhead() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.deadline = uint64(block.timestamp + 1);
+        assertEq(_clone(p).deadline(), uint64(block.timestamp + 1));
+    }
+
+    function test_init_acceptsZeroDeadline() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.deadline = 0;
+        assertEq(_clone(p).deadline(), 0);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // updateParams — pre-execute only, tightening only
     // ─────────────────────────────────────────────────────────────────────────
@@ -530,6 +559,34 @@ contract LaunchpadStrategyTest is Test {
                 })
             )
         );
+    }
+
+    function test_updateParams_revertsOnDeadlineInPast() public {
+        LaunchpadStrategy s = _cloneDefault();
+        vm.warp(block.timestamp + 2 days);
+        uint64 stale = uint64(block.timestamp);
+        vm.prank(proposer);
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.DeadlineInPast.selector, stale, block.timestamp));
+        s.updateParams(
+            abi.encode(
+                LaunchpadStrategy.UpdateParams({
+                    minTokensOut: RESERVE, minQuoteOut: 900e18, settleSlippageBps: 500, deadline: stale
+                })
+            )
+        );
+    }
+
+    function test_updateParams_acceptsZeroDeadline() public {
+        LaunchpadStrategy s = _cloneDefault();
+        vm.prank(proposer);
+        s.updateParams(
+            abi.encode(
+                LaunchpadStrategy.UpdateParams({
+                    minTokensOut: RESERVE, minQuoteOut: 900e18, settleSlippageBps: 500, deadline: 0
+                })
+            )
+        );
+        assertEq(s.deadline(), 0);
     }
 
     function test_updateParams_revertsAfterExecute() public {

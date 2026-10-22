@@ -204,6 +204,9 @@ contract LaunchpadStrategy is BaseStrategy {
     /// @notice `assetIn` is zero — there is no budget to deploy.
     error InvalidAmount();
 
+    /// @notice A non-zero `deadline` is not in the future: the venue would refuse every launch.
+    error DeadlineInPast(uint64 deadline, uint256 nowTs);
+
     /// @notice `updateParams` was called outside `Pending`.
     /// @dev    A DELIBERATE REVERSAL OF `BaseStrategy.updateParams`, which
     ///         requires `Executed`. Everything tunable on this template is an
@@ -575,6 +578,7 @@ contract LaunchpadStrategy is BaseStrategy {
             revert InvalidSlippage(p.settleSlippageBps);
         }
         if (p.assetIn == 0) revert InvalidAmount();
+        _requireLiveDeadline(p.deadline);
 
         launchAdapter = ILaunchAdapter(p.launchAdapter);
         swapAdapter = ISwapAdapter(p.swapAdapter);
@@ -622,7 +626,7 @@ contract LaunchpadStrategy is BaseStrategy {
     ///          reverts, and the proposal's own `executeBy` already bounds when
     ///          execution may happen. Letting it move lets a proposer rescue a
     ///          proposal whose vote ran long, without touching a single number
-    ///          a voter priced.
+    ///          a voter priced. It may not move into the past.
     function _updateParams(bytes calldata data) internal override {
         UpdateParams memory u = abi.decode(data, (UpdateParams));
 
@@ -630,11 +634,17 @@ contract LaunchpadStrategy is BaseStrategy {
         if (u.minQuoteOut < minQuoteOut) revert NotTightening();
         if (u.settleSlippageBps > settleSlippageBps) revert NotTightening();
         if (u.settleSlippageBps == 0) revert InvalidSlippage(u.settleSlippageBps);
+        _requireLiveDeadline(u.deadline);
 
         minTokensOut = u.minTokensOut;
         minQuoteOut = u.minQuoteOut;
         settleSlippageBps = u.settleSlippageBps;
         deadline = u.deadline;
+    }
+
+    /// @dev Zero means "no deadline", matching the launch adapters.
+    function _requireLiveDeadline(uint64 d) private view {
+        if (d != 0 && d <= block.timestamp) revert DeadlineInPast(d, block.timestamp);
     }
 
     // ── Execute ──
