@@ -120,6 +120,22 @@ contract DeployWoodPoolFeedTest is Test {
         script.deploy(_params());
     }
 
+    // ── run()'s address resolution ──
+
+    /// @notice An env var fills a key the chain's address book lacks, and the
+    ///         other keys still come from the book.
+    function test_params_envOverridesAKeyMissingFromTheBook() public {
+        address sushi = address(0x5a5a);
+        vm.chainId(4663);
+        // Read by this script only, so no parallel suite races it.
+        vm.setEnv("WOOD_WETH_SUSHI_V2_PAIR", vm.toString(sushi));
+
+        DeployWoodPoolFeed.Params memory p = script.params();
+        assertEq(p.sushiPair, sushi, "env override");
+        assertEq(p.uniPair, 0xBF3BB81de6285b8310A028d1C2Cd38F9419d54C1, "uni pair from the 4663 book");
+        assertEq(p.weth, 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73, "weth from the 4663 book");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev The keeper's job: one full window later, with both pools trading, a
