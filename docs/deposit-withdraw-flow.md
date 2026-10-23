@@ -95,14 +95,15 @@ Both directions run through the per-vault `VaultWithdrawalQueue`:
 At `settleProposal`, after both fees are charged and the high-water mark ratchets,
 the governor calls `onProposalSettled` → `queue.stampSettlement(pid, num, den)`
 (`src/SyndicateVault.sol:1527`). `num/den` carry the vault's ERC-4626 virtual
-offsets, so the queue reproduces the vault's rounding exactly. Every request tagged
-to that proposal claims at this **single frozen post-fee price** — no ordering
-games, no price drift between claimants.
+offsets, so the queue reproduces the vault's rounding exactly. Every redeem request
+tagged to that proposal claims at this **single frozen post-fee price** — no ordering
+games, no price drift between claimants. Deposit requests do not use the stamp.
 
 ### Claim (permissionless per request)
 
-- **Deposit claim:** queue pushes the escrowed assets into the vault, then the vault
-  mints shares to the receiver at the frozen price (`settleDeposit`,
+- **Deposit claim:** once no proposal is open, the queue prices the assets at the
+  vault's live `previewDeposit`, pushes them into the vault, then the vault mints
+  those shares to the receiver (`settleDeposit`,
   `src/SyndicateVault.sol:1517`). Auto-delegates voting power.
 - **Redeem claim:** vault burns the escrowed shares and pays assets to the owner at
   the frozen price (`settleRedeem`, `src/SyndicateVault.sol:1504`). The payout float
@@ -112,8 +113,10 @@ games, no price drift between claimants.
 ### Cancel (before settlement)
 
 `cancel` on the queue returns the escrowed shares (redeem) or assets (deposit) to
-the owner (`src/queue/VaultWithdrawalQueue.sol:258`). A queued deposit's cancel
-shuts once its proposal settles — the claim then exists at the frozen price.
+the owner (`src/queue/VaultWithdrawalQueue.sol:258`). A queued redeem's cancel
+shuts once its proposal settles — the claim then exists at the frozen price. A
+queued deposit stays cancellable until it is claimed: its claim mints at the live
+price, so the cancel is worth nothing, and an open proposal can hold the claim shut.
 
 ## Why this design
 
