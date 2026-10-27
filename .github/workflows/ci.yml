@@ -107,7 +107,9 @@ jobs:
       # Minimal IR optimization avoids stack-too-deep failures and instruments
       # all production files, including governor, vault, and strategies. IR source
       # maps are approximate, so this job remains advisory. The fork exclusion
-      # matches the Test step above; those suites need live RPC endpoints.
+      # matches the Test step above; those suites need live RPC endpoints. The
+      # deploy-ceremony suites pin the CREATE3 factory's initcode hash, which
+      # --ir-minimum changes; they run in the Test step instead.
       # Measured with forge 1.7.1 (CI run 35045261450): 2719 passed, 1 skipped;
       # 70.83% lines overall (7518/10614), 94.11% in src/ (4329/4600).
       - name: forge coverage
@@ -118,7 +120,7 @@ jobs:
             --ir-minimum \
             --report lcov \
             --report summary \
-            --no-match-path "test/fork/**"
+            --no-match-path "{test/fork/**,test/factory/deploy/**,test/factory/Deploy_*.t.sol}"
 
       # TODO(#63): sink is artifact-only for now — wiring Codecov needs a
       # CODECOV_TOKEN repository secret, a decision deferred out of this change.
