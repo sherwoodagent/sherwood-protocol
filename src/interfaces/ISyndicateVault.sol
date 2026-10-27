@@ -7,8 +7,6 @@ interface ISyndicateVault {
     // ── Errors ──
     error InvalidOwner();
     error InvalidExecutorImpl();
-    error NotActiveAgent();
-    error SimulationFailed();
     error InvalidDepositor();
     error DepositorAlreadyApproved();
     error DepositorNotApproved();
@@ -19,15 +17,14 @@ interface ISyndicateVault {
     ///         `MAX_AGENTS_PER_VAULT` — bound for the `rotateOwnership`
     ///         deactivation loop.
     error AgentCapExceeded();
-    error InvalidAgentRegistry();
     error NotAgentOwner();
     error NotGovernor();
     error RedemptionsLocked();
     error DepositsLocked();
-    error InvalidAgentAddress();
-    error TransferFailed();
     error ZeroAddress();
     error CannotRescueAsset();
+    /// @notice `rescueERC20` recipient is not a strategy clone of this vault.
+    error RescueRecipientNotStrategy(address to);
     error NotFactory();
     error GovernorNotSet();
     error ExecutorCodehashMismatch();
@@ -39,13 +36,11 @@ interface ISyndicateVault {
     error WithdrawalQueueAlreadySet();
     error InsufficientShares();
     error RedemptionsNotLocked();
-    /// @notice `requestDeposit` was called while no proposal is executing
-    ///         (`depositsLocked()` false): the instant `deposit`/`mint` path is
-    ///         the open one; use it instead.
-    error DepositsNotLocked();
-    /// @notice `delegate`/`delegateBySig` to anyone but the holder: voting power stays
-    ///         with the shares so the veto denominator and the castable weight match.
-    error DelegationLocked();
+    /// @notice `requestDeposit` was called with no non-terminal proposal open
+    ///         on the vault (`openProposalCount() == 0`) — the async path is
+    ///         only for entering while the instant `deposit`/`mint` path is
+    ///         closed by an open proposal; use those instead.
+    error NoOpenProposal();
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
@@ -68,9 +63,14 @@ interface ISyndicateVault {
     error NotARegisteredStrategy(address target);
     /// @notice A governor batch called `asset().transferFrom` with a `from` other than the vault.
     error TransferFromNotVault(address from);
-    /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
-    ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
+    /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata.
     error MalformedAssetCall(bytes4 selector);
+    /// @notice A governor batch called `asset()` with a selector other than `transfer`,
+    ///         `transferFrom` or the approve family.
+    error UnrecognizedAssetSelector(bytes4 selector);
+    /// @notice `delegate`/`delegateBySig` named anyone but the holder. The vault self-delegates
+    ///         every receiver, so votes always equal balance; `delegate(self)` is a no-op.
+    error DelegationDisabled();
 
     // ── Init Params ──
     struct InitParams {
@@ -135,11 +135,9 @@ interface ISyndicateVault {
     ///         implementation note for why an unbacked escrow is unrecoverable.
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
-    /// @notice Instant withdraw/redeem closed: a proposal is open (Draft included)
-    ///         and not yet settled. `requestRedeem` is the exit meanwhile.
     function redemptionsLocked() external view returns (bool);
-    /// @notice Instant deposit/mint closed: capital is deployed (execute to
-    ///         settle). `requestDeposit` is the entry meanwhile.
+    /// @notice Same predicate as `redemptionsLocked`; kept under both names for
+    ///         the queue and off-chain readers.
     function depositsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults

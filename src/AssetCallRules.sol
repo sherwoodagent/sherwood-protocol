@@ -7,9 +7,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// @notice The one asset-leg rule: enforced by the vault at execute and settle, mirrored by the
 ///         governor at propose, so a stored leg can never pass one and revert at the other.
 library AssetCallRules {
-    /// @dev A call on the asset is a metered transfer (`transferFrom` from `vault` only) or
-    ///      allowance-shaped: its first argument is the spender to reset after the batch.
-    ///      Returns that spender, or zero when the call names none.
+    /// @dev A call on the asset is a metered transfer (`transferFrom` from `vault` only) or one of
+    ///      the approve family, whose first argument is the spender to reset after the batch.
+    ///      Every other selector reverts: a token's own extensions can spend allowances to the vault.
     function spenderOf(address vault, bytes calldata data) internal pure returns (address) {
         if (data.length < 36) {
             revert ISyndicateVault.MalformedAssetCall(data.length >= 4 ? bytes4(data[0:4]) : bytes4(0));
@@ -23,6 +23,12 @@ library AssetCallRules {
             return address(0);
         }
         if (sel == IERC20.transfer.selector) return address(0);
+        if (
+            sel != IERC20.approve.selector && sel != bytes4(keccak256("increaseAllowance(address,uint256)"))
+                && sel != bytes4(keccak256("increaseApproval(address,uint256)"))
+                && sel != bytes4(keccak256("decreaseAllowance(address,uint256)"))
+                && sel != bytes4(keccak256("decreaseApproval(address,uint256)"))
+        ) revert ISyndicateVault.UnrecognizedAssetSelector(sel);
         return address(uint160(uint256(arg0)));
     }
 }

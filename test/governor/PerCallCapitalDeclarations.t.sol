@@ -47,6 +47,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         mockAdapter = new ERC20Mock("Adapter", "ADP", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
         tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
@@ -92,6 +93,8 @@ contract PerCallCapitalDeclarationsTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(agent), agent);
@@ -192,7 +195,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         discarded the settlement leg's tier, so the proposal recorded
     ///         tier 0 while coverage — always summed over both legs — priced the
     ///         extraction. Now tier is the MAX across both legs.
-    function test_she210_settlementLegLiftsProposalTier() public {
+    function test_settlementLegLiftsProposalTier() public {
         _wireTierRegistry();
         // Execute leg: certified tier-0.
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100);
@@ -235,7 +238,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         tier 0. Pins that the lift above is driven by the settlement
     ///         leg's TIER, not by the mere presence of a settlement call — so
     ///         the reject test is not vacuously always-2.
-    function test_she210_certifiedSettlementLegKeepsLowTier() public {
+    function test_certifiedSettlementLegKeepsLowTier() public {
         _wireTierRegistry();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100);
         // `usdc.approve` is certified tier-0 inside `_wireTierRegistry`.

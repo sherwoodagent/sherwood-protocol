@@ -29,7 +29,6 @@ interface IVaultWithdrawalQueue {
     error ZeroShares();
     error ZeroAssets();
     error InsufficientShares();
-    error WrongKind();
 
     // ── Types ──
     enum RequestKind {

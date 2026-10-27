@@ -105,9 +105,8 @@ interface IGuardianRegistry {
 
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
-    ///         is read from sWOOD's `getPastStake` at the review's `snapshotAt`,
-    ///         which is frozen when the governor registers the review at propose
-    ///         time.
+    ///         is the caller's raw sWOOD `getPastStake` at `snapshotAt` (one
+    ///         second before the proposal entered Pending), with no age discount.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
     ///         at `resolveReview`. A vote cast once the review window is due but
@@ -115,7 +114,13 @@ interface IGuardianRegistry {
     ///         so no keeper `openReview` call is needed first.
     /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
     ///         locks behind the proposal; the ledger locks
-    ///         `min(lockWood, free budget)` and never rejects the vote for it.
+    ///         `min(lockWood, free budget)`, and rejects the vote when what it
+    ///         books is worth less than the smaller of one slot's share of the
+    ///         proposal's coverage need and the guardian's whole-budget
+    ///         valuation, or when that valuation is zero — approver slots are
+    ///         bounded, so one has to be paid for. It rejects the vote for the
+    ///         same reason when the need cannot be read or priced, or when
+    ///         settlement lies beyond the ledger's coverage horizon.
     ///         That lock is what a conviction burns (under sWOOD's
     ///         `[minSlashBps, maxSlashBps]` envelope) and what counts toward the
     ///         execute-time coverage quorum at live value. Ignored on Block.

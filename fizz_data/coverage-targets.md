@@ -20,7 +20,6 @@ Build command for all Medusa runs: `FOUNDRY_PROFILE=fuzz forge build`
 | StakedWood | Core protocol logic | 70% |
 | ExposureLedger | Core protocol logic | 70% |
 | ChallengeGame | Core protocol logic | 70% |
-| TokenCourt | Core protocol logic | 70% |
 | VaultWithdrawalQueue | Core protocol logic | 70% |
 | GuardianRegistry | Access control / role management | 50% |
 | TierRegistry | Access control / role management | 50% |
@@ -49,14 +48,16 @@ Documented here so their absence from the report is not read as a coverage gap:
 
 ### Cycle 1 — 2026-08-04
 
-Medusa ran a full campaign: 105 tests passed, 0 failed.
+Medusa ran a full campaign: 105 tests passed, 0 failed. The per-contract figures in
+this and every later cycle section are the measurement taken on that date against
+that commit's contract set, kept as recorded.
 
 | Contract | Role | Target | Hit | Status |
 |---|---|---:|---:|:--:|
 | StakedWood | Core | 70% | 63.3% (188/297) | ❌ |
 | TierRegistry | Access control | 50% | 61.3% (76/124) | ✅ |
 | SyndicateVault | Core | 70% | 37.1% (142/383) | ❌ |
-| TokenCourt | Core | 70% | 29.5% (43/146) | ❌ |
+| TokenCourt (deleted in SHE-269) | Core | 70% | 29.5% (43/146) | ❌ |
 | ChallengeGame | Core | 70% | 20.3% (77/380) | ❌ |
 | GuardianRegistry | Access control | 50% | 19.8% (80/404) | ❌ |
 | ExposureLedger | Core | 70% | 19.3% (88/457) | ❌ |
@@ -121,19 +122,19 @@ genuinely in the same build.
 | ProposerBondEscrow | Peripheral | 40% | 8.5% | 34% | ❌ |
 | ExposureLedger | Core | 70% | 19.3% | 33% | ❌ |
 | ChallengeGame | Core | 70% | 20.3% | 26% | ❌ |
-| TokenCourt | Core | 70% | 29.5% | 29% | ❌ |
+| TokenCourt (deleted in SHE-269) | Core | 70% | 29.5% | 29% | ❌ |
 
 **5/13 at target.** The LP and governance lanes are well covered; the
-adjudication chain (challenge → court → slash) is not.
+accountability chain (challenge → vote → slash) is not.
 
-Why adjudication lags: reaching a *conviction* needs
-execute → file → dispute-to-pool-completion → refer → vote → finalize → rule,
+Why it lags: reaching a *conviction* needs
+execute → file → a convict quorum of guardian votes → resolve,
 with real time between each and a bonded challenger at every step. The
 composites only carry a proposal to Executed and Settled; there is no
 equivalent composite for the challenge lifecycle. That is the single highest-value
 next improvement — a `challengeGame_lifecycle_toConviction` composite would
-likely move ChallengeGame, TokenCourt, ExposureLedger and ProposerBondEscrow
-together, since all four are gated behind the same chain.
+likely move ChallengeGame, ExposureLedger and ProposerBondEscrow
+together, since all three are gated behind the same chain.
 
 Property results: **130 passed, 0 failed** after correcting GL-09 and GL-16
 (see below). No protocol violation was found in this campaign.

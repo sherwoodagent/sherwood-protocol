@@ -63,7 +63,7 @@ library SyndicateVaultAdminLib {
 
     /// @dev Body of `SyndicateVault.registerAgent`. `vaultOwner` is `owner()`
     ///      read on the vault side and passed in so the NFT-owner check is
-    ///      unchanged; `agentRegistry` is the vault's `_agentRegistry`.
+    ///      unchanged; `agentRegistry` is the factory's live `agentRegistry()`.
     function registerAgent(
         mapping(address => ISyndicateVault.AgentConfig) storage agents,
         EnumerableSet.AddressSet storage agentSet,

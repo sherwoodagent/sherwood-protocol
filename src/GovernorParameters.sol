@@ -27,14 +27,14 @@ abstract contract GovernorParameters is ProposalLifecycle {
     // ── Safety bounds (hardcoded) ──
 
     // Per-deployment timing floors are constructor-set immutables (see constructor).
-    // Mainnet impls deploy with `votingPeriod` >= 24h and `cooldownPeriod` >= 1h;
-    // a testnet impl can deploy with lower floors to compress fund lifecycles.
+    // The Robinhood mainnet impl deploys both floors at 1h (`RobinhoodParams`); the 24h
+    // voting period is the factory's per-vault default, which the vault owner may lower to 1h.
     // Immutables live in bytecode (not storage), so reads resolve correctly
     // through the beacon proxy. The absolute floor-of-floors below caps how low
     // a deploy may set them, so a misconfigured impl fails loudly.
     uint256 internal constant ABSOLUTE_MIN_TIMING_FLOOR = 1 minutes;
 
-    /// @notice Hard floor for `votingPeriod` (per-deployment; mainnet 24h).
+    /// @notice Hard floor for `votingPeriod` (per-deployment; Robinhood mainnet 1h).
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     uint256 public immutable MIN_VOTING_PERIOD;
     uint256 public constant MAX_VOTING_PERIOD = 3 days;
@@ -123,8 +123,8 @@ abstract contract GovernorParameters is ProposalLifecycle {
 
     // ── Constructor (impl-time; sets per-deployment timing floors) ──
 
-    /// @param minVotingPeriod_   Hard floor for `votingPeriod` (mainnet 24h; a
-    ///                           testnet impl may deploy lower to compress cycles).
+    /// @param minVotingPeriod_   Hard floor for `votingPeriod` (Robinhood mainnet 1h;
+    ///                           the absolute floor is `ABSOLUTE_MIN_TIMING_FLOOR`).
     /// @param minCooldownPeriod_ Hard floor for `cooldownPeriod` (mainnet 1h).
     /// @dev Runs at implementation-deploy time; the values bake into bytecode and
     ///      are read through every per-vault BeaconProxy. Bounded so a fat-fingered
@@ -224,7 +224,7 @@ abstract contract GovernorParameters is ProposalLifecycle {
         emit ParameterChangeFinalized(PARAM_MAX_PERF_FEE, old, newValue);
     }
 
-    function _protocolMaxStrategyDuration() private view returns (uint256) {
+    function _protocolMaxStrategyDuration() internal view returns (uint256) {
         address cfg = protocolConfig;
         if (cfg == address(0)) return type(uint256).max;
         uint256 ceiling = IProtocolConfig(cfg).maxStrategyDuration();

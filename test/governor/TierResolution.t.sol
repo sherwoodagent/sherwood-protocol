@@ -47,6 +47,7 @@ contract TierResolutionTest is Test {
         mockAdapter = new ERC20Mock("Adapter", "ADP", 18);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        vm.mockCall(address(this), abi.encodeWithSignature("agentRegistry()"), abi.encode(address(agentRegistry)));
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
         tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
@@ -92,6 +93,8 @@ contract TierResolutionTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("depositsRestricted()"), abi.encode(false));
+        vm.mockCall(address(this), abi.encodeWithSignature("ownerOnlyProposals()"), abi.encode(false));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(agent), agent);
@@ -331,7 +334,7 @@ contract TierResolutionTest is Test {
     ///         only if the live comparison prices the settle leg too — a
     ///         refactor that split the propose and execute tier resolutions
     ///         apart would regress it silently without this pin.
-    function test_she210_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
+    function test_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
         _wireTierRegistry();
         _certifyBenignSettleLeg();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);

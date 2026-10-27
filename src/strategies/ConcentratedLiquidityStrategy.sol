@@ -21,28 +21,26 @@ interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool);
 }
 
 /**
  * @title ConcentratedLiquidityStrategy
  * @notice Deploys vault capital as a market-making position: concentrated
- *         liquidity over a bounded tick range in one Uniswap V3 pool. Two
- *         funding modes, fixed at init and never blended — LEVERED borrows the
- *         vault asset against stable collateral, UNLEVERED (`morpho == 0`)
- *         deploys `lpAmount` directly and touches no lending market at all.
+ *         liquidity over a bounded tick range in one Uniswap V3 pool, with the
+ *         position funded by borrowing the vault asset against stable
+ *         collateral rather than by selling into the volatile leg.
  *
- *   Execute: levered — pull the vault asset → post it (or its ERC-4626 wrapper)
- *            as Morpho collateral → borrow the vault asset; unlevered — pull
- *            `lpAmount`. Then, identically in both: rebalance to the agent's
- *            declared fraction of the pool's other token → mint ONE position
- *            over the fixed tick range.
+ *   Execute: pull the vault asset → post it (or its ERC-4626 wrapper) as
+ *            Morpho collateral → borrow the vault asset → rebalance to the
+ *            agent's declared fraction of the pool's other token → mint ONE
+ *            position over the fixed tick range.
  *   Rerange: permissionless and fully determined — burn, collect, re-mint the
  *            approved half-width centered on the current TWAP tick. Never
  *            touches the borrow or the collateral.
  *   Settle:  decrease to zero → collect → convert the other token back →
- *            repay → withdraw collateral (levered only) → push everything to
- *            the vault. All-or-revert: every step is typed, a failed
- *            settlement is retried.
+ *            repay → withdraw collateral → push everything to the vault.
+ *            All-or-revert: every step is typed, a failed settlement is retried.
  *
  *   Batch calls from governor:
  *     Execute: [asset.approve(strategy, assetAmount), strategy.execute()]
@@ -123,6 +121,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice Hard ceiling on any configured slippage floor.
     uint256 public constant MAX_SLIPPAGE_BPS = 1_000;
 
+    /// @notice Floor on the settle slippage, which is fixed at init.
+    uint256 public constant MIN_SETTLE_SLIPPAGE_BPS = 50;
+
     /// @notice Morpho oracle scale: `price()` is loan units per collateral unit x 1e36.
     uint256 public constant ORACLE_PRICE_SCALE = 1e36;
 
@@ -154,18 +155,14 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @dev    A half-width wider than the tick domain itself cannot describe a
     ///         band any voter meant to approve, and letting one through would
     ///         make `_derivedRange` silently clamp to full-range — a materially
-    ///         different position from the one reviewed. Rejected at init so the
-    ///         clamp in `_derivedRange` only ever handles the edge case of a
-    ///         legitimate band running off the domain near an extreme tick.
+    ///         different position from the one reviewed. Below it the clamp still
+    ///         binds whenever `halfWidthTicks + |TWAP tick| > MAX_TICK` — on 4663 pools
+    ///         (~±200k from zero) that is any half-width above ~690k.
     int24 public constant MAX_HALF_WIDTH_TICKS = MAX_TICK;
 
     // ── Errors ──
 
     error InvalidAmount();
-    /// @notice The config blends the levered and unlevered modes — `lpAmount`
-    ///         set alongside a borrow, or a Morpho surface named in a config
-    ///         that will never touch it.
-    error MixedModeConfig();
     /// @notice The configured pool does not quote the vault asset. Adversary: a
     ///         proposer naming a pool whose position could not be unwound into
     ///         the asset the vault redeems in.
@@ -182,7 +179,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         Also raised when `pool` itself holds no code: the key the factory
     ///         is asked about is read off the pool with typed calls, and an
     ///         address that cannot be asked what pair it trades was never a pool
-    ///         the factory created.
+    ///         the factory created. Also raised when `positionManager.factory()`
+    ///         is not `uniswapFactory`: the mint would land in another venue's pool.
     /// @dev    Deliberately does NOT read `pool.factory()`. That answer comes
     ///         from the party being checked; see check (1) in `_initialize` for
     ///         why asking the factory is the only direction that establishes
@@ -190,12 +188,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     error PoolNotFromFactory();
     /// @notice A proposer-supplied counterparty is not allowlisted in the
     ///         `TierRegistry` the vault's own governor gates batch approvals
-    ///         against. Covers `swapAdapter`, `positionManager`, `morpho`,
-    ///         `marketParams.collateralToken`, `uniswapFactory` and the pool's
+    ///         against. Covers `swapAdapter`, `positionManager`, `morpho`, `uniswapFactory` and the pool's
     ///         volatile leg (`otherToken`) — every address this contract
     ///         approves or calls with vault funds, plus the factory whose word
     ///         the pool's provenance rests on.
     error CounterpartyNotAllowed(address counterparty, address registry);
+    /// @notice The Morpho market id (all five `MarketParams` fields) is not allowlisted in the registry.
+    error MorphoMarketNotAllowed(Id marketId, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no
     ///         registry, so no counterparty can be vouched for. Fails closed at
     ///         binding time rather than deploying capital through unvetted
@@ -328,10 +327,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         uint256 collateralAmount;
         /// @notice Vault asset borrowed against that collateral.
         uint256 borrowAmount;
-        /// @notice UNLEVERED MODE ONLY: vault asset pulled at execute and
-        ///         deployed straight into the position. Exactly one of
-        ///         {collateralAmount+borrowAmount, lpAmount} is set.
-        uint256 lpAmount;
         int24 tickLower;
         int24 tickUpper;
         /// @notice The agent's expected minted liquidity, bounded here against
@@ -373,8 +368,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     uint256 public collateralAmount;
     uint256 public borrowAmount;
-    /// @notice Unlevered-mode funding; zero in levered mode.
-    uint256 public lpAmount;
     uint256 public swapFractionBps;
     uint128 public expectedLiquidity;
 
@@ -418,13 +411,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return _rerange;
     }
 
-    /// @notice True when this clone runs the borrow-funded configuration.
-    /// @dev    Derived from `morpho`, never a second stored bit that could
-    ///         drift; init enforces that `morpho == 0` characterizes unlevered.
-    function levered() public view returns (bool) {
-        return address(morpho) != address(0);
-    }
-
     // ── Initialization ──
 
     /// @dev Validation runs in the spec's adversary order. Every check below
@@ -434,32 +420,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         InitParams memory p = abi.decode(data, (InitParams));
 
         if (p.pool == address(0) || p.positionManager == address(0)) revert ZeroAddress();
-        if (p.swapAdapter == address(0)) revert ZeroAddress();
+        if (p.morpho == address(0) || p.swapAdapter == address(0)) revert ZeroAddress();
         if (p.uniswapFactory == address(0)) revert ZeroAddress();
+        if (p.collateralAmount == 0 || p.borrowAmount == 0) revert InvalidAmount();
         if (p.expectedLiquidity == 0) revert InvalidAmount();
-
-        // Two modes, decided here, never blended: levered is the original
-        // borrow-funded configuration, unlevered funds the mint from `lpAmount`
-        // and names no Morpho surface at all. `morpho` ALONE decides, so the
-        // clone's lifelong discriminator (`levered()`) is the same rule init
-        // applied; each arm then requires the other mode's fields to be empty,
-        // so a field that would be silently ignored is a revert instead.
-        bool levered_ = p.morpho != address(0);
-        if (levered_) {
-            if (p.collateralAmount == 0 || p.borrowAmount == 0) revert InvalidAmount();
-            if (p.lpAmount != 0) revert MixedModeConfig();
-        } else {
-            if (p.lpAmount == 0) revert InvalidAmount();
-            if (p.collateralAmount != 0 || p.borrowAmount != 0) revert MixedModeConfig();
-            // The market declaration must be empty, not merely unused: a
-            // proposal naming a market it never touches invites review of the
-            // wrong risk surface.
-            if (
-                p.marketParams.loanToken != address(0) || p.marketParams.collateralToken != address(0)
-                    || p.marketParams.oracle != address(0) || p.marketParams.irm != address(0)
-                    || p.marketParams.lltv != 0
-            ) revert MixedModeConfig();
-        }
 
         address vaultAsset = IERC4626(vault()).asset();
 
@@ -472,20 +436,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // for why that is not what separates them.
             _requireAllowedCounterparty(registry, p.swapAdapter);
             _requireAllowedCounterparty(registry, p.positionManager);
+            _requireAllowedCounterparty(registry, p.morpho);
             // The factory is the authority check (1) delegates the pool's
             // provenance to, so it has to be an authority the PROTOCOL chose. A
             // proposer-authored factory vouching for a proposer-authored pool is
             // the same self-attestation one hop further out.
             _requireAllowedCounterparty(registry, p.uniswapFactory);
-            // The Morpho surface binds only when it exists: in unlevered mode
-            // both addresses are zero, and binding a zero address would fail
-            // closed against a correctly configured registry.
-            if (levered_) {
-                _requireAllowedCounterparty(registry, p.morpho);
-                if (p.marketParams.collateralToken != vaultAsset) {
-                    _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
-                }
-            }
         }
 
         if (p.pool.code.length == 0) revert PoolNotFromFactory();
@@ -496,6 +452,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         {
             bytes memory call_ = abi.encodeCall(IUniswapV3Factory.getPool, (t0, t1, pool_.fee()));
             if (_readAddress(p.uniswapFactory, call_) != p.pool) revert PoolNotFromFactory();
+            // The position manager mints into its own factory's pool: it must be the one measured.
+            call_ = abi.encodeCall(INonfungiblePositionManager.factory, ());
+            if (_readAddress(p.positionManager, call_) != p.uniswapFactory) revert PoolNotFromFactory();
         }
         if (t0 == vaultAsset) {
             assetIsToken0 = true;
@@ -509,45 +468,39 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         _requireAllowedCounterparty(registry, otherToken);
 
-        // (2)(3)(4) are the Morpho checks. They gate on the MODE, not on zero
-        // inputs: a check that passes because its inputs are vacuous reads as
-        // verified when nothing was.
-        Id id = Id.wrap(bytes32(0));
-        if (levered_) {
-            // (2) The market exists and lends the vault asset.
-            if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
-            id = p.marketParams.id();
-            if (IMorpho(p.morpho).market(id).lastUpdate == 0) revert MarketNotCreated();
+        // (2) The market exists and lends the vault asset.
+        if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
+        Id id = p.marketParams.id();
+        _requireAllowedMarket(registry, id);
+        if (IMorpho(p.morpho).market(id).lastUpdate == 0) revert MarketNotCreated();
 
-            //     Collateral is the vault asset or an ERC-4626 wrapper OF the vault
-            //     asset — never the volatile leg. `otherToken` is excluded
-            //     explicitly rather than relying on the wrapper probe to reject it,
-            //     because a volatile token could itself be an ERC-4626 over the
-            //     vault asset and would otherwise slip through.
-            if (p.marketParams.collateralToken == otherToken) revert CollateralAssetMismatch();
-            if (p.marketParams.collateralToken != vaultAsset) {
-                if (!_isWrapperOf(p.marketParams.collateralToken, vaultAsset)) revert CollateralAssetMismatch();
-            }
+        //     Collateral is the vault asset or an ERC-4626 wrapper OF the vault
+        //     asset — never the volatile leg. `otherToken` is excluded
+        //     explicitly rather than relying on the wrapper probe to reject it,
+        //     because a volatile token could itself be an ERC-4626 over the
+        //     vault asset and would otherwise slip through.
+        if (p.marketParams.collateralToken == otherToken) revert CollateralAssetMismatch();
+        if (p.marketParams.collateralToken != vaultAsset) {
+            if (!_isWrapperOf(p.marketParams.collateralToken, vaultAsset)) revert CollateralAssetMismatch();
+        }
 
-            // (3) The borrow fits the market's currently lendable liquidity.
-            {
-                Market memory m = IMorpho(p.morpho).market(id);
-                uint256 lendable = m.totalSupplyAssets > m.totalBorrowAssets
-                    ? uint256(m.totalSupplyAssets) - uint256(m.totalBorrowAssets)
-                    : 0;
-                if (p.borrowAmount > lendable) revert BorrowExceedsLiquidity();
-            }
+        // (3) The borrow fits the market's currently lendable liquidity.
+        {
+            Market memory m = IMorpho(p.morpho).market(id);
+            uint256 lendable = m.totalSupplyAssets > m.totalBorrowAssets
+                ? uint256(m.totalSupplyAssets) - uint256(m.totalBorrowAssets)
+                : 0;
+            if (p.borrowAmount > lendable) revert BorrowExceedsLiquidity();
+        }
 
-            // (4) The resulting LTV clears the market's own LLTV by the buffer.
-            //     `lltv` is WAD upstream; convert to bps before comparing.
-            {
-                uint256 collateralValue =
-                    _collateralValueOf(p.marketParams.collateralToken, vaultAsset, p.collateralAmount);
-                uint256 ltvBps = (p.borrowAmount * BPS_DENOMINATOR) / collateralValue;
-                uint256 lltvBps = (p.marketParams.lltv * BPS_DENOMINATOR) / 1e18;
-                if (lltvBps < MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
-                if (ltvBps > lltvBps - MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
-            }
+        // (4) The resulting LTV clears the market's own LLTV by the buffer.
+        //     `lltv` is WAD upstream; convert to bps before comparing.
+        {
+            uint256 collateralValue = _collateralValueOf(p.marketParams.collateralToken, vaultAsset, p.collateralAmount);
+            uint256 ltvBps = (p.borrowAmount * BPS_DENOMINATOR) / collateralValue;
+            uint256 lltvBps = (p.marketParams.lltv * BPS_DENOMINATOR) / 1e18;
+            if (lltvBps < MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
+            if (ltvBps > lltvBps - MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
         }
 
         // (5) The position does not exceed the pool-share cap. This bounds the
@@ -573,7 +526,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         collateralAmount = p.collateralAmount;
         borrowAmount = p.borrowAmount;
-        lpAmount = p.lpAmount;
         swapFractionBps = p.swapFractionBps;
         expectedLiquidity = p.expectedLiquidity;
 
@@ -655,9 +607,16 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
     }
 
+    /// @dev The market id binds loan, collateral, oracle, irm and lltv; parts are not allowlisted alone.
+    function _requireAllowedMarket(address registry, Id id) private view {
+        if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isMorphoMarketAllowed, (Id.unwrap(id))))) {
+            revert MorphoMarketNotAllowed(id, registry);
+        }
+    }
+
     /// @dev The `vault() -> governor() -> tierRegistry()` walk. `address(0)`
     ///      when unresolved (no `governor()` surface, a governor predating the
-    ///      getter, or `tierRegistry() == 0`); `_initialize` treats that as
+    ///      getter, or `tierRegistry() == 0`); every caller treats that as
     ///      fatal rather than as a skip.
     function _resolveTierRegistry() private view returns (address registry) {
         address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
@@ -667,20 +626,16 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     function _requireCounterpartiesStillAllowed() private view {
         address registry = _resolveTierRegistry();
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
         _requireAllowedCounterparty(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
-        // No Morpho surface exists to re-check when unlevered, and asking the
-        // registry about address(0) fails closed — here that would freeze
-        // execute and rerange over a demotion that never happened.
-        if (levered()) _requireAllowedCounterparty(registry, address(morpho));
+        _requireAllowedCounterparty(registry, address(morpho));
+        _requireAllowedMarket(registry, marketId);
         // The volatile leg re-checks on the same terms as the rest: `rerange()`
         // is permissionless and re-issues `forceApprove(otherToken, …)` to both
         // the adapter and the position manager on every call, so a leg demoted
         // after init would otherwise keep receiving them.
         _requireAllowedCounterparty(registry, otherToken);
-        address coll = _marketParams.collateralToken;
-        if (levered() && coll != asset) _requireAllowedCounterparty(registry, coll);
     }
 
     function _readAllowed(address registry, bytes memory data) private view returns (bool) {
@@ -731,13 +686,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
         if (p.mintSlippageBps == 0 || p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-        // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
-        // "keep current" and is otherwise a one-way ratchet. A clone
-        // initialized at 0 could therefore never be corrected: every later
-        // `slippageBps > 0` trips `ImmutableParam` against a stored 0, and the
-        // sentinel path leaves it at 0. The keep-sentinel closes the
-        // pass-0-to-change-only-the-deadline trap; this closes the init one.
-        if (p.settleSlippageBps == 0 || p.settleSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
+        // Fixed for the clone's life (`_updateParams`), so a value too tight to clear settle is refused here.
+        if (p.settleSlippageBps < MIN_SETTLE_SLIPPAGE_BPS || p.settleSlippageBps > MAX_SLIPPAGE_BPS) {
+            revert InvalidBound();
+        }
         if (p.swapFractionBps > BPS_DENOMINATOR) revert InvalidBound();
     }
 
@@ -799,7 +751,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     }
 
     /// @dev Reverts unless spot sits within `maxTwapDeviationBps` of the TWAP,
-    ///      and when the TWAP itself cannot be read (`_twapTick`).
+    ///      and when the TWAP itself cannot be read (`_twapTick`). The bound is
+    ///      compared in TICKS: N means a price move of 1.0001^N − 1 (1,000 ≈ 10.5%).
     function _requireSpotNearTwap() private view returns (int24 twap) {
         twap = _twapTick();
         (, int24 spot,,,,,) = pool.slot0();
@@ -824,21 +777,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // the swap below can cross a tick and move it too.
         uint256 poolLiquidityBefore = pool.liquidity();
 
-        // Levered pulls collateral, posts it and funds the mint from the borrow;
-        // unlevered pulls `lpAmount` directly. The mint below is identical in
-        // both modes: it already consumes the asset HELD. The wrapper deposit
-        // happens here rather than at init because init moves no funds.
-        uint256 posted = 0;
-        if (levered()) {
-            _pullFromVault(asset, collateralAmount);
-            posted = _postCollateral(collateralAmount);
-            morpho.borrow(_marketParams, borrowAmount, 0, address(this), address(this));
-        } else {
-            _pullFromVault(asset, lpAmount);
-            // The `collateral` slot carries deployed notional, so an unlevered
-            // position's size is reconstructable from logs like a levered one's.
-            posted = lpAmount;
-        }
+        // Pull, then post as collateral. The wrapper deposit happens here rather
+        // than at init because init moves no funds.
+        _pullFromVault(asset, collateralAmount);
+        uint256 posted = _postCollateral(collateralAmount);
+
+        morpho.borrow(_marketParams, borrowAmount, 0, address(this), address(this));
 
         (uint256 tid, uint128 liquidity) = _mintPosition(tickLower, tickUpper, swapFractionBps, mintSlippageBps);
         tokenId = tid;
@@ -1035,6 +979,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         int24 twap = _requireSpotNearTwap();
         // (2) Price has reached the approved trigger fraction of the range.
         _requireTriggerReached(twap);
+        // The range depends only on the TWAP, so a same-transaction repeat (clamped or not) is a no-op.
+        (int24 newLower, int24 newUpper) = _derivedRange(twap);
+        if (newLower == tickLower && newUpper == tickUpper) revert RerangeTriggerNotReached();
 
         int24 oldLower = tickLower;
         int24 oldUpper = tickUpper;
@@ -1042,8 +989,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         (uint128 liquidityBefore,) = _positionLiquidity(oldTokenId);
         _closePosition(oldTokenId);
-
-        (int24 newLower, int24 newUpper) = _derivedRange(twap);
 
         // Everything freed by the close is redeployed — both legs, which is why
         // the re-mint rebalances from measured balances rather than assuming it
@@ -1080,6 +1025,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // rerange), `travelled` because it is an absolute difference.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 threshold = (uint256(uint24(halfRange)) * _rerange.triggerBps) / BPS_DENOMINATOR;
+        // At least one spacing: a re-snapped range sits up to spacing/2 off the TWAP, so a smaller
+        // threshold lets the same-transaction rerange repeat until `maxReranges`.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (threshold < uint256(uint24(tickSpacing))) threshold = uint256(uint24(tickSpacing));
         // forge-lint: disable-next-line(unsafe-typecast)
         if (uint256(uint24(travelled)) < threshold) revert RerangeTriggerNotReached();
     }
@@ -1129,11 +1078,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             tokenId = 0;
         }
         _swapToAsset(settleSlippageBps);
-        // Unlevered clones borrowed and posted nothing. Load-bearing, not
-        // cosmetic: `position` decodes a return value so it reverts against
-        // `morpho == address(0)`, while `accrueInterest`/`withdrawCollateral`
-        // return none and so would SILENTLY succeed — never rely on the latter.
-        if (levered()) _repayAndWithdraw();
+        _repayAndWithdraw();
         _pushAllToVault(asset);
         _requireHoldsNothing();
     }
@@ -1143,10 +1088,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _requireHoldsNothing() private view {
         _requireZeroBalance(asset);
         _requireZeroBalance(otherToken);
-        // An unlevered `collateralToken` is address(0); the unguarded
-        // `balanceOf` would revert undecodably.
         address collateralToken = _marketParams.collateralToken;
-        if (levered() && collateralToken != asset) _requireZeroBalance(collateralToken);
+        if (collateralToken != asset) _requireZeroBalance(collateralToken);
     }
 
     function _requireZeroBalance(address token) private view {
@@ -1252,11 +1195,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _updateParams(bytes calldata data) internal override {
         (uint256 slippageBps, uint256 deadline) = abi.decode(data, (uint256, uint256));
         if (slippageBps != 0) {
-            // Ceiling first, so an out-of-range value keeps answering
-            // `InvalidBound` rather than being absorbed by the ratchet below.
+            // Ceiling first, so an out-of-range value keeps answering `InvalidBound`.
+            // The reviewed value is fixed: lowering it can brick settle.
             if (slippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-            if (slippageBps > settleSlippageBps) revert ImmutableParam();
-            settleSlippageBps = slippageBps;
+            if (slippageBps != settleSlippageBps) revert ImmutableParam();
         }
         settleDeadline = deadline;
     }

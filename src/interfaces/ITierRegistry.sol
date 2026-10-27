@@ -6,6 +6,8 @@ interface ITierRegistry {
     /// @notice May be bound by a strategy template as a venue (market, position manager,
     ///         swap adapter, price feed, token). Confers nothing to a governor batch.
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
+    /// @notice The Morpho market `id` (all five `MarketParams` fields) may be bound by a strategy template.
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool);
     /// @notice The code class `target` belongs to: non-zero iff it is an ERC-1167 clone of a
     ///         certified template, minted by the registry's strategy factory. `bytes32(0)` otherwise.
     function classOf(address target) external view returns (bytes32);

@@ -38,8 +38,7 @@ Design paper: [`docs/papers/guardian-network-economic-security.md`](docs/papers/
 |----------|-------------|
 | `src/ExposureLedger.sol` | Dollar-denominated coverage accounting. Converts each guardian's sWOOD stake into a haircut USD `slashableBond`, tracks per-epoch committed coverage, and freezes the coverage backing a challenged proposal. Epoch length is immutable (28d initial); the WOOD→USD price is a conservative governance-set 8-decimal value. |
 | `src/ProposerBondEscrow.sol` | Holds the risk-scaled proposer bond for the lifetime of a proposal — the proposer is the actual attacker in the threat model, so it posts capital scaled to what the proposal can extract. Accepts forfeitures only from the ledger's `coverageFreezer`. |
-| `src/ChallengeGame.sol` | Anyone may post a bonded challenge against an executed proposal, citing one of five predicates plus an evidence pointer. Filing freezes the approvers' committed coverage. Guardians counter-bond within `autoSlashDelay` (hard floor 48h), or silence becomes a slash. |
-| `src/TokenCourt.sol` | Single-layer WOOD-vote adjudication of *disputed* challenges. One referral opens one vote window (`MAX_VOTE_WINDOW = 14 days`), one tally against a participation floor produces the verdict. No panel, no appeal, no bad-faith track. |
+| `src/ChallengeGame.sol` | Anyone may post a bonded challenge against an executed proposal, citing one of five predicates plus an evidence pointer. Filing freezes the approvers' committed coverage and opens a guardian vote: `voteOnChallenge(id, convict)` within `voteWindow` (7 d, hard floor 48 h), weighted by stake pinned one second before the filing. Convict weight reaching `challengeQuorumBps` of the votable stake settles the challenge; anything less fails it and burns a fifth of the challenger's bond. |
 | `src/TierRegistry.sol` | Adapter-selector tier certification: tier is a property of `(target, selector)`, set at listing by governance and consumed at propose/execute time. Also holds the owner-managed adapter allowlist that `SyndicateVault._guardBatchCalls` checks for the spender/recipient of value-moving ERC-20 calls inside a governor batch. |
 
 ### Pricing (Lane A) & queue (Lane B)
@@ -59,6 +58,16 @@ Lane B only, and no current template overrides it).
 |----------|-------|
 | `BaseStrategy.sol` | Abstract base (custody, state machine, proposer-tunable params) |
 | `PortfolioStrategy.sol` | Weighted basket of tokens (e.g. tokenized stocks on Robinhood Chain) — buys to target weights on execute, sells out on settle, drift-only `rebalanceDelta()` off the aggregators bound at init |
+
+#### Audit scope and unaudited strategies
+
+The external audit covers the core protocol: the governor, the vault and its withdrawal queue, the
+batch rules, the factory, the guardian registry and sWOOD, the exposure ledger and proposer bond
+escrow, the challenge game, the tier registry, the strategy factory and base strategy, the Portfolio
+strategy, the swap adapter, and the WOOD price feed. The concentrated-liquidity and Morpho supply
+strategies are not audited. They are available and offered use at your own risk: a fund owner who
+proposes one accepts that, and that fund's depositors bear the risk. The full scope and the
+accepted risks are in [`docs/audit-scope-and-accepted-risks.md`](docs/audit-scope-and-accepted-risks.md).
 
 ### Swap adapters (`src/adapters/`)
 
@@ -119,8 +128,9 @@ Independent of the syndicate machinery — team/contributor token grants.
   from the at-open quorum to a 2/3 supermajority (`_severityBps`), not voted.
 - **Bonded approval** — approving a proposal commits a guardian's dollar coverage in
   `ExposureLedger`, and the proposer posts a risk-scaled bond in `ProposerBondEscrow`.
-  A bonded challenge in `ChallengeGame` freezes that coverage; silence auto-slashes,
-  and a counter-bond sends the dispute to `TokenCourt` for a single WOOD vote.
+  A bonded challenge in `ChallengeGame` freezes that coverage and puts the accusation
+  to the staked guardians outside the accused cohort; a convict quorum slashes, and a
+  window that closes short of it burns a fifth of the challenger's bond.
 - **Two-lane liquidity** — while a proposal is live the vault is not instant against
   float. **Lane A** is oracle-instant entry/exit, available only when the
   `PriceRouter` prices the active strategy's positions within its gates (per-share
@@ -144,7 +154,7 @@ Independent of the syndicate machinery — team/contributor token grants.
 
 ```
 src/            Contracts (core, strategies/, pricing/, queue/, adapters/, vesting/, interfaces/, libraries/)
-test/           Foundry tests (unit + fork/integration under test/integration/, plus invariants/, mocks/)
+test/           Foundry tests (unit + fork/integration under test/fork/, plus invariants/, mocks/)
 script/         Deploy + admin scripts (inherit script/ScriptBase.sol) and storage-layout goldens
 openspec/       Executable specs (openspec/specs/) and in-flight change proposals (openspec/changes/)
 chains/         Per-chain deployed addresses, {chainId}.json (auto-written by deploy scripts)
@@ -161,7 +171,7 @@ Requires [Foundry](https://book.getfoundry.sh/getting-started/installation)
 forge build
 
 # Unit tests. --no-match-path skips fork/integration tests that need an RPC URL.
-forge test --no-match-path "test/integration/**"
+forge test --no-match-path "test/fork/**"
 
 forge test                 # everything, including fork tests (needs RPC endpoints)
 forge fmt                  # format (CI runs forge fmt --check)
@@ -189,3 +199,7 @@ governor by that vault's owner.
 ## Docs
 
 Full protocol, governance, and integration documentation: **https://docs.sherwood.sh/**
+
+## License
+
+MIT. See [LICENSE](./LICENSE).

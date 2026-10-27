@@ -22,4 +22,15 @@ contract MockPermissiveTierRegistry {
     function isCounterpartyAllowed(address counterparty) external view returns (bool) {
         return !denied[counterparty];
     }
+
+    mapping(bytes32 => bool) public deniedMarket;
+
+    /// @notice Deny (or re-allow) a single Morpho market id.
+    function setMarketDenied(bytes32 id, bool value) external {
+        deniedMarket[id] = value;
+    }
+
+    function isMorphoMarketAllowed(bytes32 id) external view returns (bool) {
+        return !deniedMarket[id];
+    }
 }

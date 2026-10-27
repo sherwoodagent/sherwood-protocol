@@ -52,18 +52,31 @@ The ledger locks `min(lockWood, free budget)` WOOD, where
 free budget = kNumerator * slashableStake(guardian) − openExposure(guardian)
 ```
 
-all in WOOD. Nothing is converted to USD on this path and no price is read. A
-guardian with no free budget is **not rejected at vote time** — the ledger locks
-zero, the vote still counts as weight, and the cap shows up as an execute-time
-shortfall rather than a reverted vote. An asset-feed outage likewise locks
-nothing rather than reverting, so Block votes cannot keep working while Approve
-votes fail; a WOOD-feed outage is not a failure case at all, because the lock
-needs no price.
+all in WOOD. **An Approve books a lock or reverts** (SHE-240): the vote is
+refused `ApproveLockBelowFloor` when the booked lock is worth less than
+`1/APPROVER_SLOTS` of the need — or, for a guardian whose whole budget is below
+that share, less than that whole budget, admitted only while fewer than half the
+slots are booked (v1 audit F3). An unreadable or unpriceable need and a
+settlement past the horizon also revert. The registry's approver push unwinds
+with the revert, so no slot is held without a lock behind it.
 
 `releaseApproval` unwinds Approve → Block (`CoverageFrozen` while a challenge
-is live); `retireApproval` clears a lock once its proposal is past
-challengeability. The execute-time quorum reads the ledger's own `_approversOf`
-list, never the registry.
+is live). `retireApproval` clears a lock only once its epoch bucket expires
+(`epochGenesis + (epoch + 1)·epochLength + challengeWindow`), whether or not the
+proposal executed. A lock on a cancelled or expired proposal is therefore
+retained and gates the guardian's unstake meanwhile; it carries no slash risk,
+since an unexecuted proposal cannot be challenged. The lock sits in the bucket
+containing `executeBy + strategyDuration`, so from a cancel at the end of the
+review it lasts `executionWindow + strategyDuration + the rest of that epoch +
+challengeWindow`: 15–73 days at shipped parameters (24 h execution window,
+1 h–30 d strategy, 28 d epoch, 14 d challenge window). The proposer can cause
+this at will: `cancelProposal` is open after guardians have approved, through
+the review (while block quorum is not reached) and while Approved
+(`SyndicateGovernor.cancelProposal`), and the proposer can reclaim its own bond at
+once (`SyndicateGovernor.reclaimProposerBond`). The
+cancel does not lengthen the lock — an executed proposal holds the same
+bucket — but nothing frees it early. The execute-time quorum reads the
+ledger's own `_approversOf` list, never the registry.
 
 ## Declared coverage locks
 
@@ -90,10 +103,18 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   buckets (width `epochLength`, 60-day horizon, 16-bucket scan bound) in WOOD.
   A bucket recycles budget once `bucketEnd + challengeWindow` has elapsed, or
   earlier on release or retirement. A stale or manipulated WOOD feed can neither
-  starve nor inflate a guardian's budget.
+  starve nor inflate a guardian's budget. The approve vote is not price-free:
+  the slot floor values the need with `coverageUsd` and the lock with
+  `woodPriceX8()`, unwrapped (`ExposureLedger.recordApproval`), so an approve
+  reverts while the WOOD price or the vault-asset feed is unavailable. A block
+  vote reads no price.
 - **`kNumerator = 1` contains a conviction.** At the default, `Σ locks ≤ stake`,
   so burning proposal A's lock leaves `stake − lock_A ≥ Σ other locks`: every
-  other proposal the guardian backs stays fully covered. Any `k > 1` is
+  other proposal the guardian backs stays fully covered — provided the
+  CONVICTED lock is at least `minSlashBps` of the guardian's stake. A smaller
+  convicted lock is burned at the `minSlashBps` floor, more than the lock, and
+  the other locks are short by the difference (at most `minSlashBps` of that
+  guardian's stake). Any `k > 1` is
   deliberate leverage that gives exactly that property up — a guardian may lock
   more across proposals than they hold, and one conviction may leave the others
   under-covered by the excess. The adversary is an operator raising `k` for
@@ -102,10 +123,10 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **Slash = the lock, under the stake envelope.** `slashBpsFor` returns each
   approver's lock over their slash basis, in bps, rounded up (saturating at
   10_000 when the lock meets or exceeds the basis). `StakedWood` then clamps
-  that rate into `[minSlashBps, maxSlashBps]` and burns `min(lock, basis)`. The
-  basis is `min(stake at the anchor, live stake)`: `openedAt` on the review path
-  (the at-open checkpoint from pashov #11, clamped to live so a concurrent slash
-  is not double-counted) and `executedAt` on the verdict path. Denominating on
+  that rate into `[minSlashBps, maxSlashBps]` and burns the clamped rate of the basis (at least
+  `minSlashBps` of it). The basis is `min(max(stake, liability) checkpoint at the
+  anchor, live stake)`: `openedAt` on the review path (clamped to live so a
+  concurrent slash is not double-counted) and `executedAt` on the verdict path. Denominating on
   the anchored basis rather than raw live stake is what stops a post-drain
   top-up from diluting the burn — double the stake after the fact and the burn
   is still the lock. On a blocked review the block's deterministic severity
@@ -118,14 +139,44 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **WOOD is priced by one feed, capped by governance.** `woodPriceX8()` reads a
   single `AggregatorV3`-shaped WOOD/USD feed, takes `min(feed, woodUsdPriceX8)`
   — the cap is never served as a price — and applies `woodHaircutBps`. On chain
-  4663 that feed is `WoodPoolFeed`: the lower of the Uniswap and Sushiswap
-  WOOD/WETH pools' TWAPs over a window of at least 24h, converted through
-  ETH/USD; every snapshot syncs both pairs first, so there is no idle tail, and
-  each pool is held to a WETH depth floor. A stale or shallow reading yields no
-  price at all — `NoWoodPrice` — rather than a wrong one.
+  4663 that feed is `WoodPoolFeed`: the lower of two WOOD/WETH TWAPs over a
+  window of at least 24h, converted through ETH/USD. One leg is the Uniswap V2
+  pair, synced before each snapshot so there is no idle tail, held to a WETH
+  reserve floor; the other is the Uniswap V3 pool `0xF683…1C69`, held to an
+  in-range `liquidity()` floor instead. **Both legs are averaged from
+  accumulator readings the keeper snapshots** — the pair's cumulative price and
+  the pool's `observe([0])` tick cumulative — so neither leg depends on history
+  anyone else stores. The V3 leg's near end is the pool's live `observe([0])`,
+  so a crash there is tracked between rolls, not hidden until the next one. A backward `observe([window])` would: the observation ring
+  is written by ANY swapper, one slot per SECOND in which the pool is touched,
+  and `observationCardinality` is a `uint16`, so the longest ring anyone can pay
+  for reaches 18h12m against a per-second writer and no ring size can serve a 24h
+  window (v1 audit F2). `DeployWoodPoolFeed` pre-flights only that the pool
+  serves `observe([0])`, which any initialised pool does.
+  **`min` means the SHALLOWER venue binds**, and today that is the V3 pool
+  (~$122k of notional against the V2 pair's ~$330k), so the cost of pushing the
+  reported price DOWN is set by the V3 pool's depth and `woodHaircutBps` should
+  be sized against it rather than against the pair. **The V3 pool's liquidity is
+  a single full-range position**, so `MIN_V3_LIQUIDITY` is also the point at
+  which that one LP burning below it halts WOOD pricing protocol-wide
+  (`NoWoodPrice`, so nothing proposes and nothing executes); the deploy default
+  of `1e22` leaves only 2.1x headroom today and is a launch parameter to size
+  deliberately against what the protocol is willing to halt for. The two depth
+  floors also bind at different times: the V2 leg's WETH floor is checked at
+  SNAPSHOT time as well as at read time, so a pair that was thin during the
+  averaged span never enters the average, while the V3 leg's `liquidity()` floor
+  is checked only at read time, so a pool thin for most of the window but topped
+  up just before the read passes it. Accepted: neither leg carries a staleness
+  gate of its own, so a pool that stops trading keeps averaging its last tick,
+  and the pair keeps averaging its last synced spot. `updatedAt` is the
+  V2 leg's latest snapshot — the older of the two legs, the V3 leg being live — so
+  `WOOD_FEED_MAX_DELAY` at the ledger is what bounds the whole feed's age. A
+  stale or shallow reading yields no price at all — `NoWoodPrice` — rather than
+  a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
-  `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;
+  `min(needUsd, Σ min(lock_i, slash basis_i at executedAt) × woodPriceX8())`, the basis being
+  `StakedWood.slashableStakeAt` (`ExposureLedger._liabilityUsd`, `_slashBasis`);
   `unsharedLiabilityUsd` returns the same figure, since with no cohort cap there
   is no distinct shared basis. `ChallengeGame.file` sizes the challenger bond
   off it, so a cohort cannot lock surplus WOOD to price challengers out. The cap
@@ -192,6 +243,39 @@ for coverage; a guardian whose lock is worth less than when they declared it
 must hold in dollars at execution. The loop sums locks — there is no
 pro-rating and no cross-proposal sharing. This is not an indemnity — slash
 proceeds are burned.
+
+## Price outages and the challenge window
+
+`ChallengeGame.file` sizes the challenger bond from `unsharedLiabilityUsd` (read
+inside `try/catch`) and `woodPriceX8()`, and reverts `WoodPriceUnset` when either
+cannot be read. The filing deadline,
+`max(executedAt + strategyDuration + challengeWindow, challengeableUntil)`, also in
+`file`, keeps running during the outage. An outage that covers the end of the window lets the approvers keep
+their locks and the proposer reclaim its bond. Filing stops when the WOOD feed
+is unwired or older than `WOOD_FEED_MAX_DELAY`, the V3 pool's `liquidity()` is
+below `MIN_V3_LIQUIDITY` or the V2 pair's WETH reserve is below
+`MIN_WETH_RESERVE` at read time, ETH/USD is older than `ETH_USD_MAX_AGE`, the
+vault-asset feed is older than its max delay, or the cap is zero. Approve votes,
+and proposing or executing any proposal with non-zero required coverage, halt on
+the same outage; `proposerBondWood` returns zero before reading the price for a
+zero-coverage proposal (`ExposureLedger.proposerBondWood`). Block votes,
+`voteOnChallenge`, `resolve` and settlement read no price, so a challenge already
+filed is decided and executed through the outage.
+
+- **The challenger's counter.** Both depth floors are read-time checks, so a
+  challenger with the capital can add liquidity, file and remove it in one
+  transaction. `WoodPoolFeed.update()` is permissionless, so a keeper lapse is
+  not an outage a challenger has to wait out, except that a gap longer than
+  `MAX_SNAPSHOT_SPAN` (7 days) costs one more TWAP window. A stale Chainlink
+  ETH/USD or vault-asset feed cannot be fixed by anyone but the Safe.
+- **The Safe's levers.** `ExposureLedger.setWoodFeed` and `setAssetFeed` seat a
+  replacement feed at once; the ledger adds no warm-up. A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
+  snapshots before it can price; any other Chainlink-shaped feed prices at once.
+  Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.setChallengeWindow`,
+  `ChallengeGame.setChallengeWindow`; `file` reads the live window) moves the deadline of every executed proposal,
+  including one whose window has already lapsed, until the permissionless
+  `ExposureLedger.retireApproval` clears that proposal's locks. Both
+  levers are protocol-wide.
 
 ## Proposer bond
 
