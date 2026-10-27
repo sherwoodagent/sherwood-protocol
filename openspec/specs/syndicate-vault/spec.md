@@ -384,7 +384,7 @@ proxy-upgraded contracts:
    layout of `SyndicateVault` against this golden via the same
    `check_contract` convention as the other pinned contracts, and CI SHALL
    run it (the `storage-layout` job runs the whole script).
-2. A raw-slot pin test (`test/VaultLayoutPins.t.sol`) following the structure
+2. A raw-slot pin test (`test/layout/VaultLayoutPins.t.sol`) following the structure
    and assertion style of the existing layout-pin tests: sentinel values
    written through real entry points (or, for fields writable only deep in
    the proposal lifecycle, `vm.store` reverse-pinned through their public
@@ -414,7 +414,7 @@ gate's purpose.
 
 - **WHEN** a `SyndicateVault` state variable moves to a different slot or
   intra-slot offset and the test suite runs without the shell script
-- **THEN** at least one assertion in `test/VaultLayoutPins.t.sol` fails
+- **THEN** at least one assertion in `test/layout/VaultLayoutPins.t.sol` fails
 
 #### Scenario: Append-only evolution passes
 

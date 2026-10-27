@@ -12,7 +12,7 @@ pragma solidity 0.8.28;
 ///         per-call-site proposal wiring.
 /// @dev    NEVER use this for a test that is actually about the binding check
 ///         itself — those need precise, non-permissive wiring. See
-///         `test/audit-fixes/Strategy_cloneRatchetBinding.t.sol` and
+///         `test/strategies/Strategy_cloneRatchetBinding.t.sol` and
 ///         `test/mocks/MockProposalStatus.sol` (the real governor's and
 ///         vault's own `IProposalStatus` seam).
 contract MockGovernorAlwaysActive {

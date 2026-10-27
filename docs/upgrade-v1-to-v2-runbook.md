@@ -3,7 +3,7 @@
 Operator procedure for upgrading a LIVE `v1-deploy` deployment on Robinhood (4663)
 to `post-audit-v2`. Source: the internal review of 2026-10-01.
 The guards this runbook relies on are pinned by
-`test/audit-fixes/Upgrade_keepLedgerRotateGame.t.sol`.
+`test/guardian/Upgrade_keepLedgerRotateGame.t.sol`.
 
 There is no migration script. Every call below is a Safe transaction unless the
 caller column says otherwise. "Old game" is the live v1 `ChallengeGame`; "new game"

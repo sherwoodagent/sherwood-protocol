@@ -82,7 +82,7 @@ The launch set is STRICT. Every symbol in `RobinhoodParams.launchSetSymbols()` r
 
 #### Scenario: Seeding after the handoff is refused
 - **GIVEN** a refactor that moves the seed call after the Safe has accepted ownership
-- **THEN** `_seedTierRegistry` REVERTS ("PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - seed the launch set before the Safe accepts") rather than skipping, which `test/deploy/DeployTierRegistrySeed.t.sol::test_seed_revertsOnceOwnershipHasMoved` pins. Inside the one script the seeding always precedes the handoff, so the refusal is a guard against a re-ordering, not an operational state
+- **THEN** `_seedTierRegistry` REVERTS ("PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - seed the launch set before the Safe accepts") rather than skipping, which `test/factory/deploy/DeployTierRegistrySeed.t.sol::test_seed_revertsOnceOwnershipHasMoved` pins. Inside the one script the seeding always precedes the handoff, so the refusal is a guard against a re-ordering, not an operational state
 
 The ceremony SHALL seat BOTH `protocolFeeRecipient` AND `guardiansFeeRecipient` on `ProtocolConfig` inside the broadcast, and validation SHALL assert both. `ProtocolConfig`'s constructor seeds only the splits, and a zero recipient does NOT strand its leg — the governor zeroes that slice and hands it to the agent as remainder, in both `_chargeManagementFee` and `_chargePerformanceFee`. An unseated recipient is therefore a SILENT RE-ROUTING to the proposer, not a missing payment. The guardian leg is the load-bearing one: `MANAGEMENT_FEE_BPS = 200` is sized so 20% of management and 25% of performance fund the guardian pool, so leaving it unset charges depositors at a rate justified by a pool that receives nothing.
 
@@ -114,7 +114,7 @@ The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTR
 
 #### Scenario: Deprecated template keys refused entry
 - **WHEN** a deprecated key is re-added to `_templateKeys()`
-- **THEN** the exact-set assertion in `test/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
+- **THEN** the exact-set assertion in `test/factory/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
 
 ### Requirement: The Uniswap V3 factory is counterparty-allowlisted before the CL template ships
 
@@ -337,7 +337,7 @@ The Plan B phase SHALL seat `ProtocolConfig.maxStrategyDuration` to `RobinhoodPa
 - **THEN** the run FAILS with a message naming the delegator-walkout hole
 
 #### Scenario: Preflight tests cover both invariants
-- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: the duration ceiling seated; delegation-on fails the named assert and delegation-off passes; a code-less feed refused; a zero `maxDelay` refused; a foreign `StakedWood.exposureLedger` slot refused (the `GuardianRegistry` slot is covered in `test/deploy/DeployAll.t.sol`); and the two post-broadcast price checks (unset cap, cap with nothing priced beneath it)
+- **THEN** `test/factory/deploy/DeployPlanBPreflight.t.sol` covers: the duration ceiling seated; delegation-on fails the named assert and delegation-off passes; a code-less feed refused; a zero `maxDelay` refused; a foreign `StakedWood.exposureLedger` slot refused (the `GuardianRegistry` slot is covered in `test/factory/deploy/DeployAll.t.sol`); and the two post-broadcast price checks (unset cap, cap with nothing priced beneath it)
 
 ### Requirement: Plan D deployment pre-flights and wiring order
 The Plan D phase (ChallengeGame, against the Plan B contracts minted earlier in the same ceremony) SHALL run pre-flights before deploying anything, then wire the game's four roles in this order: `swood.setAuthorizedSlasher(game)` → `game.setStakedWood(swood)` → `tierRegistry.setAuthorizedDemoter(game)` → `ledger.setCoverageFreezer(game)`. The order is load-bearing at both ends: `setStakedWood` rejects a sWOOD that has not already granted the slasher role, so the GRANT precedes the POINTER; and `setCoverageFreezer` reverts `CoverageFrozen` once coverage is frozen, so the freeze role is granted LAST. Checks:

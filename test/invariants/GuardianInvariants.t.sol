@@ -74,6 +74,9 @@ contract GuardianInvariantsTest is StdInvariant, Test {
         vm.prank(owner);
         swood.setRegistry(address(registry));
 
+        vm.prank(factory);
+        registry.addGovernor(address(governor), address(vault));
+
         handler = new GuardianHandler(registry, swood, wood, governor, vault, owner, factory);
 
         // Restrict the fuzzer to the handler's action surface.
@@ -173,20 +176,47 @@ contract GuardianInvariantsTest is StdInvariant, Test {
     // INV-2: blocked-implies-accounting
     // ──────────────────────────────────────────────────────────────
 
-    /// @notice For every resolved-blocked proposal, the review state stays
-    ///         self-consistent: `resolved` and `blocked` flags both set.
-    ///         Strict INV-2 ("slashed approvers have zero stake") requires the
-    ///         approver list at resolve time, which the registry does not
-    ///         expose — that is covered by `GuardianReviewLifecycle` /
-    ///         `StakedWoodSlashing` unit tests.
+    /// @notice Every successful blocked resolution stays committed. SHE-207
+    ///         removed blocker enumeration; epoch rewards moved to Merkl, so
+    ///         the legacy invariant name now covers the durable review outcome.
+    ///         The handler records resolveReview's return value independently
+    ///         of these state reads, including subsequent idempotent resolves.
     function invariant_blockedImpliesEpochAccounting() public view {
         uint256[] memory bids = handler.getBlockedProposalIds();
         for (uint256 i = 0; i < bids.length; i++) {
-            (, bool resolved, bool blocked) = registry.getReviewState(address(governor), bids[i]);
-            if (!resolved || !blocked) continue;
+            (bool opened, bool resolved, bool blocked) = registry.getReviewState(address(governor), bids[i]);
+            assertTrue(opened, "INV-2: blocked review was never opened");
             assertTrue(resolved, "INV-2: resolved flag missing for blocked proposal");
             assertTrue(blocked, "INV-2: blocked flag missing after resolveReview returned true");
+            assertEq(
+                uint256(registry.outcomeOf(address(governor), bids[i])),
+                uint256(IGuardianRegistry.ReviewOutcome.Blocked),
+                "INV-2: committed blocked outcome drifted"
+            );
         }
+    }
+
+    /// @notice Prove the randomized handler can reach INV-2's antecedent.
+    function test_blockedResolutionReachableAndPersistent() public {
+        handler.stake(0, MIN_GUARDIAN_STAKE);
+        handler.warp(7 days);
+        handler.createProposal(1 hours, 1 hours);
+        handler.warp(1 hours);
+        handler.openReview(0);
+        handler.vote(0, 1, 0);
+        handler.warp(1 hours);
+        handler.resolveReview(0);
+
+        assertEq(handler.getBlockedProposalIds().length, 1, "blocked resolution unreachable");
+        invariant_blockedImpliesEpochAccounting();
+
+        // Later staking activity and cached resolution must not erase the verdict.
+        handler.requestUnstake(0);
+        handler.warp(7 days);
+        handler.resolveReview(0);
+        assertEq(handler.successfulResolves(), 2, "cached resolution failed");
+        invariant_blockedImpliesEpochAccounting();
+        invariant_swoodWoodConservation();
     }
 
     // ──────────────────────────────────────────────────────────────
