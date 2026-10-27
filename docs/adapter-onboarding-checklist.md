@@ -582,6 +582,13 @@ and for `external` value-moving functions that are not `onlyVault` —
 `ConcentratedLiquidityStrategy.rerange` and `PortfolioStrategy.rebalanceDelta`
 are the shipped examples, both moving value only *within* the clone).
 
+`script/check-template-destinations.sh` (CI job "Template destinations") pins
+the mechanical half: every token movement out of `src/strategies/` names the
+vault or the template itself, and no `recipient` / `receiver` / `dest` /
+`beneficiary`-shaped identifier escapes that binding. It cannot see a
+counterparty that is *approved* rather than paid, nor a missing `onlyVault` —
+those stay on the reviewer.
+
 `test/vault/ClassCloneVaultBinding.t.sol` pins both halves: a foreign-bound
 clone is admitted and priced at the class tier, and a template that drops
 `onlyVault` does move the paying vault's capital to its own `vault()`.
