@@ -81,20 +81,25 @@ contract DeployWoodPoolFeed is ScriptBase {
     /// @notice Thin env adapter. `deploy()` takes the params as an argument so
     ///         the tests never touch `vm.setEnv`.
     function run() external {
-        WoodPoolFeed feed = deploy(
-            Params({
-                uniPair: vm.envOr("WOOD_WETH_V2_PAIR", _readAddress("WOOD_WETH_V2_PAIR")),
-                sushiPair: vm.envOr("WOOD_WETH_SUSHI_V2_PAIR", _readAddress("WOOD_WETH_SUSHI_V2_PAIR")),
-                wood: vm.envOr("WOOD_TOKEN", _readAddress("WOOD_TOKEN")),
-                weth: vm.envOr("WETH", _readAddress("WETH")),
-                ethUsdFeed: vm.envOr("CHAINLINK_ETH_USD_FEED", _readAddress("CHAINLINK_ETH_USD_FEED")),
-                window: vm.envOr("TWAP_WINDOW", DEFAULT_TWAP_WINDOW),
-                ethUsdMaxAge: vm.envOr("ETH_USD_MAX_AGE", DEFAULT_ETH_USD_MAX_AGE),
-                minWethReserve: vm.envOr("MIN_WETH_RESERVE", DEFAULT_MIN_WETH_RESERVE)
-            })
-        );
+        WoodPoolFeed feed = deploy(params());
 
         _patchAddress("WOOD_USD_FEED", address(feed));
+    }
+
+    /// @notice The params `run()` deploys with: each address from the env when
+    ///         set, else from the address book. A key in neither reads as zero,
+    ///         which the pre-flight then names.
+    function params() public view returns (Params memory) {
+        return Params({
+            uniPair: _envOrBook("WOOD_WETH_V2_PAIR"),
+            sushiPair: _envOrBook("WOOD_WETH_SUSHI_V2_PAIR"),
+            wood: _envOrBook("WOOD_TOKEN"),
+            weth: _envOrBook("WETH"),
+            ethUsdFeed: _envOrBook("CHAINLINK_ETH_USD_FEED"),
+            window: vm.envOr("TWAP_WINDOW", DEFAULT_TWAP_WINDOW),
+            ethUsdMaxAge: vm.envOr("ETH_USD_MAX_AGE", DEFAULT_ETH_USD_MAX_AGE),
+            minWethReserve: vm.envOr("MIN_WETH_RESERVE", DEFAULT_MIN_WETH_RESERVE)
+        });
     }
 
     /// @notice Pre-flights, deploy, first snapshot. Public so the tests can drive
@@ -215,6 +220,12 @@ contract DeployWoodPoolFeed is ScriptBase {
     }
 
     // ── Helpers ──
+
+    /// @dev The book read is tolerant: `envOr` evaluates its default eagerly, so
+    ///      a strict read would revert on a key the book lacks even with the env set.
+    function _envOrBook(string memory key) internal view returns (address) {
+        return vm.envOr(key, _optionalAddress(key));
+    }
 
     /// @dev Instantaneous spot, 8 decimals. Both tokens share a decimals count
     ///      (asserted in `_preflight`), so only the feed's own decimals scale.

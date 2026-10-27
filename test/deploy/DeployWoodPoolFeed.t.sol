@@ -120,7 +120,37 @@ contract DeployWoodPoolFeedTest is Test {
         script.deploy(_params());
     }
 
+    // ── run()'s address resolution ──
+
+    /// @notice An env var fills a key the chain's address book lacks, an env var
+    ///         wins over a key the book has, and the other keys still come from
+    ///         the book. One test, so no parallel case races the shared env.
+    function test_params_envOverridesTheBook() public {
+        address sushi = address(0x5a5a);
+        address uni = address(0x7b7b);
+        vm.chainId(4663);
+        // Both keys are read by this script only. forge has no unset cheatcode,
+        // so a value set before the test is put back at the end.
+        (bool hadSushi, string memory oldSushi) = _envBefore("WOOD_WETH_SUSHI_V2_PAIR");
+        (bool hadUni, string memory oldUni) = _envBefore("WOOD_WETH_V2_PAIR");
+        vm.setEnv("WOOD_WETH_SUSHI_V2_PAIR", vm.toString(sushi));
+        vm.setEnv("WOOD_WETH_V2_PAIR", vm.toString(uni));
+
+        DeployWoodPoolFeed.Params memory p = script.params();
+        assertEq(p.sushiPair, sushi, "env fills a key missing from the book");
+        assertEq(p.uniPair, uni, "env wins over the book");
+        assertEq(p.weth, 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73, "weth from the 4663 book");
+
+        if (hadSushi) vm.setEnv("WOOD_WETH_SUSHI_V2_PAIR", oldSushi);
+        if (hadUni) vm.setEnv("WOOD_WETH_V2_PAIR", oldUni);
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
+
+    function _envBefore(string memory key) internal view returns (bool had, string memory value) {
+        had = vm.envExists(key);
+        if (had) value = vm.envString(key);
+    }
 
     /// @dev The keeper's job: one full window later, with both pools trading, a
     ///      second snapshot rolls in and the feed answers.
