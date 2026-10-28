@@ -87,7 +87,11 @@ Checked after every call sequence.
 - [x] **GL-26** `SHOULD-HOLD` — a challenge reaches exactly one terminal status and never
   changes after (x-ray I-25).
 - [ ] **GL-27** `SHOULD-HOLD` — challenge status edges are exactly
-  `Filed→{Disputed,Settled}`, `Disputed→{Settled,Failed,Inconclusive}`.
+  `Filed→{Disputed,Settled,Inconclusive}`, `Disputed→{Settled,Failed,Inconclusive}`.
+  `Filed→Inconclusive` is `resolve` on a filing nobody disputed or settled before
+  `filedAt + disputeTimeoutAtFiling` (`ChallengeGame.sol:996-1000`). `Disputed` is
+  derived, not stored: a `Filed` challenge whose counter-bond pool completed in time
+  (`challengeOf`, `:1339-1348`).
 - [ ] **GL-28** `SHOULD-HOLD` — `_convicted[reviewKey]` is one-shot; a second `file()`
   against a convicted key always reverts.
 - [ ] **GL-29** `SHOULD-HOLD` — `swood.verdictSlashed(caseKey, approver)` is one-shot

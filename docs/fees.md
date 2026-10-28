@@ -171,8 +171,9 @@ not a team wallet. Until it is seated, the leg pays the deployer placeholder, an
   amount can also be capped by `spendableFee`.
 - **When to seat it.** The governor snapshots the recipient at propose. Seat the
   router as soon as it is minted, before any proposal; a proposal created earlier
-  pays the old recipient for good. DeployAll's validation accepts the router, so a
-  later handoff run still passes. Never re-point to the deployer to get a run through.
+  pays the old recipient for good. The ownership handoff is transfer-only and never
+  re-runs `DeployAll` (see `deployment-runbook.md` §1 step 5), so it leaves the
+  recipient alone. Never re-point it to the deployer.
 - **Guardian leg.** `guardiansFeeRecipient` is a separate path (SHE-399).
 
 ## Co-proposer splits

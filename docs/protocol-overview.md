@@ -52,13 +52,16 @@ the proposer get their bond back.
 2. **Optimistic LP vote** — cheap default-pass governance with a real veto
    (20–80% threshold), backed by ERC20Votes checkpoints and a flash-proof snapshot.
 3. **Guardian review** — humans (and their agents) read the calldata. Approvals
-   stake real WOOD as coverage; blocks slash approvers; tiny cohorts auto-clear
-   rather than carry veto power.
-4. **Coverage quorum at execute** — no strategy runs unless guardian stake covers
-   its extractable value (fail-closed, re-checked against live tier state).
+   stake real WOOD as coverage; blocks slash approvers. There is no cohort-size
+   floor: a thin cohort decides its own reviews.
+4. **Coverage quorum at execute** — execution is sized to the coverage the
+   approvers' locks raise at live value: a partial book scales the capital and
+   every per-call cap down in proportion, and a proposal with non-zero required
+   coverage cannot execute with no approver or a zero book.
 5. **Post-execution challenge game** — a 14-day accountability tail with bonded
    challenges, a silence-convicts default, an escalating anti-spam burn schedule,
-   and a WOOD-vote court. Convictions slash at 100% and burn.
+   and a WOOD-vote court. A conviction burns each approver's lock, never less
+   than `minSlashBps` (10%) of its stake.
 6. **Emergency rails** — owner veto, emergency cancel, `unstick` (replay voted
    settlement), bonded emergency settle behind a fresh guardian review, registry
    dead-man unpause.
@@ -67,18 +70,18 @@ the proposer get their bond back.
 
 | Thing | Default | Bounds |
 |---|---|---|
-| Voting period | 24 h | 24 h (mainnet floor) – 3 d |
+| Voting period | 24 h | 30 min (mainnet floor) – 3 d |
 | LP veto threshold | 20% | 20 – 80% |
-| Guardian review | 24 h | 6 h – 3 d |
+| Guardian review | 24 h (30 min live on 4663) | 30 min (mainnet floor) – 3 d |
 | Guardian block quorum | 30% | 10 – 100% |
 | Execution window | 24 h | 1 h – 7 d |
 | Strategy duration | ≤ 30 d | 1 h – 30 d (absolute) |
 | Cooldown between strategies | 1 h | 1 h – 30 d |
 | Challenge window | 14 d | ≥ review + 7 d |
-| Management fee | 0.5%/yr | 0 – 5%/yr |
-| Performance fee | 5% | 0 – 20% (vault cap) / 30% (protocol ceiling) |
-| Mgmt split (agent/protocol/guardian) | 70/20/10 | must sum to 100% |
-| Perf split (agent/protocol/guardian/owner) | 60/15/15/10 | must sum to 100% |
+| Management fee | 2%/yr | 0 – 3%/yr |
+| Performance fee | 20% | 0 – 20% (per-vault cap, owner may raise it) / 25% (protocol ceiling) |
+| Mgmt split (agent/protocol/guardian) | 60/20/20 | must sum to 100% |
+| Perf split (agent/protocol/guardian/owner) | 50/15/25/10 | must sum to 100% |
 | Min guardian stake | 10 000 WOOD | ≥ 1 WOOD |
 | Guardian unstake cooldown | 7 d | 1 – 30 d, ≥ review period |
 | Proposer bond | 1% of coverage | 0 – 100% |
