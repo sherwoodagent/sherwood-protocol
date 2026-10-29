@@ -167,7 +167,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # Pinned for the same reason FOUNDRY_VERSION is: a validator's rules are
       # as version-sensitive as a formatter's, and an unpinned bump would turn
