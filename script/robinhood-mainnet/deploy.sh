@@ -124,7 +124,8 @@ has_code "$(book EXPOSURE_LEDGER)" || { echo "the coverage stack was not minted;
 
 # ── Run 2 finished ──
 say "verify-robinhood.sh"
-RPC=$RPC ./script/verify-robinhood.sh $CHAIN_ID
+# Deferred: this script refuses a book whose OWNER_MULTISIG is not the deployer (above).
+RPC=$RPC ./script/verify-robinhood.sh $CHAIN_ID deferred
 
 FACTORY=$(book SYNDICATE_FACTORY)
 say "launch posture"
