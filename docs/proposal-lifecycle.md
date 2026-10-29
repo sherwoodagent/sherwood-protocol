@@ -63,7 +63,7 @@ recorded on entering Pending.
 | 0. Collaboration (Draft) | `collaborationWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:268` |
 | 1. LP voting | `votingPeriod` | 24 h (factory default) | 30 min (`MIN_VOTING_PERIOD` on the mainnet impl; absolute floor 1 min) | 3 d | `GovernorParameters.sol:323-325` |
 | 1a. LP veto threshold | `vetoThresholdBps` | 20% | 20% | 80% | `GovernorParameters.sol:331-333` |
-| 2. Guardian review | `registry.reviewPeriod` | 24 h | 30 min (mainnet immutable floor; absolute floor 1 min) | 3 d | `GuardianRegistry.sol:1002` |
+| 2. Guardian review | `registry.reviewPeriod` | 24 h | 30 min (mainnet immutable floor; absolute floor 1 min) | 3 d | `GuardianRegistry.sol:1121` |
 | 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:204` |
 | 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:235-258` |
 | 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:260` |
@@ -72,7 +72,7 @@ recorded on entering Pending.
 Cross-contract timing invariants (all enforced at the setters):
 
 - `reviewPeriod ≤ StakedWood.coolDownPeriod` — a guardian cannot unstake faster than
-  a review they might have to answer for (`GuardianRegistry.sol:1004`).
+  a review they might have to answer for (`GuardianRegistry.sol:1124`).
 - `ledger.challengeWindow ≥ reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW (7 d)` —
   coverage stays challengeable through the longest possible execution delay
   (`GuardianRegistry.sol:1018`).

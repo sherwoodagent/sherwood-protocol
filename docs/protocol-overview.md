@@ -68,9 +68,9 @@ Only after that window closes does the proposer get their bond back.
 
 | Thing | Default | Bounds |
 |---|---|---|
-| Voting period | 24 h | 24 h (mainnet floor) – 3 d |
+| Voting period | 24 h | 30 min (mainnet floor) – 3 d |
 | LP veto threshold | 20% | 20 – 80% |
-| Guardian review | 24 h | 6 h – 3 d |
+| Guardian review | 24 h (30 min live on 4663) | 30 min (mainnet floor) – 3 d |
 | Guardian block quorum | 30% | 10 – 100% |
 | Execution window | 24 h | 1 h – 7 d |
 | Strategy duration | ≤ 30 d | 1 h – 30 d (absolute) |
