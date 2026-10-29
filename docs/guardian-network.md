@@ -32,11 +32,25 @@ direction:
   on the operator. It inspects calldata submitted by agents and vault owners. It
   provides no assurance against the operator, because the same party runs every
   reviewer.
-- **Block quorum is not the binding constraint while that holds.** The operator
-  clears `blockQuorumBps` from its own stake, so the veto's availability is an
-  uptime question rather than a governance one. What *is* binding is dilution:
-  `stakeAsGuardian` has no cap and no allowlist, so a third party parking stake
-  raises the absolute weight the cohort must clear, costing them only capital.
+- **Block quorum is not the binding constraint on the operator's own veto.** The
+  operator clears `blockQuorumBps` from its own stake, so the veto's availability
+  is an uptime question rather than a governance one. Two outside threats bind
+  instead. Both cost only capital, because `stakeAsGuardian` has no cap and no
+  allowlist:
+  - **Dilution.** Stake a third party parks before a proposal's snapshot raises
+    the absolute weight the cohort must clear to block.
+  - **A blocking bloc that burns the approvers** (audit 2026-10-08, A-2). A
+    block vote is uncapped and carries no lock, so the blocker risks nothing
+    (`GuardianRegistry.sol:599-600`). An outside bloc `X` staked before the
+    snapshot reaches the quorum once `X ≥ blockQuorumBps × (F + X)`, that is
+    `X ≥ 3F/7` against a cohort of `F` at the 30% default. It can then block any
+    proposal the cohort approved, and a blocked review slashes every approver at
+    no less than `minSlashBps` (10%) of its stake, however small its lock
+    (`:928`). Cast at the start of the late-vote lockout, the block cannot be
+    answered: an approver's switch to Block reverts `VoteChangeLockedOut`
+    (`:618-623`). The bloc needs no vault and loses nothing, so it can repeat on
+    every review the cohort approves while it stays staked.
+    [launch-notes.md](launch-notes.md) sizes it for the v1 fleet.
 - **A fleet of identically-configured daemons is not a quorum of independent
   reviewers.** They share one verdict path, so they agree by construction.
   Dissent between them comes only from differing policy — what warnings each
@@ -85,7 +99,7 @@ Timeline per proposal: `registerReview` (governor pushes the window at propose) 
 
 | Parameter | Default | Min | Max | Where |
 |---|---|---|---|---|
-| `reviewPeriod` | 24 h | 6 h (mainnet immutable floor) | 3 d | `GuardianRegistry.setReviewPeriod` |
+| `reviewPeriod` | 24 h (30 min live on 4663) | 30 min (`minReviewPeriod`, mainnet immutable floor) | 3 d, and ≤ `sWOOD.coolDownPeriod` | `GuardianRegistry.setReviewPeriod` |
 | `blockQuorumBps` | 30% | 10% | 100% | `GuardianRegistry.setBlockQuorumBps` |
 | `LATE_VOTE_LOCKOUT_BPS` | last 10% of window | const | const | `GuardianRegistry` constant |
 | `MAX_APPROVERS_PER_PROPOSAL` | 100 | const | const | `GuardianRegistry` constant — approvers only; blockers are uncapped (SHE-207) |
@@ -119,15 +133,15 @@ Mechanics worth knowing:
   **lock**, not the bond. The rate handed to `StakedWood` is the guardian's lock
   over their live stake; the block's severity — a deterministic quadratic ramp of
   block-side decisiveness, saturating at a 66.67% supermajority (`_severityBps`,
-  `GuardianRegistry.sol:1195`) — multiplies that lock-derived rate, and the result
+  `GuardianRegistry.sol:942`) — multiplies that lock-derived rate, and the result
   is clamped into `[minSlashBps, maxSlashBps]`. A guardian who backed a bad
   proposal with a small lock while holding a large bond loses the lock, and never
   less than `minSlashBps` of the bond.
 - Slashed WOOD is **burned** (`0x…dEaD`) — the slash pays nobody. A funded
   slash-appeal reserve can refund at most 20% per 7-day epoch
-  (`MAX_REFUND_PER_EPOCH_BPS`, `GuardianRegistry.sol:56`).
+  (`MAX_REFUND_PER_EPOCH_BPS`, `GuardianRegistry.sol:53`).
 - Registry pause has a dead-man switch: anyone can unpause after 7 days
-  (`DEADMAN_UNPAUSE_DELAY`, `GuardianRegistry.sol:57`).
+  (`DEADMAN_UNPAUSE_DELAY`, `GuardianRegistry.sol:54`).
 
 ## The exposure ledger — economic security sizing
 
@@ -156,7 +170,7 @@ it. Full detail: [coverage.md](coverage.md).
   `InsufficientApproveCoverage` **only** when the approver set is empty (`ExposureLedger.sol:1185`)
   or the raised aggregate is exactly zero (`:1202`). A nonzero-but-partial book is
   the shortfall case: it **scales** capital via
-  `_deriveAndStoreEffectiveCapital` (`SyndicateGovernor.sol:1563`) —
+  `_deriveAndStoreEffectiveCapital` (`SyndicateGovernor.sol:1359`) —
   `effectiveMaxCapital = floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)` —
   and the same ratio scales every per-call cap. The gate applies at every
   tier. An empty or
@@ -170,11 +184,13 @@ it. Full detail: [coverage.md](coverage.md).
 ### Declared coverage locks
 
 A guardian **declares** how much WOOD stands behind each approve. The lock is the
-declaration; there is no USD conversion on the approval path and no later pass that
-rewrites it. One number per (proposal, guardian) — `lockOf(governor, proposalId,
-guardian)` — is at once the guardian's booking, their pledge, and the base a
-conviction burns. It is written once by `recordApproval` and erased only by release
-(vote change) or retirement; a filed challenge blocks both. The adversary this shape
+declaration: it is booked in WOOD as declared (clamped to the free budget), and no
+later pass rewrites it. The approval path does price the need and the lock, but
+only to check the slot floor (see "Capacity is WOOD" below). One number per
+(proposal, guardian) — `lockOf(governor, proposalId, guardian)` — is at once the
+guardian's booking, their pledge, and the base a conviction burns. It is written
+once by `recordApproval` and erased only by release (vote change) or retirement;
+a filed challenge blocks both. The adversary this shape
 removes is anyone who could move a guardian's slash base while a challenge is live:
 with booking and pledge the same storage, no permissionless step exists that can
 shrink or grow it.
@@ -297,40 +313,61 @@ Governance discipline: never certify proxied or storage-mutable adapters at tier
 ## Post-execution accountability — ChallengeGame
 
 Anyone can challenge an executed proposal during the challenge window by posting a
-bond. The game is a two-stage bond battle with a court backstop:
+bond. On 4663 filing is paused through the beta (`filingsPaused() == true`,
+SHE-352; see [launch-notes.md](launch-notes.md)). The game is a two-stage bond
+battle with a court backstop:
 
 ```
-file (bond = 1.5% of liability) ─┬─ nobody disputes within autoSlashDelay (7 d)
-                                │    → SILENCE CONVICTION: approvers' locks burned,
-                                │      proposer bond forfeited, adapter demoted
-                                └─ counter-bond pool fills to exactly bondWood
+file (bond = 1.5% of liability) ─┬─ counter-bond pool not complete within autoSlashDelay (7 d)
+                                │    → SILENCE CONVICTION (resolve before disputeTimeout):
+                                │      approvers' locks burned, proposer bond forfeited,
+                                │      adapter demoted; challenger gets its bond back
+                                │      less settleBurnBps (5%) plus prosecutorFeeBps (20%)
+                                │      of the proposer bond; a part-filled pool is
+                                │      refunded to its funders
+                                │    → nobody resolves before disputeTimeout (30 d):
+                                │      Inconclusive, unwound like the court's
+                                └─ counter-bond pool fills to the bond
                                      → Disputed → referred to TokenCourt
-                                          ├─ Guilty: slash + challenger takes pool
-                                          ├─ NotGuilty / timeout: challenger bond
-                                          │    forfeited (20% burned, rest to funders)
-                                          └─ Inconclusive: everyone refunded minus a
-                                               burn; window re-arms
+                                          ├─ Guilty: the same conviction and challenger
+                                          │    payout; the pool is BURNED, not paid out
+                                          ├─ NotGuilty, or disputeTimeout with no ruling:
+                                          │    challenger bond forfeited (20% burned, rest
+                                          │    to pool funders by contribution, pool
+                                          │    returned); the timeout re-arms the window,
+                                          │    a NotGuilty ruling does not
+                                          └─ Inconclusive, or disputeTimeout with no court
+                                               pinned at filing: challenger bond back less
+                                               the round's burn, pool refunded whole;
+                                               window re-arms
 ```
+
+Sources: `resolve` and `rule` (`ChallengeGame.sol:989-1048`), the conviction and
+its pool burn (`_settle`, `:1050-1157`), the forfeit (`_fail`, `:1198-1248`), the
+unwind (`_refundAll`, `:1250-1285`).
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `challengeWindow` | 14 d | > 0 | ≤ ledger's window | `ChallengeGame.sol:2088` |
-| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.sol:2104` |
-| `autoSlashDelay` (silence → conviction) | 7 d | 2 d | < `disputeTimeout` | `ChallengeGame.sol:2176` |
-| `disputeTimeout` | 30 d | > `autoSlashDelay` | 60 d | `ChallengeGame.sol:2187` |
-| `settleBurnBps` (win burn) | 5% | 0 | 50% | `ChallengeGame.sol:2203` |
-| `forfeitBurnBps` (loss burn) | 20% | 0 | 50% | `ChallengeGame.sol:2114` |
-| `inconclusiveBurnBps` (round 4+) | 10% | 0 | 50% | `ChallengeGame.sol:2234` |
-| `prosecutorFeeBps` (slice of proposer bond) | 20% | 0 | 20% | `ChallengeGame.sol:2217` |
+| `challengeWindow` | 14 d | > 0 | ≤ ledger's window | `ChallengeGame.sol:1600` |
+| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.sol:1609` |
+| `autoSlashDelay` (silence → conviction) | 7 d | 2 d | `disputeTimeout` − 1 d | `ChallengeGame.sol:1665` |
+| `disputeTimeout` | 30 d | `autoSlashDelay` + 1 d | 60 d | `ChallengeGame.sol:1678` |
+| `settleBurnBps` (win burn) | 5% | 0 | 50% | `ChallengeGame.sol:1696` |
+| `forfeitBurnBps` (loss burn) | 20% | 0 | 50% | `ChallengeGame.sol:1619` |
+| `inconclusiveBurnBps` (round 4+) | 10% | 0 | 50% | `ChallengeGame.sol:1727` |
+| `prosecutorFeeBps` (slice of proposer bond) | 20% | 0 | 20% | `ChallengeGame.sol:1710` |
 
 Anti-griefing details:
 
 - All rates are **pinned at filing** — no owner change can re-rate a live challenge.
-- Inconclusive retries burn on an escalating schedule per proposal:
-  round 1 = 2.5% (`INCONCLUSIVE_BURN_ROUND1_BPS`, `ChallengeGame.sol:192` — a free
-  first round let a filer freeze coverage at no cost), round 2 = 5%, round 3 =
-  10%, round 4+ = `inconclusiveBurnBps` (10%), each clamped to `settleBurnBps`
-  on earlier rounds.
+- Inconclusive retries burn the challenger's bond on an escalating schedule per
+  proposal. The literals are round 1 = 2.5% (`INCONCLUSIVE_BURN_ROUND1_BPS`,
+  `ChallengeGame.sol:207` — a free first round let a filer freeze coverage at no
+  cost), round 2 = 5%, round 3 = 10%, round 4+ = `inconclusiveBurnBps` (10%).
+  Rounds 1–3 are clamped to the live `settleBurnBps` (5%) and round 4+ is not
+  (`:1287-1301`), so the realised schedule is **2.5% / 5% / 5% / 10%**. The round
+  is fixed at filing from the proposal's earlier Inconclusive rounds plus its
+  other live filings (`:742`). The counter-bond pool is refunded whole.
 - One live challenge per challenger per proposal; conviction is once-per-accused
   (survives even a game redeploy via an sWOOD-side flag).
 - Verdict slashing burns each approver's **lock** for the proposal
@@ -358,8 +395,16 @@ the verdict. No panel, no appeal.
 | `FINALIZE_BUFFER` | 1 d | const | const |
 | `participationFloorBps` | 10% | > 0 | < `sWOOD.ageFloorBps` (25%) |
 
-- Electorate: all sWOOD stakers **except the accused** (accused = guardians whose
-  locks back the challenged proposal). No vote changes.
+- Electorate: sWOOD stakers at the case snapshot (`executedAt − 1`), weighted by
+  age-discounted `getPastVotes` (`TokenCourt.sol:358`). Four parties are barred,
+  each with its own revert (`:344-355`): **the accused** (guardians whose locks
+  back the challenged proposal), **the challenger**, **the proposer** whose bond
+  the verdict decides (when a bond was locked), and **every counter-bond
+  contributor** to the challenge's pool. A voter whose raw stake grew over the
+  30 days before the snapshot votes at the lower of its weight then and now, so
+  an address with no stake 30 days earlier is refused once any stake existed
+  then (`:362-369`). A voter must still hold stake when it votes (`:372`). No vote
+  changes.
 - Verdict: turnout below the participation floor → `Inconclusive`; strict majority
   guilty → `Guilty`; tie or majority not-guilty → `NotGuilty` (fails safe).
 - Referral is only accepted if a full vote + finalize buffer fits before the
@@ -534,10 +579,10 @@ zero-amount slot and `emergencySettleWithCalls` now reverts
 The way back is a factory-gated ceremony, and it works because
 `transferOwnerStakeSlot`'s `PriorStakeNotCleared` guard passes at zero:
 
-1. `prepareOwnerStake(amount)` (`StakedWood.sol:944`) with
+1. `prepareOwnerStake(amount)` (`StakedWood.sol:907`) with
    `amount >= requiredOwnerBond(vault)`
-2. `SyndicateFactory.rotateOwner` (`SyndicateFactory.sol:718`) to bind the
-   funded slot via `transferOwnerStakeSlot` (`StakedWood.sol:1120`)
+2. `SyndicateFactory.rotateOwner` (`SyndicateFactory.sol:644`) to bind the
+   funded slot via `transferOwnerStakeSlot` (`StakedWood.sol:1097`)
 
 Until that runs, the affected vault keeps `unstick` — which carries no bond gate
 — so a settlement replay of already-reviewed calldata is unaffected. Only the

@@ -68,7 +68,8 @@ Nothing is read from the environment. Every number comes from
 4. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
    TokenCourt deploy, and as its last step before the handoff the run opens
    creation by pointing the factory at the real ERC-8004 registry (refusing if any
-   syndicate exists). Creation then costs the invite-only fee (1M WOOD to the Safe).
+   syndicate exists). Creation then costs the invite-only fee (1M WOOD to the
+   booked `OWNER_MULTISIG`, the deployer while the handoff is deferred).
    The run also leaves `ChallengeGame.filingsPaused() == true` (SHE-352): no
    challenge can be filed until the fleet's juror reserve is 30 days old, because
    until then one aged 10k-WOOD outsider, or 7 days of silence, convicts every
@@ -90,17 +91,47 @@ Nothing is read from the environment. Every number comes from
    drops immediate.
    **Deferred handoff (v1 launch).** `chains/4663.json` names the deployer as
    `OWNER_MULTISIG`, so run 2 hands nothing off and this step is skipped: the
-   deployer key owns every contract and receives the creation fee. To hand off
-   later: set `OWNER_MULTISIG` to the real owner (a contract), call
-   `factory.setCreationFee(WOOD, 1_000_000e18, <owner>)` from the deployer, re-run
-   `DeployAll` (it sends only the transfers), then do this step.
+   deployer key owns every contract and receives the creation fee.
+
+   **Never re-run `DeployAll` after run 2**, to hand off or for anything else. A
+   re-run is not transfer-only. It re-seats `woodUsdPriceX8` at
+   `CAP_OVER_SPOT_BPS` times that day's spot (`DeployAll.s.sol:141`,
+   `DeployPlanB.s.sol:156`), overwriting whatever the owner set; resets
+   `woodHaircutBps` and `coveredTvlCapUsd` (`DeployPlanB.s.sol:157, 172`);
+   re-wires the booked WOOD feed if the ledger's feed is not answering
+   (`:159-162`); re-closes `depositsRestricted` and `ownerOnlyProposals` and
+   re-seats a zeroed creation fee (`DeployAll.s.sol:123-130`); re-pauses filings
+   (`:168`); and re-approves any de-listed strategy template
+   (`DeployStrategyFactory.s.sol:65`). It is also gated on the booked
+   `WOOD_USD_FEED` (the retired `WoodPoolFeed`) answering: when it does not, the
+   run stops before `_handoffAll` (`DeployAll.s.sol:152-157`) and then fails
+   validation because syndicates exist (`:502`).
+
+   The handoff is transfer-only, sent by the deployer:
+   1. `factory.setCreationFee(WOOD, 1_000_000e18, <Safe>)`, while the deployer
+      still owns the factory (the recipient is the deployer today).
+   2. One-step `transferOwnership(<Safe>)`, final on send: `GovernorBeacon`,
+      `SyndicateFactory`, `GuardianRegistry`, `StakedWood`, `StrategyFactory`.
+   3. Two-step `transferOwnership(<Safe>)`, which only arms the transfer:
+      `ProtocolConfig`, `TierRegistry`, `ExposureLedger`, `ChallengeGame`,
+      `TokenCourt`.
+
+   Steps 2 and 3 are the ten legs `DeployAll._handoffAll` sends
+   (`DeployAll.s.sol:299-325`). The deployer keeps the Create3Factory, and
+   `ProtocolFeeRouter` is already the Safe's. Then set `OWNER_MULTISIG` in the
+   book to the Safe and do this step from the Safe, starting with
+   `acceptOwnership()` on the five two-step contracts. Update the book before
+   running `verify-robinhood.sh`: it checks ownership against the booked
+   `OWNER_MULTISIG` (`verify-robinhood.sh:89`), so with the deployer booked it
+   passes on a protocol nobody handed off.
+
    **Protocol fee router (SHE-239), right after run 2 and before any proposal.**
    Run `DeployProtocolFeeRouter.s.sol` with `--broadcast` from the deployer, passing
    the Safe, then `script/verify-blockscout.py 4663` to verify its source. Then call `setProtocolFeeRecipient(PROTOCOL_FEE_ROUTER)` from the
    ProtocolConfig owner (the deployer while the handoff is deferred). Each proposal
    snapshots its recipient at propose time, so a proposal created first pays the
-   deployer for good. Validation accepts the router, so the handoff re-run still
-   passes; never point the recipient back at the deployer for it.
+   deployer for good. The transfer-only handoff above leaves the recipient alone;
+   never point it back at the deployer.
 
    `script/robinhood-mainnet/deploy.sh` wraps steps 2 to 6 and verifies the
    sources on Blockscout; run it once per stage.
@@ -123,11 +154,8 @@ Verify with `./script/verify-robinhood.sh 9994663`.
 `0xf8bc08092c06db6148114dcf82af881f1085f92b`, and `DeployWood` now refuses chain
 4663 outright.
 
-**TokenCourt is branch-specific.** The `_deployCourt` / `_wireCourt` phases exist
-on the branch that ships `src/TokenCourt.sol`. `post-audit-v2` resolves disputed
-challenges by guardian vote (SHE-269) and drops both together — but as of
-2026-09-16 `origin/post-audit-v2` (188941b6) has `TokenCourt` RESTORED by
-721d8775, so re-fetch and read the branch before assuming either shape.
+**TokenCourt is deployed.** Run 2's `_deployCourt` / `_wireCourt` phases minted it
+at `TOKEN_COURT` in `chains/4663.json` and wired it as `ChallengeGame.court()`.
 
 **A comment moves every address.** The Create3Factory initcode hash is pinned in
 `script/DeploySalts.sol`. solc's CBOR metadata hashes the source and
