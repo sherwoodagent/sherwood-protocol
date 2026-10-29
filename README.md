@@ -170,11 +170,14 @@ forge test --no-match-path "test/integration/**"
 
 forge test                 # everything, including fork tests (needs RPC endpoints)
 forge fmt                  # format (CI runs forge fmt --check)
-forge build --sizes        # runtime bytecode sizes (some contracts sit near the EIP-170 limit)
+forge build --sizes        # runtime bytecode sizes (exits non-zero on EIP-170's 24,576 B; 4663 allows 98,304 B, which CI enforces)
 ```
 
 `via_ir = true` in `foundry.toml` makes compilation ~2× slower than the legacy
-pipeline — it is required to fit the governor under the bytecode limit.
+pipeline. It is required because the legacy pipeline does not compile `src/` at all
+(`FOUNDRY_VIA_IR=false forge build --skip test --skip script` stops at "Stack too
+deep"). Size is not what binds: under `via_ir` the largest deployable contract,
+`SyndicateGovernor`, is 37,012 B of runtime code against Robinhood Chain's 98,304 B.
 
 ## Deployment
 
