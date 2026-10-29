@@ -46,7 +46,7 @@ Design paper: [`docs/papers/guardian-network-economic-security.md`](docs/papers/
 
 | Contract | Description |
 |----------|-------------|
-| `src/pricing/WoodV3TwapFeed.sol`, `src/pricing/WoodPoolFeed.sol` | WOOD/USD sources on the `AggregatorV3` surface (8 decimals) for `ExposureLedger.woodPriceX8`; the booked `WOOD_USD_FEED` (`WoodPoolFeed`) is retired. `PriceRouter` and Lane A are gone on this line (issue #54): no vault prices a live strategy's positions, so there are no oracle-instant entries or exits. |
+| `src/pricing/WoodV3TwapFeed.sol`, `src/pricing/WoodPoolFeed.sol` | WOOD/USD sources on the `AggregatorV3` surface (8 decimals) for `ExposureLedger.woodPriceX8`. On 4663 the ledger reads `WoodV3TwapFeed` (`WOOD_USD_TWAP_FEED`, `maxDelay` 1h); the booked `WOOD_USD_FEED` (`WoodPoolFeed`) is retired and its `latestRoundData()` reverts `PriceUnavailable`. `PriceRouter` and Lane A are gone on this line (issue #54): no vault prices a live strategy's positions, so there are no oracle-instant entries or exits. |
 | `src/queue/VaultWithdrawalQueue.sol` | Per-vault async request queue. Escrows redeem shares / deposit assets while a proposal is open. At settlement the vault stamps one frozen price per proposal and every redeem tagged to it claims at that price; a deposit claims at the live price once no proposal is open. A redeem tagged to a proposal that ends without settling is never stamped and can only be cancelled. |
 
 ### Strategy templates (`src/strategies/`)

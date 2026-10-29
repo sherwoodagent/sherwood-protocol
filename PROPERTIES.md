@@ -351,6 +351,10 @@ implementations) carries no CBOR metadata trailer.
   On 4663 the reserve is unfunded (`slashAppealReserve()` = 0 and a WOOD balance of
   0 at block 101208138), so the line is true of today's balance, not of the
   contract. (SHE-468)
+- **`src/ExposureLedger.sol:210-211`** says that on chain 4663 the WOOD feed "is a
+  `WoodPoolFeed`". Since the SHE-398 swap the ledger reads `WoodV3TwapFeed`:
+  `_woodFeed` (slot 7, no getter) holds `WOOD_USD_TWAP_FEED` with `maxDelay` 3600 at
+  block 101208643. (SHE-468)
 - **`src/SyndicateVault.sol:80`** gives the agent performance-fee cap as 30%. The
   constant is 2,500 bps, 25% (`FeeConstants.sol:20`). (#401)
 - **`src/ExposureLedger.sol:1335`** says "`recordApproval` needs no WOOD price".
