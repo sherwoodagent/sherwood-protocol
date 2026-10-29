@@ -133,14 +133,47 @@ governance change never affects an in-flight strategy.
 
 - `_payFee` wraps the transfer in `try/catch`: a failing recipient (e.g. blacklisted)
   escrows the amount in the governor instead of bricking settlement
-  (`src/SyndicateGovernor.sol`). Anyone can later push it out via the
-  permissionless `claimUnclaimedFees(vault, token)` (`src/SyndicateGovernor.sol`).
+  (`src/SyndicateGovernor.sol`). The recipient pulls it later with
+  `claimUnclaimedFees(vault, token)`, which pays `msg.sender` (`src/SyndicateGovernor.sol`).
 - The vault refuses to pay fees out of float reserved for stamped queue redemptions
   (`transferPerformanceFee` subtracts `reservedQueueAssets()`,
   `src/SyndicateVault.sol`).
 - The guardian slice is paid in the vault's asset to `guardiansFeeRecipient` and
   converted to WOOD off-chain (weekly Merkl buyback). `GuardianFeeAccrued` is emitted
   only on actual delivery, never on escrow.
+
+## Protocol fee router
+
+On mainnet `protocolFeeRecipient` is meant to be `ProtocolFeeRouter` (`src/ProtocolFeeRouter.sol`),
+not a team wallet. Until it is seated, the leg pays the deployer placeholder, and
+`script/verify-robinhood.sh` fails on mainnet. The router has no swap or burn logic.
+
+- **Allocations.** The owner (the Safe, then the foundation) sets a list of
+  `(target, bps)` legs summing to 10,000. Anyone can call `distribute(token)` to send
+  the router's whole balance of that token across the legs.
+- **Hold mode.** The router launches with no allocations, so `distribute` sends
+  nothing. Hold mode limits `distribute`, not the owner.
+- **Owner powers.** `rescue` moves any token, fee assets included, to any address,
+  in any mode. `setAllocations` takes effect immediately; there is no timelock.
+  `renounceOwnership` is disabled. Validation checks only that the owner is a contract
+  other than the deployer key; that it is the Safe is an operator check.
+- **Backlog follows the live allocations.** Whatever sits in the router goes to the
+  allocations live when `distribute` runs, and anyone can run it before a queued
+  `setAllocations` lands. Bundle `distribute` (or `rescue`) and `setAllocations` in
+  one Safe multisend.
+- **A leg that cannot receive blocks that token.** If a target is frozen by the
+  token issuer, `distribute` for that token reverts, and so does any
+  `distributeMany` that includes it, until the owner replaces the leg. The backlog
+  then goes to the new legs. Keepers should call `distribute` per token.
+- **Escrow.** If a fee transfer to the router fails, the governor escrows it, and
+  anyone can call `claimEscrowedFees(governor, vault, token)` to pull it into the
+  router. The claim reverts while that vault has an active proposal. The escrowed
+  amount can also be capped by `spendableFee`.
+- **When to seat it.** The governor snapshots the recipient at propose. Seat the
+  router as soon as it is minted, before any proposal; a proposal created earlier
+  pays the old recipient for good. DeployAll's validation accepts the router, so a
+  later handoff run still passes. Never re-point to the deployer to get a run through.
+- **Guardian leg.** `guardiansFeeRecipient` is a separate path (SHE-399).
 
 ## Co-proposer splits
 

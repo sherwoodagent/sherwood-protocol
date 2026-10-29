@@ -254,7 +254,7 @@ shrink or grow it.
 |---|---|---|---|---|
 | `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.setKNumerator` |
 | `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.setChallengeWindow` |
-| `epochLength` | 28 d (immutable) | — | — | ctor |
+| `epochLength` | 7 d (immutable; SHE-356) | — | — | ctor |
 | `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.MAX_COVERAGE_HORIZON` |
 | `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.setProposerBondBps` |
 | `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.setCoveredTvlCapUsd` |

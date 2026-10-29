@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {console, Script} from "forge-std/Script.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {DeploySalts} from "./DeploySalts.sol";
 import {Create3} from "./utils/Create3.sol";
@@ -32,17 +33,7 @@ abstract contract ScriptBase is Script {
             "Create3Factory initcode hash drift"
         );
         bytes memory initcode = abi.encodePacked(type(Create3Factory).creationCode, abi.encode(deployer));
-        address predicted = address(
-            uint160(
-                uint256(
-                    keccak256(
-                        abi.encodePacked(
-                            bytes1(0xff), CREATE2_DEPLOYER, DeploySalts.CREATE3_FACTORY, keccak256(initcode)
-                        )
-                    )
-                )
-            )
-        );
+        address predicted = _c3FactoryAddress(deployer);
         if (predicted.code.length == 0) {
             (bool ok,) = CREATE2_DEPLOYER.call(abi.encodePacked(DeploySalts.CREATE3_FACTORY, initcode));
             require(ok, "Create3Factory bootstrap reverted");
@@ -51,6 +42,33 @@ abstract contract ScriptBase is Script {
         Create3Factory c3 = Create3Factory(predicted);
         require(c3.owner() == deployer, "Create3Factory owned by a different deployer");
         return c3;
+    }
+
+    /// @notice The Create3Factory's CREATE2 address for `deployer`, without bootstrapping it.
+    function _c3FactoryAddress(address deployer) internal pure returns (address) {
+        bytes memory initcode = abi.encodePacked(type(Create3Factory).creationCode, abi.encode(deployer));
+        bytes32 h = keccak256(
+            abi.encodePacked(bytes1(0xff), CREATE2_DEPLOYER, DeploySalts.CREATE3_FACTORY, keccak256(initcode))
+        );
+        return address(uint160(uint256(h)));
+    }
+
+    function _protocolFeeRouterAddress(address deployer) internal pure returns (address) {
+        return Create3.addressOf(_c3FactoryAddress(deployer), DeploySalts.PROTOCOL_FEE_ROUTER);
+    }
+
+    /// @notice `router` is the SHE-239 fee router: at its salt, with the pinned code, owned by a contract
+    ///         that is not the deployer key.
+    function _requireProtocolFeeRouter(address router, address deployer) internal view {
+        require(router == _protocolFeeRouterAddress(deployer), "fee router: not at the PROTOCOL_FEE_ROUTER salt");
+        require(
+            router.codehash == DeploySalts.PROTOCOL_FEE_ROUTER_RUNTIME_HASH, "fee router: code is not the pinned router"
+        );
+        address owner_ = Ownable(router).owner();
+        require(
+            owner_ != deployer && owner_.code.length != 0,
+            "fee router: owner must be a contract other than the deployer"
+        );
     }
 
     /// @notice Address this factory mints `salt` at. Depends on (factory, salt) only.

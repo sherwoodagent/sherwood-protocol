@@ -45,6 +45,15 @@ bad()  { printf '  \033[31mFAIL\033[0m %-46s %s\n' "$1" "$2"; FAIL=$((FAIL+1)); 
 check() {
   if [ "$(lc "$2")" = "$(lc "$3")" ]; then ok "$1" "$2"; else bad "$1" "got $2 want $3"; fi
 }
+# check_range <label> <actual> <lo> <hi> — inclusive, for an OPERATING value the owner
+# tunes. Pinning a literal here goes stale the first time the owner moves it, and a check
+# that is always red gets ignored; the bound is what the contract itself enforces.
+check_range() {
+  for n in "$2" "$3" "$4"; do
+    case "$n" in ''|*[!0-9]*) bad "$1" "unread (got '$2', bounds '$3'..'$4')"; return;; esac
+  done
+  if [ "$2" -ge "$3" ] && [ "$2" -le "$4" ]; then ok "$1" "$2 (in $3..$4)"; else bad "$1" "$2 outside $3..$4"; fi
+}
 call() { cast call "$1" "$2" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{print $1}'; }
 call1() { cast call "$1" "$2" "$3" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{print $1}'; }
 
@@ -130,9 +139,17 @@ else
 fi
 check "swood.wood"                    "$(call "$SWOOD" 'wood()(address)')"              "$WOOD"
 check "swood.registry"                "$(call "$SWOOD" 'registry()(address)')"          "$REGISTRY"
-check "registry.reviewPeriod == 24h"  "$(call "$REGISTRY" 'reviewPeriod()(uint256)')"   "86400"
+check "registry.minReviewPeriod == 30m" "$(call "$REGISTRY" 'minReviewPeriod()(uint256)')" "1800"
+# The operating window, bounded by what `setReviewPeriod` enforces: the impl's floor below,
+# and sWOOD's guardian cooldown (capped at the 3d ceiling) above, so an approver can never
+# unstake and escape the slash before `resolveReview`.
+REVIEW_FLOOR=$(call "$REGISTRY" 'minReviewPeriod()(uint256)')
+REVIEW_COOLDOWN=$(call "$SWOOD" 'coolDownPeriod()(uint256)')
+REVIEW_CEIL=259200
+case "$REVIEW_COOLDOWN" in ''|*[!0-9]*) :;; *) [ "$REVIEW_COOLDOWN" -lt "$REVIEW_CEIL" ] && REVIEW_CEIL="$REVIEW_COOLDOWN";; esac
+check_range "registry.reviewPeriod within bounds" "$(call "$REGISTRY" 'reviewPeriod()(uint256)')" "$REVIEW_FLOOR" "$REVIEW_CEIL"
 check "registry.blockQuorumBps == 30%" "$(call "$REGISTRY" 'blockQuorumBps()(uint256)')" "3000"
-check "governorImpl.MIN_VOTING_PERIOD" "$(call "$BIMPL" 'MIN_VOTING_PERIOD()(uint256)')" "3600"
+check "governorImpl.MIN_VOTING_PERIOD == 30m" "$(call "$BIMPL" 'MIN_VOTING_PERIOD()(uint256)')" "1800"
 check "governorImpl.MIN_COOLDOWN_PERIOD" "$(call "$BIMPL" 'MIN_COOLDOWN_PERIOD()(uint256)')" "3600"
 check "swood.maxSlashBps == 100%"     "$(call "$SWOOD" 'maxSlashBps()(uint256)')"       "10000"
 check "swood.minSlashBps == 10%"      "$(call "$SWOOD" 'minSlashBps()(uint256)')"       "1000"
@@ -167,6 +184,39 @@ for leg in protocolFeeRecipient guardiansFeeRecipient; do
   R=$(call "$CONFIG" "$leg()(address)")
   if [ -n "$R" ] && [ "$R" != "$ZERO" ]; then ok "config.$leg non-zero" "$R"; else bad "config.$leg non-zero" "$R"; fi
 done
+echo; echo "── Protocol fee router (SHE-239: the protocol leg must not pay a team key) ──"
+# Each code is read once; output that is not 0x-hex is a failed read and scores as a failure, never a pass.
+code_of() { local c; c=$(cast code "$1" --rpc-url "$RPC" 2>/dev/null); [[ "$c" =~ ^0x[0-9a-fA-F]*$ ]] && echo "$c"; }
+ROUTER=$(derive protocol-fee-router)
+PFR=$(call "$CONFIG" 'protocolFeeRecipient()(address)')
+RCODE=""; [ -z "$ROUTER" ] || RCODE=$(code_of "$ROUTER")
+if [ -z "$RCODE" ]; then
+  bad "PROTOCOL_FEE_ROUTER code read" "derive or cast code failed for '$ROUTER'"
+elif [ "$RCODE" = "0x" ]; then
+  if [ -n "$(a PROTOCOL_FEE_ROUTER)" ]; then
+    bad "PROTOCOL_FEE_ROUTER holds code" "book names $(a PROTOCOL_FEE_ROUTER), nothing at $ROUTER"
+  elif [ "$POSTURE" = "mainnet" ]; then
+    bad "fee router minted and seated" "nothing at $ROUTER; protocol leg pays $PFR"
+  else
+    printf '  \033[33mWARN\033[0m %-46s %s\n' "fee router not deployed (fork)" "protocol leg pays $PFR"
+  fi
+else
+  book_matches "PROTOCOL_FEE_ROUTER" PROTOCOL_FEE_ROUTER "$ROUTER"
+  RHASH=$(cast keccak "$RCODE")
+  PINNED=$(grep -A1 'PROTOCOL_FEE_ROUTER_RUNTIME_HASH =' script/DeploySalts.sol | grep -o '0x[0-9a-f]\{64\}')
+  check "router codehash == DeploySalts pin" "$RHASH" "$PINNED"
+  check "router codehash == forge inspect" "$RHASH" \
+    "$(cast keccak "$(forge inspect ProtocolFeeRouter deployedBytecode 2>/dev/null | tail -1)")"
+  check "config.protocolFeeRecipient == router" "$PFR" "$ROUTER"
+  RO=$(call "$ROUTER" 'owner()(address)')
+  ROCODE=""; [ -z "$RO" ] || ROCODE=$(code_of "$RO")
+  if [ -n "$ROCODE" ] && [ "$ROCODE" != "0x" ] && [ "$(lc "$RO")" != "$(lc "$DEPLOYER")" ]; then
+    ok "router.owner is a contract, not the deployer" "$RO"
+  else
+    bad "router.owner is a contract, not the deployer" "owner '$RO', code read '${ROCODE:0:10}'"
+  fi
+  check "router.pendingOwner (none)" "$(call "$ROUTER" 'pendingOwner()(address)')" "$ZERO"
+fi
 
 echo; echo "── Strategy templates (the allowlist IS _templateKeys) ──"
 APPROVED=0
@@ -229,12 +279,42 @@ check "game.stakedWood (reciprocal)"  "$(call "$GAME" 'stakedWood()(address)')" 
 check "game.exposureLedger"           "$(call "$GAME" 'exposureLedger()(address)')"      "$LEDGER"
 check "game.tierRegistry"             "$(call "$GAME" 'tierRegistry()(address)')"        "$TIERS"
 check "game.challengeWindow == ledger" "$(call "$GAME" 'challengeWindow()(uint256)')"    "$(call "$LEDGER" 'challengeWindow()(uint256)')"
+# Beta posture (SHE-352): filings stay paused until the juror reserve is 30 days old.
+check "game.filingsPaused (beta posture)" "$(call "$GAME" 'filingsPaused()(bool)')"      "true"
 
 echo; echo "── WOOD price source ──"
 check "feed decimals == 8"            "$(call "$WFEED" 'decimals()(uint8)')"             "8"
 # A late 24h heartbeat round must still price WOOD (audit V1-06): 26h = 93600 s.
 if [ "$POSTURE" = "mainnet" ]; then
   check "feed.ethUsdMaxAge == 26h"    "$(call "$WFEED" 'ethUsdMaxAge()(uint256)')"       "93600"
+fi
+
+# SHE-398: once the book records the V3 TWAP feed, it must be the one the ledger reads.
+TWAP_FEED=$(a WOOD_USD_TWAP_FEED)
+if [ -n "$TWAP_FEED" ]; then
+  echo; echo "── WOOD V3 TWAP feed (SHE-398) ──"
+  check "WOOD_USD_TWAP_FEED (book == derived)" "$TWAP_FEED" "$(derive wood-v3-twap-feed)"
+  # The ledger has no getter for its WOOD feed; the address is the low 20 bytes of its slot.
+  FEED_SLOT=$(forge inspect ExposureLedger storageLayout --json 2>/dev/null \
+    | python3 -c "import json,sys;print(next(s['slot'] for s in json.load(sys.stdin)['storage'] if s['label']=='_woodFeed'))")
+  WIRED="0x$(cast storage "$LEDGER" "$FEED_SLOT" --rpc-url "$RPC" | tail -c 41)"
+  check "ledger reads the TWAP feed"   "$WIRED" "$TWAP_FEED"
+  POOL=$(a WOOD_WETH_UNISWAP_V3_POOL)
+  check "twapFeed.pool"                "$(call "$TWAP_FEED" 'pool()(address)')"           "$POOL"
+  check "twapFeed.window == 1h"        "$(call "$TWAP_FEED" 'window()(uint32)')"          "3600"
+  check "twapFeed.ethUsdMaxAge == 26h" "$(call "$TWAP_FEED" 'ethUsdMaxAge()(uint256)')"   "93600"
+  RING=$(cast call "$POOL" 'slot0()(uint160,int24,uint16,uint16,uint16,uint8,bool)' --rpc-url "$RPC" | sed -n 5p | awk '{print $1}')
+  if [ "${RING:-0}" -gt 3600 ]; then ok "pool ring target > window" "$RING"; else bad "pool ring target > window" "${RING:-unread} (needs 3601)"; fi
+  # The cap is static while spot moves: re-seat it once it is over 2.5x the feed.
+  ANSWER=$(cast call "$TWAP_FEED" 'latestRoundData()(uint80,int256,uint256,uint256,uint80)' --rpc-url "$RPC" 2>/dev/null | sed -n 2p | awk '{print $1}')
+  CAP=$(call "$LEDGER" 'woodUsdPriceX8()(uint256)')
+  if [ -z "$ANSWER" ]; then
+    bad "twapFeed answers" "reverts (ring not a window old, or below a floor)"
+  elif [ "$((CAP * 10))" -le "$((ANSWER * 25))" ]; then
+    ok "cap at most 2.5x the feed" "cap $CAP feed $ANSWER"
+  else
+    bad "cap at most 2.5x the feed" "cap $CAP feed $ANSWER (re-seat with setWoodUsdPrice)"
+  fi
 fi
 
 echo

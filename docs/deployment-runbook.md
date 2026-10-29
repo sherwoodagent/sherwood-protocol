@@ -69,6 +69,13 @@ Nothing is read from the environment. Every number comes from
    deploy, and as its last step before the handoff the run opens
    creation by pointing the factory at the real ERC-8004 registry (refusing if any
    syndicate exists). Creation then costs the invite-only fee (1M WOOD to the Safe).
+   The run also leaves `ChallengeGame.filingsPaused() == true` (SHE-352): no
+   challenge can be filed until the fleet's juror reserve is 30 days old, because
+   until then one aged 10k-WOOD outsider, or 7 days of silence, convicts every
+   approving key (audit 2026-10-08, D-1/D-2). The owner lifts it with
+   `setFilingsPaused(false)` once `StakedWood.stakedAt(reserve) + 30d` has passed
+   and the counter-bond treasury and keeper are live (SHE-361). `verify-robinhood.sh`
+   expects the flag set.
    The handoff runs and `deployAll` returns `Checkpoint.Complete`. Addresses are
    written to `chains/4663.json` last. If a `WoodPoolFeed` with a different
    `ethUsdMaxAge` was already deployed on the target chain, the run refuses to
@@ -76,11 +83,27 @@ Nothing is read from the environment. Every number comes from
 5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
    `ExposureLedger` and `ChallengeGame` (the one-step contracts —
    beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already
-   transferred). Then re-point `setProtocolFeeRecipient` and
-   `setGuardiansFeeRecipient` off the deployer placeholder, seed the slash-appeal
+   transferred). Then re-point `setGuardiansFeeRecipient` off the deployer
+   placeholder (the protocol leg is already on the fee router, see below), seed the slash-appeal
    reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
+   **Deferred handoff (v1 launch).** `chains/4663.json` names the deployer as
+   `OWNER_MULTISIG`, so run 2 hands nothing off and this step is skipped: the
+   deployer key owns every contract and receives the creation fee. To hand off
+   later: set `OWNER_MULTISIG` to the real owner (a contract), call
+   `factory.setCreationFee(WOOD, 1_000_000e18, <owner>)` from the deployer, re-run
+   `DeployAll` (it sends only the transfers), then do this step.
+   **Protocol fee router (SHE-239), right after run 2 and before any proposal.**
+   Run `DeployProtocolFeeRouter.s.sol` with `--broadcast` from the deployer, passing
+   the Safe, then `script/verify-blockscout.py 4663` to verify its source. Then call `setProtocolFeeRecipient(PROTOCOL_FEE_ROUTER)` from the
+   ProtocolConfig owner (the deployer while the handoff is deferred). Each proposal
+   snapshots its recipient at propose time, so a proposal created first pays the
+   deployer for good. Validation accepts the router, so the handoff re-run still
+   passes; never point the recipient back at the deployer for it.
+
+   `script/robinhood-mainnet/deploy.sh` wraps steps 2 to 6 and verifies the
+   sources on Blockscout; run it once per stage.
 6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it derives the
    `Create3Factory` address from the compiled `Create3Factory` initcode and the book's
    `DEPLOYER` (never from the book's `CREATE3_FACTORY`, which it only checks against the
@@ -110,6 +133,106 @@ compiled bytecode of `script/utils/Create3.sol` or `Create3Factory.sol`, or a co
 or optimizer change, does — it moves the whole address table and trips the
 `Create3Factory initcode hash drift` pre-flight. Re-record the constant deliberately;
 never to get a build green.
+
+---
+
+## 1b. Fleet stake — before run 2, before any outsider
+
+`StakedWood` has been live since run 1 and staking is permissionless. Whoever stakes first owns challenge adjudication (TokenCourt on v1; the guardian challenge vote on this branch) until the other side's stake is 30 days old. A 10k-WOOD outsider who stakes first can convict alone while every fleet juror is still refused. So the fleet stakes from the Safe **before run 2 opens creation**. `stakeAsGuardian` does not read the ledger, so this works before run 2.
+
+**Topology first, then stake.** A top-up re-anchors `stakedAt` to the stake-weighted average, which resets part of the 30-day clock. Fix the topology before the first stake:
+
+- **Approving keys**: small dedicated keys whose stake ≈ the lock they will carry, each ≥ `minGuardianStake` (10,000 WOOD). Only these keys approve. The review-path burn is 10% of *approving* stake.
+- **Juror reserve**: staked by the Safe under its own address. It never approves and never funds counter-bonds. Size it at least as large as the largest plausible aged outside stake: a reserve that never votes still raises the court floor and the 3F/7 blocking bar.
+
+**Run** (prints the plan, broadcasts nothing; it refuses any key or the Safe that already holds stake, the Safe as an approving key, a duplicate key, an amount under the minimum, and a plan the Safe cannot fund):
+
+```bash
+forge script script/robinhood-mainnet/StakeFleet.s.sol:StakeFleet --rpc-url robinhood \
+  --sig "run(address,address[],uint256[],uint256)" <Safe> "[0x…,0x…,0x…]" "[<whole WOOD>,…]" <reserve, whole WOOD>
+```
+
+The first argument is the Safe that holds the WOOD (`0x0aEB…04F3` on 4663), given
+explicitly because the launch book names the deployer as `OWNER_MULTISIG` until
+the handoff. The v1 plan (SHE-355, `docs/launch-notes.md`): three approving keys
+at 10M each (voter-2, voter-3, voter-4) and a 70M reserve. voter-1 stays veto-only
+and is not part of this ceremony; if it needs `minGuardianStake` to vote Block, it
+stakes 10k from itself and is never listed as an approving key.
+
+1. The Safe's two signers (not the deployer) submit the printed calls as one batch: `WOOD.transfer` to each approving key, then `WOOD.approve(sWOOD, reserve)` and `sWOOD.stakeAsGuardian(reserve, 0)`.
+2. Each approving key, from itself: `WOOD.approve(sWOOD, amount)`, then `sWOOD.stakeAsGuardian(amount, 0)`.
+3. **Record** in the launch notes which address plays which role, each key's `stakedAt`, and `totalGuardianStake`. That timestamp starts the 30-day court maturation that gates unpausing filings, and with it general access.
+4. No fleet key approves until the per-vault lock cap (SHE-299) is live on the voters.
+
+## 1c. WOOD feed swap (SHE-398) — after run 2
+
+The ceremony wires `WoodPoolFeed` (24h stored snapshots, rolled by a keeper). The swap replaces it at the ledger with `WoodV3TwapFeed`: the WOOD/WETH V3 pool's own 1h mean tick times ETH/USD, with no keeper. Every step is `script/robinhood-mainnet/SwapWoodFeed.s.sol`; numbers come from `RobinhoodParams`, addresses from the book.
+
+1. **Grow the pool's observation ring** (any funded key; permissionless):
+   ```bash
+   forge script script/robinhood-mainnet/SwapWoodFeed.s.sol:SwapWoodFeed --sig "growRing()" \
+     --rpc-url robinhood --account <any key> --broadcast --slow
+   ```
+   It raises the ring target to 3,660 in four calls of at most 1,000 slots. Do not pass `--gas-estimate-multiplier 200`: 4663 caps a transaction at 32M gas and a call of 1,000 slots uses about 22M. Send the calls back to back, so the ring never wraps at an intermediate size.
+2. **Deploy the feed** (the deployer key, which owns the Create3Factory):
+   ```bash
+   forge script script/robinhood-mainnet/SwapWoodFeed.s.sol:SwapWoodFeed --sig "deployFeed()" \
+     --rpc-url robinhood --account sherwood-deployer --broadcast --slow
+   ```
+   Pre-flights: WOOD and WETH share a decimals count, the booked factory's `getPool` returns the pool, in-range liquidity is at or above `MIN_V3_LIQUIDITY`, ETH/USD is live, the ring target is at least `window + 1`, and the ring has not wrapped at a smaller size. The address is written to the book as `WOOD_USD_TWAP_FEED`. The feed answers one window after the pool's oldest observation.
+3. **Shadow run, two to three days.** Log both feeds and V2 spot, for example hourly:
+   ```bash
+   forge script script/robinhood-mainnet/SwapWoodFeed.s.sol:SwapWoodFeed --sig "compare()" \
+     --rpc-url robinhood | grep CSV >> wood-feed-shadow.csv
+   ```
+   Columns: time, old feed, new feed, V2 spot, all at 8 decimals; 0 is a feed that reverted. Keep rolling `WoodPoolFeed.update()` until the swap.
+4. **Swap** (the ledger owner):
+   ```bash
+   forge script script/robinhood-mainnet/SwapWoodFeed.s.sol:SwapWoodFeed --sig "swap()" \
+     --rpc-url robinhood --account sherwood-deployer --broadcast --slow
+   ```
+   It refuses unless the feed is the booked one, answers, and sits within 10% of V2 spot. Then it calls `setWoodFeed(feed, 1h)` and seats `woodUsdPriceX8` at 2x the feed's answer (the TWAP, not spot). The `maxDelay` is inert for this feed: its `updatedAt` is the read time.
+5. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` now also checks that the ledger reads the booked TWAP feed, the ring target, and that the cap is at most 2.5x the feed. Commit the book. Retire the keeper's `update()` job.
+
+Standing rule after the swap: the cap is static while WOOD moves. When the feed falls below `cap / 2.5`, lower the cap with `setWoodUsdPrice` to 2x the feed within a day.
+
+## 1d. 30-minute timing floors — after run 2
+
+`MIN_VOTING_PERIOD` (governor impl) and `minReviewPeriod` (registry impl) are
+constructor immutables, so lowering them from 1h/6h to 30 min is a new
+implementation behind each live proxy. Storage is untouched and the operating
+values do not move: the owner lowers `reviewPeriod` and each vault's
+`votingPeriod` afterwards, as separate calls.
+
+A 30-minute review window is only as good as the fleet's uptime inside it: an
+unopened or unquorate review resolves `Cleared`, which is passage. Execution
+still needs an approver's coverage, and the LATE_VOTE_LOCKOUT_BPS tail makes the
+last 10% of the window unvotable (3 minutes of a 30-minute one). Before seating
+30 minutes, confirm the voters poll fast enough to decide inside it and that the
+block quorum survives one voter being down.
+
+1. **Upgrade both implementations** (the owner of the beacon and the registry, one run):
+   ```bash
+   forge script script/robinhood-mainnet/LowerTimingFloors.s.sol:LowerTimingFloors \
+     --rpc-url robinhood --account sherwood-deployer --broadcast --slow
+   ```
+   It mints both impls at their own CREATE3 salts, refuses an impl whose floors
+   are not the booked ones or that would move `MIN_COOLDOWN_PERIOD`, refuses a
+   re-run once the live floors are already at or below 30 min, and asserts after
+   each swap that the floor moved and the registry's storage did not.
+2. **Seat the operating values.** The floors only permit the shorter windows;
+   nothing shortens on its own. From the registry owner:
+   `registry.setReviewPeriod(1800)` — bounded above by `sWOOD.coolDownPeriod()`
+   (7 d) and below by the new floor. Per vault, from the vault owner:
+   `governor.setVotingPeriod(1800)` (`whenNoActiveProposal`).
+3. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` checks
+   `registry.minReviewPeriod == 1800` and `governorImpl.MIN_VOTING_PERIOD == 1800`.
+
+Rehearse on an anvil fork with `--disable-code-size-limit`: the governor
+implementation is 37,012 bytes, which 4663 accepts (ArbOS caps code at 98,304)
+and vanilla revm rejects at the standard 24,576. Without the flag the governor
+impl deploy fails with status 0 and the beacon keeps the old implementation,
+which looks like a script bug and is not.
 
 ---
 
@@ -174,8 +297,9 @@ Not one-time steps. Nothing below is enforced on-chain.
   price — seeded at or below market it binds permanently and pins every bond.
   Review monthly; lowering it is the emergency brake and is not rate-limited
   on-chain (rate limiting lives in a Zodiac module on the owner Safe).
-- **Call `WoodPoolFeed.update()` on a schedule** shorter than the `maxDelay`
-  passed to `setWoodFeed`. It is permissionless and a no-op when a pool is early
+- **Until the SHE-398 swap (§1c), call `WoodPoolFeed.update()` on a schedule**
+  shorter than the `maxDelay` passed to `setWoodFeed`. After the swap nothing has
+  to be called: `WoodV3TwapFeed` reads the pool's own ring. It is permissionless and a no-op when a pool is early
   or below its depth floor, so a failing keeper looks like nothing at all — and a
   stale feed is `NoWoodPrice`: block votes still land, but approve votes,
   `ChallengeGame.file`, and `propose` and `executeProposal` for any proposal

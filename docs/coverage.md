@@ -153,6 +153,12 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   for reaches 18h12m against a per-second writer and no ring size can serve a 24h
   window (v1 audit F2). `DeployWoodPoolFeed` pre-flights only that the pool
   serves `observe([0])`, which any initialised pool does.
+  **After the SHE-398 swap the feed is `WoodV3TwapFeed`**: the V3 pool alone,
+  its own mean tick over 1h read backward with `observe([3600, 0])`, no keeper
+  and no stored snapshot. A 1h window does fit a ring: 3,601 slots against a
+  per-second writer, and the feed's constructor refuses a pool whose ring target
+  is shorter. There is no second venue and no `min`; the bounds are the cap
+  (2x the feed at the swap), the haircut and the covered-TVL cap.
   **`min` means the SHALLOWER venue binds**, and today that is the V3 pool
   (~$122k of notional against the V2 pair's ~$330k), so the cost of pushing the
   reported price DOWN is set by the V3 pool's depth and `woodHaircutBps` should
@@ -270,7 +276,8 @@ filed is decided and executed through the outage.
   ETH/USD or vault-asset feed cannot be fixed by anyone but the Safe.
 - **The Safe's levers.** `ExposureLedger.setWoodFeed` and `setAssetFeed` seat a
   replacement feed at once; the ledger adds no warm-up. A replacement `WoodPoolFeed` still needs a full TWAP window of keeper
-  snapshots before it can price; any other Chainlink-shaped feed prices at once.
+  snapshots before it can price; a `WoodV3TwapFeed` prices one window after the
+  pool's oldest observation; any other Chainlink-shaped feed prices at once.
   Raising `challengeWindow` on the ledger and then on the game (`ExposureLedger.setChallengeWindow`,
   `ChallengeGame.setChallengeWindow`; `file` reads the live window) moves the deadline of every executed proposal,
   including one whose window has already lapsed, until the permissionless

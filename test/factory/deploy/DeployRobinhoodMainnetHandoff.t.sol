@@ -10,6 +10,8 @@ import {RobinhoodParams} from "../../../script/robinhood-mainnet/RobinhoodParams
 import {ProtocolConfig} from "../../../src/ProtocolConfig.sol";
 import {TierRegistry} from "../../../src/TierRegistry.sol";
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
+import {DeploySalts} from "../../../script/DeploySalts.sol";
+import {ProtocolFeeRouter} from "../../../src/ProtocolFeeRouter.sol";
 
 /// @notice Stand-in for a Gnosis Safe. The script's only check is
 ///         `code.length > 0`, so any deployed bytecode satisfies it.
@@ -43,6 +45,16 @@ contract DeployRobinhoodMainnetHarness is DeployRobinhoodMainnet {
 
     function exposed_validate(Deployed memory d, address deployer, address ownerMultisig, address wood) external view {
         _validateMainnet(d, deployer, ownerMultisig, wood, RobinhoodParams.AGENT_REGISTRY);
+    }
+
+    /// @dev Mints the SHE-239 router at its salt through this harness's own Create3Factory.
+    function exposed_mintFeeRouter(address owner_) external returns (address) {
+        bytes memory initcode = abi.encodePacked(type(ProtocolFeeRouter).creationCode, abi.encode(owner_));
+        return _c3(_c3Factory(address(this)), DeploySalts.PROTOCOL_FEE_ROUTER, initcode);
+    }
+
+    function exposed_feeRouterAddress(address deployer) external pure returns (address) {
+        return _protocolFeeRouterAddress(deployer);
     }
 }
 
@@ -245,6 +257,58 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
 
         vm.expectRevert(bytes("factory.tierRegistry mismatch"));
         harness.exposed_validate(decoy, address(harness), address(multisig), address(wood));
+    }
+
+    // ── The SHE-239 fee router as the protocol recipient ──
+
+    function _seatRouter(address router) internal {
+        vm.prank(address(harness));
+        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(router);
+    }
+
+    /// @notice A seated router at its salt passes, before and after the deferred handoff.
+    function test_validate_acceptsTheSeatedFeeRouter() public {
+        vm.prank(address(harness));
+        address router = harness.exposed_mintFeeRouter(address(multisig));
+        _seatRouter(router);
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
+
+        _handoffCoreRoles();
+        harness.exposed_validate(d, address(harness), address(multisig), address(wood));
+    }
+
+    /// @notice Any other contract seated as the protocol recipient still fails the deployer check.
+    function test_validate_refusesARouterOffTheSalt() public {
+        _seatRouter(address(new ProtocolFeeRouter(address(multisig))));
+        vm.expectRevert(bytes("protocolConfig.protocolFeeRecipient mismatch"));
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
+    }
+
+    /// @notice Foreign code at the router salt is refused.
+    function test_validate_refusesForeignCodeAtTheRouterSalt() public {
+        address at = harness.exposed_feeRouterAddress(address(harness));
+        vm.etch(at, address(wood).code);
+        _seatRouter(at);
+        vm.expectRevert(bytes("fee router: code is not the pinned router"));
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
+    }
+
+    /// @notice A router owned by the deployer key is refused: that is the team wallet SHE-239 removes.
+    function test_validate_refusesADeployerOwnedRouter() public {
+        vm.prank(address(harness));
+        address router = harness.exposed_mintFeeRouter(address(harness));
+        _seatRouter(router);
+        vm.expectRevert(bytes("fee router: owner must be a contract other than the deployer"));
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
+    }
+
+    /// @notice A router owned by an EOA other than the deployer is refused: the owner must be a contract.
+    function test_validate_refusesAnEoaOwnedRouter() public {
+        vm.prank(address(harness));
+        address router = harness.exposed_mintFeeRouter(makeAddr("someone's wallet"));
+        _seatRouter(router);
+        vm.expectRevert(bytes("fee router: owner must be a contract other than the deployer"));
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
     }
 
     /// @notice The six core-role transfers `DeployAll._handoffAll` makes, replayed locally.

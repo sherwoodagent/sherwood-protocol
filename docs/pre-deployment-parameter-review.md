@@ -289,9 +289,9 @@ commit; re-derive them if it moves. Values not listed here are read from
 |---|---|---|---|
 | `ROBINHOOD_MAX_CODE_SIZE` | `:9` | 98,304 | CL template size gate |
 | `MANAGEMENT_FEE_BPS` | `:18` | 200 | `deployCore` → factory, stamped per vault |
-| `MIN_VOTING_PERIOD` | `:22` | 1h | governor impl immutable; the per-vault floor (SHE-234), not the operating value |
+| `MIN_VOTING_PERIOD` | `:22` | 30 min | governor impl immutable; the per-vault floor (SHE-234), not the operating value. Lowered from 1h on 2026-10-14 (`LowerTimingFloors`) |
 | `MIN_COOLDOWN_PERIOD` | `:20` | 1h | governor impl immutable |
-| `MIN_REVIEW_PERIOD` | `:21` | 6h | governor impl immutable |
+| `MIN_REVIEW_PERIOD` | `:21` | 30 min | registry impl immutable. Lowered from 6h on 2026-10-14 (`LowerTimingFloors`) |
 | `MAX_STRATEGY_DURATION` | `:22` | 30d | `ProtocolConfig.setMaxStrategyDuration`, seated only when zero |
 | `REVIEW_PERIOD` | `:25` | 24h | `GuardianRegistry.initialize` |
 | `BLOCK_QUORUM_BPS` | `:26` | 3000 | `GuardianRegistry.initialize` |
@@ -300,7 +300,7 @@ commit; re-derive them if it moves. Values not listed here are read from
 | `MIN_SLASH_BPS` / `MAX_SLASH_BPS` | `:32`, `:33` | 1000 / 10,000 | `StakedWood.initialize`; Plan B pre-flight requires the 10,000 ceiling |
 | `AGE_FLOOR_BPS` | `:34` | 2500 | `StakedWood.initialize` |
 | `MATURATION` | `:35` | 30d | `StakedWood.initialize` |
-| `EPOCH_LENGTH` | `:38` | 28d | `ExposureLedger` constructor, immutable |
+| `EPOCH_LENGTH` | `:38` | 7d (28d before SHE-356) | `ExposureLedger` constructor, immutable |
 | `EXPECTED_CHALLENGE_WINDOW` | `:39` | 14d | Plan B / Plan D drift guard |
 | `WOOD_HAIRCUT_BPS` | `:41` | 5000 | `setWoodHaircutBps`; sits ON the ledger's `MIN_WOOD_HAIRCUT_BPS` floor |
 | `TWAP_WINDOW` | `:44` | 24h | `WoodPoolFeed` constructor |
@@ -309,6 +309,11 @@ commit; re-derive them if it moves. Values not listed here are read from
 | `MAX_PAIR_IDLE` | `:47` | 5 min | feed pre-flight: a pair idle past this never snapshots |
 | `KEEPER_CADENCE_SLACK` | `:48` | 2h | feeds `WOOD_FEED_MAX_DELAY` |
 | `WOOD_FEED_MAX_DELAY` | `:50` | window + 2h + 1 | `ledger.setWoodFeed` |
+| `WOOD_TWAP_WINDOW` | SHE-398 | 1h | `WoodV3TwapFeed` constructor |
+| `WOOD_TWAP_RING` | SHE-398 | 3,660 | pool ring target (`window + 1` is the floor the feed enforces) |
+| `WOOD_TWAP_RING_GROW_PER_TX` | SHE-398 | 1,000 | slots per `growRing` call; 4663 caps a transaction at 32M gas |
+| `WOOD_TWAP_FEED_MAX_DELAY` | SHE-398 | 1h | `ledger.setWoodFeed` at the swap; inert, the feed's `updatedAt` is the read time |
+| `MAX_FEED_SPOT_DEVIATION_BPS` | SHE-398 | 1,000 | the swap refuses while the TWAP and V2 spot differ by more |
 
 ### The three still marked `PLACEHOLDER — Ana to confirm`
 
@@ -336,10 +341,10 @@ cohort is willing to underwrite in a single approval — not a derivation. Owner
 with no bounds and read live on every propose, so it is a starting point: lowering it
 after launch is one Safe transaction and takes effect on the next proposal.
 
-**`CAP_OVER_SPOT_BPS` (`15_000` = 1.5x).** No WOOD price is committed. BOTH postures
+**`CAP_OVER_SPOT_BPS` (`20_000` = 2x; 4x until SHE-398).** No WOOD price is committed. The SHE-398 swap re-seats the cap at this multiple of the new feed's TWAP. BOTH postures
 DERIVE the cap at deploy time as `spot * CAP_OVER_SPOT_BPS / 10_000` from the live
 WOOD/WETH pair and the ETH/USD feed, and the ceremony still refuses anything outside
-`[1.25x, 2x]` of that same spot. The cap is the manipulation ceiling: `min(market,
+`[1.25x, 4x]` of that same spot. The cap is the manipulation ceiling: `min(market,
 cap)`, never served as a price, and it SHALL sit ABOVE market.
 
 - Committing a measured price is the shape this replaces, and it does not survive
