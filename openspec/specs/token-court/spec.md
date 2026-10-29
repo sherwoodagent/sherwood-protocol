@@ -25,6 +25,11 @@ The court SHALL hold no WOOD at any point in any case lifecycle: no bonds, no co
 
 On success the court SHALL create a 1-indexed case in phase `Voting`, pin into it the referring `game` address, `snapshotTs`, `referredAt = block.timestamp`, `voteWindowAtReferral` (the live `voteWindow` at referral), and `Case.ledger` (the exposure ledger read from `IChallengeGameLedger(game).exposureLedger()` — resolved exactly once, at `refer`), record the accused set using that same resolved `Case.ledger` (single read, no second live resolution within the call), and emit `CaseReferred` carrying `snapshotTs`. The court SHALL claim `caseOfChallenge` before any external read of challenge state.
 
+The same referral SHALL also pin the two parties that `vote` bars besides the accused set:
+
+- `Case.challenger`, the challenge's `challenger`, taken from the same `challengeOf` read;
+- `Case.proposer`, read once from the challenge's pinned `proposerBondEscrow` with `bondOf(governor, proposalId)`. It is set only when that escrow is non-zero, the call succeeds and returns exactly 64 bytes, and the bonded amount is non-zero. Otherwise it stays zero. The read is best-effort: an escrow that reverts or has no code leaves `proposer` zero and does not block the referral. A zero `proposer` bars no one, since `address(0)` cannot originate a call.
+
 Because `Case.ledger` is a snapshot taken at `refer` and not at `file`, an owner re-point of the game's exposure ledger strictly between `file` and `refer` still produces an empty accused set — this residual gap is owner-only, recoverable by re-pointing back before `refer`, and is documented in natspec on `refer`/`_recordAccused` as an accepted follow-up (closing it fully would require an at-`file` pin inside `ChallengeGame` or a live-challenge guard on `setExposureLedger`, out of scope here).
 
 #### Scenario: Ledger pinned at refer
@@ -100,6 +105,9 @@ At referral the court SHALL record the accused set as `Case.ledger`'s covering a
 - `block.timestamp < referredAt + voteWindowAtReferral` (else `WindowClosed`);
 - the caller has not already voted on this case (else `AlreadyVoted`) — one vote per address, no vote changes;
 - the caller is not in the case's accused set (else `AccusedCannotVote`);
+- the caller is not the case's pinned `challenger` (else `ChallengerCannotVote`). The challenger's own payout turns on the verdict, so it cannot vote on its own filing;
+- the caller is not the case's pinned `proposer` (else `ProposerCannotVote`). A `Guilty` verdict forfeits the proposer's bond and every other verdict returns it. When the proposal locked no bond, `proposer` is zero and this bar matches no caller;
+- the caller holds no counter-bond contribution on the case's challenge, read from the pinned game as `counterBondContributionOf(challengeId, caller)` (else `CounterBondContributorCannotVote`). The funders are the party a `NotGuilty` verdict pays. The read fails closed: a call that reverts, or returns anything other than exactly 32 bytes, also refuses the ballot;
 - the caller's ballot weight (defined below) is non-zero (else `NoVotingPower`);
 - the caller's present voting power `getVotes(caller)` is non-zero (else `NoPresentHoldings`) — the present-holdings gate.
 
@@ -120,7 +128,7 @@ The lookback distance SHALL be the same `FLOOR_LOOKBACK` constant the participat
 
 #### Scenario: Valid vote inside the window
 
-- **WHEN** an unaccused address with non-zero ballot weight and non-zero present holdings votes during the open window
+- **WHEN** an address that is not accused, not the challenger, not the bonded proposer and holds no counter-bond contribution, with non-zero ballot weight and non-zero present holdings, votes during the open window
 - **THEN** its weight is added to the chosen tally, its ruling is recorded, and `VoteCast` is emitted with that weight
 
 #### Scenario: Steady staker is bit-identical to today at every age
@@ -162,6 +170,33 @@ The lookback distance SHALL be the same `FLOOR_LOOKBACK` constant the participat
 
 - **WHEN** an address in the case's accused set calls `vote`
 - **THEN** the call reverts `AccusedCannotVote`
+
+#### Scenario: Challenger barred from its own filing
+
+- **WHEN** the case's pinned `challenger` calls `vote`, with either value
+- **THEN** the call reverts `ChallengerCannotVote`
+
+#### Scenario: Bonded proposer barred
+
+- **GIVEN** a case whose challenged proposal locked a non-zero proposer bond, so `refer` pinned its proposer
+- **WHEN** that proposer calls `vote`, with either value
+- **THEN** the call reverts `ProposerCannotVote`
+
+#### Scenario: Unbonded proposer is not barred
+
+- **GIVEN** a case whose challenged proposal locked no proposer bond, so `Case.proposer` is zero
+- **WHEN** the proposal's proposer calls `vote` with non-zero ballot weight and non-zero present holdings
+- **THEN** the proposer bar does not apply, because no verdict moves a bond it never locked
+
+#### Scenario: Counter-bond contributor barred
+
+- **WHEN** an address whose `counterBondContributionOf(challengeId, caller)` on the case's pinned game is non-zero calls `vote`
+- **THEN** the call reverts `CounterBondContributorCannotVote`
+
+#### Scenario: Counter-bond read fails closed
+
+- **WHEN** the pinned game's `counterBondContributionOf` call reverts or returns anything other than exactly 32 bytes
+- **THEN** `vote` reverts `CounterBondContributorCannotVote` for every caller
 
 #### Scenario: Second vote refused
 

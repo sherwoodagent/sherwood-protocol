@@ -24,7 +24,7 @@ compilation. Full protocol docs: **https://docs.sherwood.sh/**
 | `src/ProtocolConfig.sol` | Plain `Ownable2Step`. Protocol-wide settlement config shared by all per-vault governors; read once at propose time and snapshotted into the proposal. Holds the two fee recipients (protocol, guardian network), the protocol-wide `maxStrategyDuration` clamp, and the two splits of the two-number model — `mgmtSplit` (agent/protocol/guardian) and `perfSplit` (agent/protocol/guardian/owner), each required to sum to 10 000 bps and seeded at construction with the launch values (60/20/20 and 50/15/25/10). It sets **no fee rates** — those live on the vault and the per-vault governor. Not upgradeable: replacement is a fresh deploy plus the factory's `setProtocolConfig`, which snapshotting makes safe for in-flight proposals, and which reaches only governors created afterwards (no factory path re-points a live governor's config). |
 | `src/FeeConstants.sol` | Single source of truth for the protocol-wide fee ceilings and the bps denominator: `MAX_PERFORMANCE_FEE_BPS` (25%, the outer bound governance can ever reach), `DEFAULT_MAX_PERFORMANCE_FEE_BPS` (20%, the per-vault cap a new vault starts with), `DEFAULT_AGENT_FEE_BPS` (20%). |
 | `src/GuardianRegistry.sol` | UUPS. Guardian review / emergency-review lifecycle and the slash-appeal reserve. Holds no guardian stake — reads vote weight from sWOOD and calls sWOOD to slash; its only WOOD is the owner-funded slash-appeal reserve. Computes the deterministic slash severity (`_severityBps`, not voted). `reviewPeriod` is governance-set between a per-deployment immutable floor (`minReviewPeriod`, 30 min on mainnet) and a 3-day ceiling. |
-| `src/StakedWood.sol` | UUPS. Sole WOOD custodian for the guardian layer: guardian stake, owner bonds, checkpointed age-weighted vote weight, slashing + burn. Non-transferable vote-escrow — no ERC-20 transfer surface. (DPoS delegation removed/postponed 2026-07-26.) |
+| `src/StakedWood.sol` | UUPS. Sole WOOD custodian for the guardian layer: guardian stake, owner bonds, checkpointed age-weighted vote weight, slashing + burn. Non-transferable vote-escrow — no ERC-20 transfer surface. (DPoS delegation deferred to v2 on 2026-07-26 and removed from the code on 2026-07-27, #29.) |
 | `src/SyndicateFactory.sol` | UUPS. Deploys each vault as an ERC-1967 proxy in one tx, plus a per-vault governor (`BeaconProxy` off the shared `beacon`), records its subdomain in the factory's `subdomainToSyndicate` map (the Durin ENS registrar is retired) and its withdrawal queue, and binds the owner stake. The vault is UUPS, upgradeable only by its creator through `upgradeVault` and only while the factory owner has set `upgradesEnabled` (false on 4663). Exposes `governorOf(vault)`. Holds the protocol-wide `managementFeeBps` (hard cap `MAX_MANAGEMENT_FEE_BPS = 300`, i.e. 3%) that each new vault is seeded with. The guardian registry is set once at init; `setBeacon` and `setProtocolConfig` re-point only what governors created afterwards use. A protocol-wide governor upgrade is one `beacon.upgradeTo(newImpl)`. |
 | `src/BatchExecutorLib.sol` | Stateless batch executor. Vaults delegatecall it to run protocol calls as themselves. The vault pins the executor codehash at init (re-pinned only by the factory's `pushExecutor`) and reverts on drift. |
 | `src/StrategyFactory.sol` | Atomic clone + initialize for strategy templates — closes the front-run window on separate `clone` / `initialize` txs. Templates gated by an owner allowlist; cloning is permissionless, and the named proposer must be the caller. |
@@ -46,7 +46,7 @@ Design paper: [`docs/papers/guardian-network-economic-security.md`](docs/papers/
 
 | Contract | Description |
 |----------|-------------|
-| `src/pricing/WoodV3TwapFeed.sol`, `src/pricing/WoodPoolFeed.sol` | WOOD/USD sources on the `AggregatorV3` surface (8 decimals) for `ExposureLedger.woodPriceX8`; the booked `WOOD_USD_FEED` (`WoodPoolFeed`) is retired. `PriceRouter` and Lane A are gone on this line (issue #54): no vault prices a live strategy's positions, so there are no oracle-instant entries or exits. |
+| `src/pricing/WoodV3TwapFeed.sol`, `src/pricing/WoodPoolFeed.sol` | WOOD/USD sources on the `AggregatorV3` surface (8 decimals) for `ExposureLedger.woodPriceX8`. On 4663 the ledger reads `WoodV3TwapFeed` (`WOOD_USD_TWAP_FEED`, `maxDelay` 1h); the booked `WOOD_USD_FEED` (`WoodPoolFeed`) is retired and its `latestRoundData()` reverts `PriceUnavailable`. `PriceRouter` and Lane A are gone on this line (issue #54): no vault prices a live strategy's positions, so there are no oracle-instant entries or exits. |
 | `src/queue/VaultWithdrawalQueue.sol` | Per-vault async request queue. Escrows redeem shares / deposit assets while a proposal is open. At settlement the vault stamps one frozen price per proposal and every redeem tagged to it claims at that price; a deposit claims at the live price once no proposal is open. A redeem tagged to a proposal that ends without settling is never stamped and can only be cancelled. |
 
 ### Strategy templates (`src/strategies/`)
@@ -170,11 +170,14 @@ forge test --no-match-path "test/integration/**"
 
 forge test                 # everything, including fork tests (needs RPC endpoints)
 forge fmt                  # format (CI runs forge fmt --check)
-forge build --sizes        # runtime bytecode sizes (some contracts sit near the EIP-170 limit)
+forge build --sizes        # runtime bytecode sizes (exits non-zero on EIP-170's 24,576 B; 4663 allows 98,304 B, which CI enforces)
 ```
 
 `via_ir = true` in `foundry.toml` makes compilation ~2× slower than the legacy
-pipeline — it is required to fit the governor under the bytecode limit.
+pipeline. It is required because the legacy pipeline does not compile `src/` at all
+(`FOUNDRY_VIA_IR=false forge build --skip test --skip script` stops at "Stack too
+deep"). Size is not what binds: under `via_ir` the largest deployable contract,
+`SyndicateGovernor`, is 37,012 B of runtime code against Robinhood Chain's 98,304 B.
 
 ## Deployment
 

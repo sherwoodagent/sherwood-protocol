@@ -325,3 +325,50 @@ Recorded so a future contributor does not "fix" these into properties:
   `openspec/specs/epoch-nav/spec.md` still describes a `PriceRouter` NAV mechanism
   that `SyndicateFactory` marks `__deprecated_priceRouter`. Spec/code drift, not a
   fuzzable property.
+
+## Natspec drift, fix at next deploy
+
+Natspec on contracts deployed to chain 4663 from `v1-deploy` that disagrees with
+the code under it. Each line is left as deployed on this branch and should be
+corrected in the source of the next deployment. The markdown that repeated these
+claims was corrected in #401, #403 and SHE-468. None of this is a fuzzable
+property; it is listed here so the next deploy picks it up.
+
+The comments do not reach the bytecode: `foundry.toml` sets `cbor_metadata = false`
+and `bytecode_hash = "none"`, and the deployed runtime code read for this note
+(`TokenCourt`, `ExposureLedger`, and the `SyndicateFactory` and `GuardianRegistry`
+implementations) carries no CBOR metadata trailer.
+
+- **`src/SyndicateFactory.sol:24`** says the factory "Deploys new syndicate vaults
+  as immutable ERC-1967 proxies". The vault is UUPS: `_authorizeUpgrade` admits only
+  the factory (`SyndicateVault.sol:1160-1162`), and the factory upgrades a vault for
+  its creator through `upgradeVault` while `upgradesEnabled` is true
+  (`SyndicateFactory.sol:682-700`, setter `:477`). On 4663 `upgradesEnabled()` is
+  false, so no vault can be upgraded today, but the owner can turn it on. (SHE-468)
+- **`src/GuardianRegistry.sol:25`** says the registry "Holds zero assets". It
+  custodies the slash-appeal reserve: `fundSlashAppealReserve` pulls WOOD in
+  (`GuardianRegistry.sol:1065-1067`) and `refundSlash` pays it out (`:1074-1084`).
+  On 4663 the reserve is unfunded (`slashAppealReserve()` = 0 and a WOOD balance of
+  0 at block 101208138), so the line is true of today's balance, not of the
+  contract. (SHE-468)
+- **`src/ExposureLedger.sol:210-211`** says that on chain 4663 the WOOD feed "is a
+  `WoodPoolFeed`". Since the SHE-398 swap the ledger reads `WoodV3TwapFeed`:
+  `_woodFeed` (slot 7, no getter) holds `WOOD_USD_TWAP_FEED` with `maxDelay` 3600 at
+  block 101208643. (SHE-468)
+- **`src/SyndicateVault.sol:80`** gives the agent performance-fee cap as 30%. The
+  constant is 2,500 bps, 25% (`FeeConstants.sol:20`). (#401)
+- **`src/ExposureLedger.sol:1335`** says "`recordApproval` needs no WOOD price".
+  `recordApproval` reads `woodPriceX8()` (`ExposureLedger.sol:775`). (#401)
+- **`src/interfaces/IChallengeGame.sol:46-47`** says `Inconclusive` is "reachable
+  only from `Disputed`". `resolve` also unwinds a `Filed` challenge past its
+  dispute timeout to `Inconclusive` (`ChallengeGame.sol:998-1000`). (#401)
+- **`src/ChallengeGame.sol:368-369`** says that on the escalated path "the
+  challenger already takes bond plus the forfeited pool". The challenger takes its
+  bond less `settleBurnBps` (`ChallengeGame.sol:1132-1137`) and a completed pool is
+  burned (`:1138-1139`, `:1154`). (#401)
+- **`src/TokenCourt.sol:273-274`** says "a `Guilty` verdict pays the challenger the
+  accused's bond", and **`src/interfaces/ITokenCourt.sol:169-170`** says it "pays
+  it the accused's bond plus the escalated pool". The accused's lock is burned
+  (`slashVerdict` takes no recipient, `ChallengeGame.sol:1095`; `StakedWood.sol:1297`),
+  and the challenger's take is as in the previous item. The bar the comments
+  justify is correct. (#401; the `ITokenCourt` line is added by SHE-468)
