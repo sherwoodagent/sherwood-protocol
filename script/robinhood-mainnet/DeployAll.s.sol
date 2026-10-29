@@ -131,7 +131,7 @@ contract DeployAll is
 
         if (i.posture == Posture.Mainnet) {
             // DERIVED from the live pool, like the fork's: a committed constant is only inside
-            // the [1.25x, 2x] band on the day it was measured, and the band moves with the price.
+            // the [1.25x, 4x] band on the day it was measured, and the band moves with the price.
             Params memory fp = _feedParams(i);
             uint256 spotX8 = _spotWoodUsdX8(fp, fp.uniPair);
             s.woodPriceCapX8 = (spotX8 * RobinhoodParams.CAP_OVER_SPOT_BPS) / 10_000;
@@ -155,6 +155,10 @@ contract DeployAll is
 
         (s.exposureLedger, s.proposerBondEscrow) = deploy(_planBBook(s, i));
         s.challengeGame = deploy(_planDBook(s, i));
+        // Beta posture (SHE-352, audit 2026-10-08 D-1/D-2): no challenge may be filed until the fleet's
+        // juror reserve is 30 days old. Gates `file` only; the owner lifts it with setFilingsPaused(false).
+        ChallengeGame game = ChallengeGame(s.challengeGame);
+        if (!game.filingsPaused()) game.setFilingsPaused(true);
 
         _requireNoPredictionDrift(c3, s, i.posture);
 
@@ -299,8 +303,9 @@ contract DeployAll is
         console.log("RUNBOOK: ExposureLedger AND ChallengeGame.");
         // BOTH FEE LEGS PAY THE DEPLOYER KEY until the Safe re-points them: a zero recipient
         // is worse (it folds the leg into the agent's remainder silently), so they are seeded.
-        console.log("RUNBOOK: then, from the Safe, setProtocolFeeRecipient(treasury) and");
-        console.log("RUNBOOK: setGuardiansFeeRecipient(guardian payout address).");
+        // The protocol leg goes to ProtocolFeeRouter (SHE-239), seated right after run 2, before any proposal.
+        console.log("RUNBOOK: protocol leg -> PROTOCOL_FEE_ROUTER (DeployProtocolFeeRouter), before any proposal;");
+        console.log("RUNBOOK: then, from the Safe, setGuardiansFeeRecipient(guardian payout address).");
         // NOT handed off: `Create3Factory.deploy` is `onlyOwner`, so the deployer key keeps the
         // right to mint at any UNUSED salt in this namespace. Used salts already hold code.
         console.log("RUNBOOK: the deployer key KEEPS Create3Factory ownership: %s", s.create3Factory);
@@ -326,6 +331,7 @@ contract DeployAll is
     /// @dev Posture from the chain id alone: 4663 is Mainnet, any other chain with a
     ///      committed book carrying DEPLOYER is a Fork. Who ends up owning the protocol is a
     ///      POSTURE, never a flag: the Safe on Mainnet, the deployer itself on a fork or vnet.
+    ///      A Mainnet book whose OWNER_MULTISIG is its DEPLOYER defers the handoff to a later run.
     function _readInputs() internal view returns (Inputs memory i) {
         require(_fileExists(_chainsPath()), "wrong chain: no chains/<chainid>.json for this chain");
         i.posture = block.chainid == RobinhoodParams.MAINNET_CHAIN_ID ? Posture.Mainnet : Posture.Fork;
@@ -421,7 +427,8 @@ contract DeployAll is
     ///      load-bearing half: the canonical Uniswap mainnet addresses each hold unrelated
     ///      code on 4663, so a code-length check passes and wires the wrong contract.
     function _preflight(Inputs memory i) internal view {
-        if (i.posture == Posture.Mainnet) {
+        // A book naming the DEPLOYER as owner defers the handoff: the deployer keeps every role.
+        if (i.posture == Posture.Mainnet && i.ownerMultisig != i.deployer) {
             require(i.ownerMultisig.code.length != 0, "OWNER_MULTISIG must be a contract (Safe), not an EOA");
         }
         require(CREATE2_DEPLOYER.code.length != 0, "CREATE2 deployer not on this chain");
@@ -449,7 +456,7 @@ contract DeployAll is
     ///      a correct run AFTER the broadcast, with the transactions already sent.
     function _validateAll(Stack memory s, Inputs memory i, Checkpoint cp) internal view {
         address deployer = s.core.deployer;
-        bool handedOff = cp == Checkpoint.Complete && i.posture == Posture.Mainnet;
+        bool handedOff = cp == Checkpoint.Complete && i.posture == Posture.Mainnet && i.ownerMultisig != i.deployer;
         address finalOwner = handedOff ? i.ownerMultisig : deployer;
 
         // Creation stays closed (sentinel registry, no syndicates) until run 2's last step.
@@ -487,6 +494,7 @@ contract DeployAll is
 
         _postflight(_planBBook(s, i), ExposureLedger(s.exposureLedger));
         _postflight(_planDBook(s, i), ChallengeGame(s.challengeGame));
+        require(ChallengeGame(s.challengeGame).filingsPaused(), "game.filingsPaused");
 
         // Plan B pre-flight 10 in its new home. The ledger's owner is the slashing and
         // freeze authority; on Mainnet it must end up at a CONTRACT (the Safe), and a

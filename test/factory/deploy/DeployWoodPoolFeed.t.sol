@@ -298,7 +298,7 @@ contract DeployWoodPoolFeedTest is Test {
     }
 
     /// @notice The cap the ledger bounds the governance WOOD price with is refused
-    ///         outside [1.25x, 2x] of spot, in either direction.
+    ///         outside [1.25x, 4x] of spot, in either direction.
     function test_preflight_capMustSitBetween125And200PercentOfSpot() public {
         uint256 spot = script.exposed_spotWoodUsdX8(_params(), address(uniPair));
         assertApproxEqRel(spot, EXPECTED_WOOD_USD_X8, 0.01e18, "the spot the band is measured against");
@@ -306,8 +306,8 @@ contract DeployWoodPoolFeedTest is Test {
         vm.expectRevert(bytes("PRE-FLIGHT: WOOD_PRICE_CAP_X8 is below 1.25x spot"));
         script.exposed_requireCapAboveSpot((spot * 125) / 100 - 1, spot);
 
-        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 2x spot"));
-        script.exposed_requireCapAboveSpot(spot * 2 + 1, spot);
+        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 4x spot"));
+        script.exposed_requireCapAboveSpot(spot * 4 + 1, spot);
 
         vm.expectRevert(bytes("PRE-FLIGHT: WOOD spot is zero"));
         script.exposed_requireCapAboveSpot(spot, 0);

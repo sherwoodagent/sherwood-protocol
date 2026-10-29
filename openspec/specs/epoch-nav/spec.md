@@ -7,7 +7,7 @@ Defines how `ExposureLedger` prices value for coverage: the WOOD/USD price (the 
 ## Requirements
 ### Requirement: Coverage epochs are a fixed wall-clock schedule
 
-The `ExposureLedger` SHALL derive coverage epochs from an immutable schedule: `epochLength` is set at construction (non-zero; 28 days on the Robinhood deployment), `epochGenesis` is the deployment timestamp, and `currentEpoch() = (block.timestamp - epochGenesis) / epochLength`. Each guardian lock SHALL be booked into the epoch containing the proposal's `executeBy + strategyDuration` (at most `MAX_COVERAGE_HORIZON`, 60 days, ahead) and SHALL count toward open exposure until that epoch's end plus the challenge window. The bucket accounting itself is specified by the guardian-coverage capability ("Epoch-bucketed exposure accounting").
+The `ExposureLedger` SHALL derive coverage epochs from an immutable schedule: `epochLength` is set at construction (non-zero; 7 days on the Robinhood deployment per SHE-356, 28 days in design §5), `epochGenesis` is the deployment timestamp, and `currentEpoch() = (block.timestamp - epochGenesis) / epochLength`. Each guardian lock SHALL be booked into the epoch containing the proposal's `executeBy + strategyDuration` (at most `MAX_COVERAGE_HORIZON`, 60 days, ahead) and SHALL count toward open exposure until that epoch's end plus the challenge window. The bucket accounting itself is specified by the guardian-coverage capability ("Epoch-bucketed exposure accounting").
 
 #### Scenario: Epoch index advances on wall clock
 

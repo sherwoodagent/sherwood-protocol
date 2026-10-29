@@ -47,12 +47,12 @@ flowchart TD
     P6 -. stampSettlement .-> QW2
     QW2 --> E3["claim: shares burned,\nassets paid at frozen\npost-fee settle price"]
     E3 --> OUT
-    E2 -. before settlement .-> E0[cancel: shares returned]
+    E2 -. until its pid is stamped .-> E0[cancel: shares returned]
 ```
 
 ## Instant path
 
-**Deposit** (`_deposit`, `src/SyndicateVault.sol:1334`):
+**Deposit** (`_deposit`, `src/SyndicateVault.sol:792`):
 
 - Gate 1 — whitelist: `receiver` must be approved unless the vault is in
   open-deposit mode (`_openDeposits`). Owner manages via `approveDepositor(s)` /
@@ -63,7 +63,7 @@ flowchart TD
   high-water mark; shares auto-delegate to the receiver so depositors get voting
   power without a separate transaction.
 
-**Withdraw** (`_withdraw`, `src/SyndicateVault.sol:1356`):
+**Withdraw** (`_withdraw`, `src/SyndicateVault.sol:815`):
 
 - Instant against idle float only — `assets + reservedQueueAssets() ≤ float`
   (`QueueReserveBreached` otherwise). The float owed to already-settled,
@@ -77,12 +77,12 @@ flowchart TD
 From `propose` until the proposal settles or ends (`openProposalCount() != 0`,
 Draft included):
 
-- `deposit`/`mint` revert `DepositsLocked` (`src/SyndicateVault.sol:1340`).
+- `deposit`/`mint` revert `DepositsLocked` (`src/SyndicateVault.sol:798`).
 - `maxWithdraw`/`maxRedeem` return 0; `withdraw`/`redeem` are closed.
 
 Both lanes run through the per-vault `VaultWithdrawalQueue`:
 
-### Async deposit (`requestDeposit`, `src/SyndicateVault.sol:1462`)
+### Async deposit (`requestDeposit`, `src/SyndicateVault.sol:909`)
 
 1. Only callable while a proposal is open (`NoOpenProposal` guard) and only for
    approved receivers. Zero assets rejected.
@@ -92,7 +92,7 @@ Both lanes run through the per-vault `VaultWithdrawalQueue`:
 3. The request is tagged with the executing proposal id, else the latest. Request
    id is always > 0.
 
-### Async redeem (`requestRedeem`, `src/SyndicateVault.sol:1426`)
+### Async redeem (`requestRedeem`, `src/SyndicateVault.sol:882`)
 
 1. Only callable while a proposal is open (`RedemptionsNotLocked` guard).
 2. Shares transfer from the LP into the queue (escrow, not burn).
@@ -102,7 +102,7 @@ Both lanes run through the per-vault `VaultWithdrawalQueue`:
 
 At `settleProposal`, after both fees are charged and the high-water mark ratchets,
 the governor calls `onProposalSettled` → `queue.stampSettlement(pid, num, den)`
-(`src/SyndicateVault.sol:1527`). `num/den` carry the vault's ERC-4626 virtual
+(`src/SyndicateVault.sol:991`). `num/den` carry the vault's ERC-4626 virtual
 offsets, so the queue reproduces the vault's rounding exactly. Every redeem request
 tagged to that proposal claims at this **single frozen post-fee price** — no ordering
 games, no price drift between claimants. Deposit requests do not use the stamp.
@@ -116,7 +116,7 @@ games, no price drift between claimants. Deposit requests do not use the stamp.
   while the vault is paused, and for a receiver that no longer passes the depositor
   whitelist rule; the receiver can `cancel` the request instead.
 - **Redeem claim:** vault burns the escrowed shares and pays assets to the owner at
-  the frozen price (`settleRedeem`, `src/SyndicateVault.sol:1504`). The payout float
+  the frozen price (`settleRedeem`, `src/SyndicateVault.sol:951`). The payout float
   is protected by `reservedQueueAssets()` — instant withdrawals, fee transfers, and
   strategy batches all subtract it first.
 
@@ -126,6 +126,18 @@ games, no price drift between claimants. Deposit requests do not use the stamp.
 the owner (`VaultWithdrawalQueue.cancel`, `src/queue/VaultWithdrawalQueue.sol:243`), also while the vault is paused.
 A redeem cancels only until its proposal is stamped; its payout is then fixed. A
 deposit cancels at any time until it is claimed, including after settlement.
+
+**A redeem tagged to a proposal that never settles has to be cancelled.** Only
+settlement stamps a price (`_finishSettlement` → `onProposalSettled` →
+`stampSettlement`, `src/SyndicateGovernor.sol:1547`). A redeem requested while its
+proposal was Draft, Pending, in guardian review or Approved, where the proposal
+then ends Cancelled, Rejected or Expired, is tagged to a pid nothing ever stamps:
+its `claim` reverts `NotSettled` for good (`VaultWithdrawalQueue.sol:198`), also
+after later proposals settle. `cancel` still works and is the only exit. Cancel
+before the vault's next `propose`: until then the escrowed shares are still in
+supply, so they carry the next proposal's P&L, and they sit with the queue at that
+proposal's snapshot, so they give the LP no veto weight on it (audit 2026-10-08,
+B-1).
 
 ## Why this design
 

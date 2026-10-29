@@ -19,12 +19,14 @@ library RobinhoodParams {
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
     // Invite-only window: 1M WOOD (~$5.9k) per unsponsored fund, so sponsorship is the way in.
     uint256 internal constant INVITE_ONLY_CREATION_FEE = 1_000_000e18;
-    // Governor-impl IMMUTABLE, so this deploy is the only chance to set it. Held at the
-    // per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod` itself;
-    // the operating value is the factory's 24h default, which owners may now lower.
-    uint256 internal constant MIN_VOTING_PERIOD = 1 hours;
+    // Governor-impl IMMUTABLE: changing it is a new impl behind the beacon (`LowerTimingFloors`).
+    // Held at the per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod`
+    // itself; the operating value is the factory's 24h default, which owners may lower.
+    // 30 min (2026-10-14): the fleet is autonomous, and the veto is bounded by coverage.
+    uint256 internal constant MIN_VOTING_PERIOD = 30 minutes;
     uint256 internal constant MIN_COOLDOWN_PERIOD = 1 hours;
-    uint256 internal constant MIN_REVIEW_PERIOD = 6 hours;
+    // Registry-impl IMMUTABLE; same upgrade path. Operating value is `reviewPeriod` (owner-set).
+    uint256 internal constant MIN_REVIEW_PERIOD = 30 minutes;
     uint256 internal constant MAX_STRATEGY_DURATION = 30 days;
 
     // Guardian registry
@@ -41,7 +43,12 @@ library RobinhoodParams {
     uint256 internal constant MATURATION = 30 days;
 
     // ExposureLedger / ChallengeGame
-    uint256 internal constant EPOCH_LENGTH = 28 days;
+    // 7d, not 28d (SHE-356 / SHE-250, 2026-10-09): a lock is released at bucketEnd + challengeWindow,
+    // so the epoch length is the tail every lock carries past its proposal. 7d cuts the 46-74d hold of
+    // a 30-day strategy to 46-53d and a 7-day one from 23-51d to 23-30d, at the cost of capping any
+    // future `challengeWindow` at 38d ((window + 60d) / 7d + 2 <= 16 scan buckets). Constructor
+    // immutable: one shot at run 2.
+    uint256 internal constant EPOCH_LENGTH = 7 days;
     uint256 internal constant EXPECTED_CHALLENGE_WINDOW = 14 days;
     // Sits ON the ledger's MIN_WOOD_HAIRCUT_BPS floor; the two move together.
     uint256 internal constant WOOD_HAIRCUT_BPS = 5000;
@@ -70,8 +77,20 @@ library RobinhoodParams {
     uint256 internal constant COVERED_TVL_CAP_USD18 = 1_000_000e18;
     // How far above live spot the WOOD price cap is seated, bps. Both postures DERIVE the cap
     // from the pool at deploy time, so no measured price is ever committed here. Must land
-    // inside the ceremony's [1.25x, 2x] band; the Safe re-reviews the cap monthly after launch.
-    uint256 internal constant CAP_OVER_SPOT_BPS = 15_000;
+    // inside the ceremony's [1.25x, 4x] band; the owner re-reviews the cap monthly after launch.
+    // 2x (SHE-398, audit F-2): with the 50% haircut a fully pushed feed values stake at no more
+    // than its real worth. The cap is static while spot moves, so re-seat it when spot < cap / 2.5.
+    uint256 internal constant CAP_OVER_SPOT_BPS = 20_000;
+
+    // WoodV3TwapFeed (SHE-398). The ring holds one slot per second of the window plus a margin;
+    // 4663 caps a transaction at 32M gas, about 1,438 slots, so it grows 1,000 slots per call.
+    uint32 internal constant WOOD_TWAP_WINDOW = 1 hours;
+    uint16 internal constant WOOD_TWAP_RING = 3_660;
+    uint16 internal constant WOOD_TWAP_RING_GROW_PER_TX = 1_000;
+    // INERT for this feed: its `updatedAt` is the read time, so no value here can bind.
+    uint256 internal constant WOOD_TWAP_FEED_MAX_DELAY = 1 hours;
+    // The swap is refused while the feed's TWAP and the V2 pair's spot disagree by more than this.
+    uint256 internal constant MAX_FEED_SPOT_DEVIATION_BPS = 1_000;
 
     /// @notice TierRegistry launch set. Every CHAINLINK_<SYM>_USD_FEED and <SYM> (WETH for ETH) book key is
     ///         REQUIRED. A Solidity constant cannot hold an array, hence a pure accessor.

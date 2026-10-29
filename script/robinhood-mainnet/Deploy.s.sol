@@ -71,7 +71,14 @@ abstract contract DeployRobinhoodMainnet is DeploySherwood {
         // leave the guardian budget — the whole reason MANAGEMENT_FEE_BPS is
         // 200 — silently payable to the proposer.
         ProtocolConfig protocolConfig = ProtocolConfig(d.protocolConfig);
-        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), deployer);
+        // The protocol leg may already pay the SHE-239 router, seated before the first proposal; the
+        // deferred-handoff re-run must accept it, since re-pointing to the deployer leaks proposals to the EOA.
+        address protocolRecipient = protocolConfig.protocolFeeRecipient();
+        if (protocolRecipient == _protocolFeeRouterAddress(deployer)) {
+            _requireProtocolFeeRouter(protocolRecipient, deployer);
+        } else {
+            _checkAddr("protocolConfig.protocolFeeRecipient", protocolRecipient, deployer);
+        }
         _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), deployer);
 
         _checkAddr("factory.beacon", factory.beacon(), d.beacon);

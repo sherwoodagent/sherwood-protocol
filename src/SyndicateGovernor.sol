@@ -239,7 +239,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `script/syndicate-governor-layout.golden.json`.
     uint256[26] private __gap;
 
-    /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 1h, `RobinhoodParams`).
+    /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 30 min).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
     /// @dev Floors are impl-time immutables (bytecode, not storage) forwarded to
     ///      `GovernorParameters`; a testnet impl may deploy lower floors and be

@@ -32,11 +32,25 @@ direction:
   on the operator. It inspects calldata submitted by agents and vault owners. It
   provides no assurance against the operator, because the same party runs every
   reviewer.
-- **Block quorum is not the binding constraint while that holds.** The operator
-  clears `blockQuorumBps` from its own stake, so the veto's availability is an
-  uptime question rather than a governance one. What *is* binding is dilution:
-  `stakeAsGuardian` has no cap and no allowlist, so a third party parking stake
-  raises the absolute weight the cohort must clear, costing them only capital.
+- **Block quorum is not the binding constraint on the operator's own veto.** The
+  operator clears `blockQuorumBps` from its own stake, so the veto's availability
+  is an uptime question rather than a governance one. Two outside threats bind
+  instead. Both cost only capital, because `stakeAsGuardian` has no cap and no
+  allowlist:
+  - **Dilution.** Stake a third party parks before a proposal's snapshot raises
+    the absolute weight the cohort must clear to block.
+  - **A blocking bloc that burns the approvers** (audit 2026-10-08, A-2). A
+    block vote is uncapped and carries no lock, so the blocker risks nothing
+    (`GuardianRegistry.sol:599-600`). An outside bloc `X` staked before the
+    snapshot reaches the quorum once `X ≥ blockQuorumBps × (F + X)`, that is
+    `X ≥ 3F/7` against a cohort of `F` at the 30% default. It can then block any
+    proposal the cohort approved, and a blocked review slashes every approver at
+    no less than `minSlashBps` (10%) of its stake, however small its lock
+    (`:928`). Cast at the start of the late-vote lockout, the block cannot be
+    answered: an approver's switch to Block reverts `VoteChangeLockedOut`
+    (`:618-623`). The bloc needs no vault and loses nothing, so it can repeat on
+    every review the cohort approves while it stays staked.
+    [launch-notes.md](launch-notes.md) sizes it for the v1 fleet.
 - **A fleet of identically-configured daemons is not a quorum of independent
   reviewers.** They share one verdict path, so they agree by construction.
   Dissent between them comes only from differing policy — what warnings each
@@ -92,7 +106,7 @@ Timeline per proposal: `registerReview` (governor pushes the window at propose) 
 
 | Parameter | Default | Min | Max | Where |
 |---|---|---|---|---|
-| `reviewPeriod` | 24 h | 6 h (mainnet immutable floor) | 3 d | `GuardianRegistry.setReviewPeriod` |
+| `reviewPeriod` | 24 h (30 min live on 4663) | 30 min (`minReviewPeriod`, mainnet immutable floor) | 3 d, and ≤ `sWOOD.coolDownPeriod` | `GuardianRegistry.setReviewPeriod` |
 | `blockQuorumBps` | 30% | 10% | 100% | `GuardianRegistry.setBlockQuorumBps` |
 | `LATE_VOTE_LOCKOUT_BPS` | last 10% of window | const | const | `GuardianRegistry` constant |
 | `MAX_APPROVERS_PER_PROPOSAL` | 100 | const | const | `GuardianRegistry` constant — approvers only; blockers are uncapped (SHE-207) |
@@ -176,11 +190,13 @@ it. Full detail: [coverage.md](coverage.md).
 ### Declared coverage locks
 
 A guardian **declares** how much WOOD stands behind each approve. The lock is the
-declaration; there is no USD conversion on the approval path and no later pass that
-rewrites it. One number per (proposal, guardian) — `lockOf(governor, proposalId,
-guardian)` — is at once the guardian's booking, their pledge, and the base a
-conviction burns. It is written once by `recordApproval` and erased only by release
-(vote change) or retirement; a filed challenge blocks both. The adversary this shape
+declaration: it is booked in WOOD as declared (clamped to the free budget), and no
+later pass rewrites it. The approval path does price the need and the lock, but
+only to check the slot floor (see "Capacity is WOOD" below). One number per
+(proposal, guardian) — `lockOf(governor, proposalId, guardian)` — is at once the
+guardian's booking, their pledge, and the base a conviction burns. It is written
+once by `recordApproval` and erased only by release (vote change) or retirement;
+a filed challenge blocks both. The adversary this shape
 removes is anyone who could move a guardian's slash base while a challenge is live:
 with booking and pledge the same storage, no permissionless step exists that can
 shrink or grow it.
@@ -254,7 +270,7 @@ shrink or grow it.
 |---|---|---|---|---|
 | `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.setKNumerator` |
 | `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.setChallengeWindow` |
-| `epochLength` | 28 d (immutable) | — | — | ctor |
+| `epochLength` | 7 d (immutable; SHE-356) | — | — | ctor |
 | `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.MAX_COVERAGE_HORIZON` |
 | `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.setProposerBondBps` |
 | `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.setCoveredTvlCapUsd` |
@@ -297,8 +313,9 @@ Governance discipline: never certify proxied or storage-mutable adapters at tier
 
 Anyone can challenge an executed proposal during the challenge window by posting a
 bond. The window closes at `max(executedAt + strategyDuration + challengeWindow,
-challengeableUntil)` (`ChallengeGame.file`). A filing freezes the accused cohort's
-coverage and opens a guardian vote; the vote decides it.
+challengeableUntil)` (`ChallengeGame.file`). On 4663 filing is paused through the beta
+(`filingsPaused() == true`, SHE-352; see [launch-notes.md](launch-notes.md)). A filing
+freezes the accused cohort's coverage and opens a guardian vote; the vote decides it.
 
 ```
 file (bond = 1.5% of liability)

@@ -18,6 +18,9 @@ library DeploySalts {
     bytes32 internal constant VAULT_IMPL = keccak256("sherwood.robinhood.v1.vault-impl");
     bytes32 internal constant PROTOCOL_CONFIG = keccak256("sherwood.robinhood.v1.protocol-config");
     bytes32 internal constant GOVERNOR_IMPL = keccak256("sherwood.robinhood.v1.governor-impl");
+    // 30-minute timing floors (2026-10-14): the impls `LowerTimingFloors` seats behind the live proxies.
+    bytes32 internal constant GOVERNOR_IMPL_30M = keccak256("sherwood.robinhood.v1.governor-impl-30m");
+    bytes32 internal constant REGISTRY_IMPL_30M = keccak256("sherwood.robinhood.v1.guardian-registry-impl-30m");
     bytes32 internal constant GOVERNOR_BEACON = keccak256("sherwood.robinhood.v1.governor-beacon");
     bytes32 internal constant SWOOD_IMPL = keccak256("sherwood.robinhood.v1.staked-wood-impl");
     bytes32 internal constant SWOOD_PROXY = keccak256("sherwood.robinhood.v1.staked-wood-proxy");
@@ -37,9 +40,17 @@ library DeploySalts {
     // Pricing. Distinct salts so a fork book can never be mistaken for a mainnet feed.
     bytes32 internal constant WOOD_USD_FEED = keccak256("sherwood.robinhood.v1.wood-pool-feed");
     bytes32 internal constant FORK_WOOD_FEED = keccak256("sherwood.robinhood.v1.fork-wood-feed-fixture");
+    // SHE-398: the native V3 TWAP feed that replaces `WOOD_USD_FEED` at the ledger.
+    bytes32 internal constant WOOD_USD_TWAP_FEED = keccak256("sherwood.robinhood.v1.wood-v3-twap-feed");
 
     // Plan B / Plan D
     bytes32 internal constant EXPOSURE_LEDGER = keccak256("sherwood.robinhood.v1.exposure-ledger");
     bytes32 internal constant PROPOSER_BOND_ESCROW = keccak256("sherwood.robinhood.v1.proposer-bond-escrow");
     bytes32 internal constant CHALLENGE_GAME = keccak256("sherwood.robinhood.v1.challenge-game");
+    // Fees (SHE-239). Minted after run 2 by DeployProtocolFeeRouter, outside the ceremony.
+    bytes32 internal constant PROTOCOL_FEE_ROUTER = keccak256("sherwood.robinhood.v1.protocol-fee-router");
+    // keccak256(runtime code of ProtocolFeeRouter) under the pinned toolchain; asserted before the mint, and by
+    // DeployAll validation once the router is the protocol recipient. Re-record it when ProtocolFeeRouter.sol changes.
+    bytes32 internal constant PROTOCOL_FEE_ROUTER_RUNTIME_HASH =
+        0x1f7d5467ff00c0ccb398caebba5eb0120ffcee41902456cb8429a00daa4805af;
 }
