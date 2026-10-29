@@ -275,20 +275,20 @@ On Mainnet posture the ceremony SHALL mint `src/pricing/WoodPoolFeed.sol` at the
 Pre-flights, all PRE-broadcast:
 - The two named venues SHALL be DISTINCT and each SHALL hold exactly `{WOOD, WETH}`. The V2 pair's WETH reserve SHALL be at or above `MIN_WETH_RESERVE`; the V3 pool's floor is its in-range `liquidity()`, below.
 - WOOD and WETH SHALL share a decimals count. The composition multiplies a raw UQ112x112 ratio by ETH/USD with no decimals normalisation, so a mismatch prices WOOD off by orders of magnitude while every other check passes.
-- The V2 pair SHALL have traded within `MAX_PAIR_IDLE` (5 minutes). A pair that stopped trading accepts the deploy and then no-ops forever, because the cumulative read refuses to extrapolate across a long idle span. On 4663 the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production and impossible to satisfy on a fork.
+- The V2 pair SHALL have traded within `MAX_PAIR_IDLE` (5 minutes). The feed does not need the trade: `update()` calls the pair's `sync()` before it snapshots, so an untraded pair still snapshots. The guard exists because a pair nobody has traded for five minutes has no live market behind it, and its average is a number, not a price. On 4663 the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production and impossible to satisfy on a fork.
 - The ETH/USD feed answers positive and is no staler than `ETH_USD_MAX_AGE`.
 
 #### Scenario: Deploy lays a baseline but leaves the oracle unpriced
-- **WHEN** the script completes
-- **THEN** `latestObservation` is set, `consult()` still reports unavailable, and `DeployPlanB` pre-flight 8 still refuses — an operator cannot mistake the deploy for a primed oracle
+- **WHEN** the script completes a minting run
+- **THEN** its one `update()` has set `latestObservation` and `latestPoolObservation`, `latestRoundData()` still reverts `PriceUnavailable` until a second snapshot lands one `window` later, and `DeployPlanB` pre-flight 8 still refuses — an operator cannot mistake the deploy for a primed oracle
 
 #### Scenario: Idle pool refused before deploying
-- **GIVEN** the `WOOD/WETH` pair has not traded within `twapWindow / 20`
-- **THEN** the script refuses PRE-broadcast, naming that `update()` would no-op forever and that a fork/vnet pool does not trade at all
+- **GIVEN** the `WOOD/WETH` V2 pair has not traded within `MAX_PAIR_IDLE` (5 minutes)
+- **THEN** the script refuses PRE-broadcast, before anything is minted, naming that no live market stands behind the pair and that a fork/vnet pool does not trade at all (generate swaps, or wire a Chainlink-shaped WOOD feed instead)
 
 #### Scenario: Fork cannot prime the oracle
-- **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
-- **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
+- **GIVEN** a Tenderly vnet, where the pair stops trading at the fork point and its idle time grows without bound
+- **THEN** the idle pre-flight refuses `DeployWoodPoolFeed` there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
 
 ### Requirement: The WOOD feed's second leg is a Uniswap V3 pool, averaged from a stored snapshot of its tick accumulator to the live one
 
