@@ -371,8 +371,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
     /// @notice Governor push of a proposal's review-window timestamps at propose
     ///         time. The governor is the single source of the window and pushes
-    ///         it once; the registry then reads the stored fields and never
-    ///         calls back.
+    ///         it once; the registry's only read back is `getProposalState` on vote.
     /// @dev Keyed by `(msg.sender, proposalId)` so each governor owns its own
     ///      namespace. `voteEnd == 0` is the unregistered sentinel, so a zero
     ///      `voteEnd` is rejected; re-registration is rejected to keep the window
@@ -541,8 +540,9 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd`; within that window it opens a
-    ///      due-but-unopened review itself, so no keeper `openReview` is needed first. Snapshots the caller's raw
+    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd` AND the governor reporting
+    ///      GuardianReview; it then opens a due-but-unopened review itself, so no keeper `openReview` is needed
+    ///      first. Snapshots the caller's raw
     ///      stake at `r.snapshotAt` — the same instant the denominator is read
     ///      at — and adds it to the chosen side's tally. Approvers are capped
     ///      (the slash loop iterates them); Blockers are NOT — the block tally is
@@ -845,7 +845,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
     /// @dev SHE-471: a vote only lands while the governor itself reports GuardianReview, so a
     ///      vetoed, cancelled or still-Pending (`== voteEnd`) proposal cannot seat a slashable approval.
-    ///      A governor without the getter (test stand-ins) keeps the window-only check.
+    ///      Any failed or short read (no getter, revert) keeps the window-only check.
     function _governorInReview(address governor, uint256 proposalId) private view returns (bool) {
         (bool ok, bytes memory ret) =
             governor.staticcall(abi.encodeCall(ISyndicateGovernor.getProposalState, (proposalId)));
