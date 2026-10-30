@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
+import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -575,6 +576,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
+        if (!_governorInReview(governor, proposalId)) revert ReviewNotOpen();
         if (!r.opened) _openReview(r, governor, proposalId);
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
@@ -839,6 +841,16 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         uint256 ve = r.voteEnd;
         if (ve == 0 || _effNow(r.clockShiftAtRegister) < ve) revert ReviewNotOpen();
         _openReview(r, governor, proposalId);
+    }
+
+    /// @dev SHE-471: a vote only lands while the governor itself reports GuardianReview, so a
+    ///      vetoed, cancelled or still-Pending (`== voteEnd`) proposal cannot seat a slashable approval.
+    ///      A governor without the getter (test stand-ins) keeps the window-only check.
+    function _governorInReview(address governor, uint256 proposalId) private view returns (bool) {
+        (bool ok, bytes memory ret) =
+            governor.staticcall(abi.encodeCall(ISyndicateGovernor.getProposalState, (proposalId)));
+        if (!ok || ret.length < 32) return true;
+        return abi.decode(ret, (uint256)) == uint256(ISyndicateGovernor.ProposalState.GuardianReview);
     }
 
     /// @dev Snapshots stake and the owner-settable thresholds at the open instant.

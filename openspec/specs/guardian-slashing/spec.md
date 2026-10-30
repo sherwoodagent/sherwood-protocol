@@ -113,3 +113,15 @@ A zero lock owes nothing and is skipped. `minSlashBps` is the single deterrence 
 - **WHEN** an approver changed their vote and their lock was released before the verdict
 - **THEN** that approver is not slashed
 
+
+### Requirement: A review vote lands only while the governor reports GuardianReview
+
+`GuardianRegistry.voteOnProposal` SHALL revert `ReviewNotOpen` when the proposal's governor answers `getProposalState(proposalId)` with any state other than `GuardianReview`, in addition to the registry's own `[voteEnd, reviewEnd)` window. A proposal the governor already killed (LP veto, proposer cancel) or still holds in `Pending` (the `== voteEnd` second) therefore cannot seat a slashable approval, so no approver is slashed for a proposal that can never execute. A governor that does not answer the getter keeps the window-only check; every governor the factory authorizes answers it.
+
+#### Scenario: LP-vetoed proposal before the flush
+- **WHEN** LPs reach the veto threshold and, before anyone flushes the governor, a guardian votes on the review at `voteEnd + 1`
+- **THEN** the vote reverts `ReviewNotOpen`, the flush closes the review, and no approver can be slashed
+
+#### Scenario: Vote in the voteEnd second
+- **WHEN** a guardian votes at `block.timestamp == voteEnd`, while the governor still reports `Pending`
+- **THEN** the vote reverts `ReviewNotOpen`; the same vote lands one second later, once the governor reports `GuardianReview`
