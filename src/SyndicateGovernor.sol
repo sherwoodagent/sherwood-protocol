@@ -587,7 +587,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // The review was registered at the Draft -> Pending transition, so it
             // must be closed here too — otherwise a keeper opens it at `voteEnd`
             // and guardians are slashed for approving a Cancelled proposal.
-            // Best-effort; in this branch the review cannot yet be open.
+            // Best-effort; in this branch the review cannot yet be blocked.
             _closeReviewIfRegistered(proposal);
             _decOpen();
         } else if (s == ProposalState.GuardianReview) {

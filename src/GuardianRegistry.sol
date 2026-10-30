@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IStakedWood} from "./interfaces/IStakedWood.sol";
+import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -370,8 +371,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
     /// @notice Governor push of a proposal's review-window timestamps at propose
     ///         time. The governor is the single source of the window and pushes
-    ///         it once; the registry then reads the stored fields and never
-    ///         calls back.
+    ///         it once; the registry's only read back is `getProposalState` on vote.
     /// @dev Keyed by `(msg.sender, proposalId)` so each governor owns its own
     ///      namespace. `voteEnd == 0` is the unregistered sentinel, so a zero
     ///      `voteEnd` is rejected; re-registration is rejected to keep the window
@@ -540,8 +540,9 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
     // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd`; within that window it opens a
-    ///      due-but-unopened review itself, so no keeper `openReview` is needed first. Snapshots the caller's raw
+    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd` AND the governor reporting
+    ///      GuardianReview; it then opens a due-but-unopened review itself, so no keeper `openReview` is needed
+    ///      first. Snapshots the caller's raw
     ///      stake at `r.snapshotAt` — the same instant the denominator is read
     ///      at — and adds it to the chosen side's tally. Approvers are capped
     ///      (the slash loop iterates them); Blockers are NOT — the block tally is
@@ -575,6 +576,7 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
+        if (!_governorInReview(governor, proposalId)) revert ReviewNotOpen();
         if (!r.opened) _openReview(r, governor, proposalId);
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
@@ -839,6 +841,16 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         uint256 ve = r.voteEnd;
         if (ve == 0 || _effNow(r.clockShiftAtRegister) < ve) revert ReviewNotOpen();
         _openReview(r, governor, proposalId);
+    }
+
+    /// @dev SHE-471: a vote only lands while the governor itself reports GuardianReview, so a
+    ///      vetoed, cancelled or still-Pending (`== voteEnd`) proposal cannot seat a slashable approval.
+    ///      Any failed or short read (no getter, revert) keeps the window-only check.
+    function _governorInReview(address governor, uint256 proposalId) private view returns (bool) {
+        (bool ok, bytes memory ret) =
+            governor.staticcall(abi.encodeCall(ISyndicateGovernor.getProposalState, (proposalId)));
+        if (!ok || ret.length < 32) return true;
+        return abi.decode(ret, (uint256)) == uint256(ISyndicateGovernor.ProposalState.GuardianReview);
     }
 
     /// @dev Snapshots stake and the owner-settable thresholds at the open instant.
