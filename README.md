@@ -49,7 +49,7 @@ Design paper: [`docs/papers/guardian-network-economic-security.md`](docs/papers/
 | Contract | Description |
 |----------|-------------|
 | `src/pricing/PriceRouter.sol` | UUPS, governance-owned. Prices a strategy's reported `positions()` per position `kind` via registered adapters, with a monotone haircut, an instant-size cap, and a per-kind `laneAEnabled` flag. Fail-closed → `(0, false)` → Lane B. **Currently inert:** no adapter is registered and no surviving strategy overrides `positions()`, so `valueStrategy` short-circuits on the empty array and every vault takes Lane B. Onboarding a new adapter: [`docs/adapter-onboarding-checklist.md`](docs/adapter-onboarding-checklist.md). |
-| `src/queue/VaultWithdrawalQueue.sol` | Per-vault async request queue. Escrows redeem shares / deposit assets while a proposal is live; at settlement the vault stamps one frozen price per proposal and every request claims at that single realized price. |
+| `src/queue/VaultWithdrawalQueue.sol` | Per-vault async request queue. Escrows redeem shares / deposit assets while a proposal is live; at settlement the vault stamps one frozen price per proposal and every redeem claims at that single realized price; queued deposits mint at the live price once no proposal is open. |
 
 ### Strategy templates (`src/strategies/`)
 

@@ -7,8 +7,8 @@ pragma solidity 0.8.28;
 ///         active (`redemptionsLocked() == true`) LPs escrow exits (shares) and
 ///         entries (assets) here instead of transacting against an unrealized
 ///         mid-flight NAV. At settlement the vault stamps ONE frozen price per
-///         proposal (`num/den` = realized NAV checkpoint); every request tagged
-///         to that proposal then claims at that single, un-front-runnable price.
+///         proposal (`num/den` = realized NAV checkpoint); every redeem tagged to
+///         that proposal claims at that single price. Deposits mint live at claim.
 /// @dev    Functionally this is the "VaultRequestQueue" from the spec, kept
 ///         under the legacy `IVaultWithdrawalQueue` name.
 interface IVaultWithdrawalQueue {
@@ -22,9 +22,7 @@ interface IVaultWithdrawalQueue {
     error NotSettled();
     error AlreadySettled();
     /// @notice `stampSettlement` called with a pid below the highest already
-    ///         stamped. `_lastStampedPid` is a high-water mark that `claim` and
-    ///         `cancel` use as exact complements, so a backwards stamp would
-    ///         hold both exits open for the same deposit.
+    ///         stamped (`_lastStampedPid` is a high-water mark).
     error StampOutOfOrder();
     error ZeroShares();
     error ZeroAssets();
@@ -34,7 +32,7 @@ interface IVaultWithdrawalQueue {
     // ── Types ──
     enum RequestKind {
         Redeem, // escrow shares, claim assets at frozen price
-        Deposit // escrow assets, claim shares at frozen price
+        Deposit // escrow assets, claim shares at the live price
     }
 
     struct Request {

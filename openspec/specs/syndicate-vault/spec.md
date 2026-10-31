@@ -188,7 +188,7 @@ proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
 #### Scenario: One frozen price per proposal
 
 - **WHEN** a proposal settles with queued requests tagged to it
-- **THEN** every request tagged to that proposal claims against a single stamped
+- **THEN** every redeem request tagged to that proposal claims against a single stamped
   `num/den`, and a second stamp for the same pid reverts
 
 #### Scenario: Reserve created at stamp
@@ -198,15 +198,15 @@ proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
   the stamped price
 
 ### Requirement: Claiming settled requests
-`claim(requestId)` SHALL be permissionless, SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and the vault to be unlocked (`VaultLocked` while a proposal is active), and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim SHALL mint `mulDiv(assets, den, num)` shares priced at the LATEST stamped settlement (not the request's own pid), pushing the escrowed assets into the vault immediately before the queue-only `settleDeposit` mint — pricing at the request's own pid would grant depositors a free look-back option across later settlements.
+`claim(requestId)` SHALL be permissionless and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and redemptions to be unlocked (`VaultLocked` while a proposal is open), and SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim carries no stamped price: it SHALL require only that deposits are unlocked (`VaultLocked` while a proposal is open), SHALL mint the vault's live `previewDeposit(assets)` at the claim instant (`ZeroShares` if that is zero), and SHALL push the escrowed assets into the vault immediately before the queue-only `settleDeposit` mint — pricing at the claim instant is what leaves a queued depositor no look-back option across settlements.
 
 #### Scenario: Redeem claim at frozen price
 - **WHEN** a settled redeem request is claimed
 - **THEN** the escrowed shares are burned, the owner receives assets at the request's own stamped price, and `RequestClaimed` is emitted
 
-#### Scenario: Deposit claim priced at latest stamp
-- **WHEN** a deposit request tagged to proposal N is claimed after proposal N+1 has also stamped
-- **THEN** shares are minted at proposal N+1's (latest) stamped price
+#### Scenario: Deposit claim priced live
+- **WHEN** a deposit request is claimed while no proposal is open
+- **THEN** shares are minted at the vault's current `previewDeposit` price, whatever any stamp recorded
 
 #### Scenario: No claims mid-proposal
 - **WHEN** a later proposal is active at claim time
@@ -220,14 +220,14 @@ Each redeem claim SHALL release reserve: partial claims release exactly their fl
 - **THEN** the proposal's per-pid reservation drops to 0 and `reservedAssets` decreases by the full remaining reservation, not merely the final payout
 
 ### Requirement: Request cancellation
-`cancel(requestId)` SHALL be callable only by the request owner and only before the request's proposal is stamped; after stamping it SHALL revert `AlreadySettled` (a post-settle cancel would be a free look-back option). Cancellation SHALL return the escrowed shares (redeem) or assets (deposit) to the owner, mark the request cancelled, and emit `RequestCancelled`. Cancellation SHALL remain available while the vault is paused.
+`cancel(requestId)` SHALL be callable only by the request owner. A redeem request SHALL be cancellable only before its proposal is stamped; after stamping it SHALL revert `AlreadySettled` (a post-settle cancel would be a free look-back option). A deposit request SHALL stay cancellable until it is claimed: its claim mints at the live price, so cancelling is worth nothing, and the deposit gate can hold its claim shut while a proposal is open. Cancellation SHALL return the escrowed shares (redeem) or assets (deposit) to the owner, mark the request cancelled, and emit `RequestCancelled`. Cancellation SHALL remain available while the vault is paused.
 
 #### Scenario: Pre-stamp cancel returns escrow
 - **WHEN** an owner cancels an unstamped redeem request
 - **THEN** the escrowed shares transfer back and pending counters decrease
 
-#### Scenario: Post-stamp cancel is forbidden
-- **WHEN** the request's proposal has been stamped
+#### Scenario: Post-stamp redeem cancel is forbidden
+- **WHEN** a redeem request's proposal has been stamped
 - **THEN** `cancel` reverts `AlreadySettled` and the request must be claimed
 
 #### Scenario: Paused vault does not trap queued LPs

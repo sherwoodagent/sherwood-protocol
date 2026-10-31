@@ -33,19 +33,19 @@ interface IRequestableVault {
 /// @title VaultWithdrawalQueue (Lane B async request substrate)
 /// @notice Per-vault queue for mid-proposal LP flow. Redeems escrow shares and
 ///         deposits escrow assets while a proposal is active; at settlement the
-///         vault stamps one frozen price per proposal and each request claims at
-///         that single realized price, so the vault never mints or burns against
-///         an unrealized, strategy-influenced NAV.
+///         vault stamps one frozen price per proposal and each redeem claims at
+///         that single realized price; deposits mint at the live price once no
+///         proposal is open. Neither mints nor burns against an unrealized NAV.
 ///
 ///         Lifecycle:
 ///           REDEEM:  vault.requestRedeem -> queueRedeem (shares escrowed here)
 ///                    [settle -> stampSettlement] -> claim -> vault.settleRedeem
 ///           DEPOSIT: vault.requestDeposit -> queueDeposit (assets escrowed here)
-///                    [settle -> stampSettlement] -> claim -> vault.settleDeposit
+///                    [no open proposal] -> claim (live price) -> vault.settleDeposit
 ///
-///         `cancel` is allowed ONLY before the request's proposal is stamped:
-///         once a settle price is frozen, a post-settle cancel would be a free
-///         look-back option.
+///         A redeem `cancel` is allowed ONLY before its proposal is stamped (a
+///         post-settle cancel would be a free look-back option); a deposit
+///         `cancel` stays open until claim, since its claim is priced live.
 contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -54,11 +54,9 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     Request[] private _requests; // index 0 unused (sentinel)
     mapping(address => uint256[]) private _byOwner;
     mapping(uint256 pid => SettlePrice) private _settlePrice;
-    /// @dev The pid of the most recent `stampSettlement`. Deposit claims price
-    ///      against THIS rather than the pid their request was tagged to — see
-    ///      the rationale in `claim`. Redeem claims deliberately keep their own
-    ///      pid's price, because their shares left the supply at that settlement
-    ///      and `_pidReserved` is denominated against it.
+    /// @dev The pid of the most recent `stampSettlement`; it only orders stamps
+    ///      (`StampOutOfOrder`). Redeems claim at their own pid's stamp, deposits
+    ///      at the live price (see `claim`).
     uint256 private _lastStampedPid;
     /// @notice Redeem shares still queued per proposal. Incremented at
     ///         `queueRedeem`, decremented at `cancel` (pre-stamp) and at `claim`
