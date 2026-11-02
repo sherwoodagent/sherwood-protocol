@@ -312,6 +312,12 @@ settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The C
 only by `MAX_STAMP_DRAWDOWN_BPS` (90%), so 7 d after the duration a third party may settle a leg whose
 swap carries no `minOut` down to that backstop (the stranger is paid nothing; the sandwicher captures the
 gap). Guardians SHOULD treat an unbounded settle leg as a block reason at review.
+Portfolio has no venue anchor: the route (adapter, fee tier, V4 hop list in `swapExtraData`) is
+proposer data, fixed at init, and only the adapter and token-to-feed pairing are attested, never the
+pool. A proposer who routes through a venue it controls fills both execute and settle at the floor and
+keeps up to 2 × `maxSlippageBps` of deployed capital (≤ about 20%; 19% in the internal review's PoC,
+SHE-473), against a bond of 1%. Guardians SHOULD check each route's pool depth at feed price at review
+and block a route they cannot price.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
 reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at
