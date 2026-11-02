@@ -4,7 +4,7 @@
 > runbook — per-proposal intake, Approve/Block policy, how to encode the vote —
 > is the `network-guardian` skill in
 > [`sherwoodagent/skill`](https://github.com/sherwoodagent/skill/blob/main/skills/network-guardian/SKILL.md).
-> Vault-owner duties (veto, unstick, emergency settle) are the separate `guardian` skill there.
+> Vault-owner duties (veto, unstick inside its 7-day grace, emergency settle) are the separate `guardian` skill there.
 
 Guardians are staked-WOOD reviewers who inspect every strategy proposal's calldata
 before it can execute, and who underwrite the capital it may extract. Their economics

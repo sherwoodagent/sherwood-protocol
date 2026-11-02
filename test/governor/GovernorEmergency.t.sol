@@ -374,6 +374,15 @@ contract GovernorEmergencyTest is Test {
         governor.unstick(pid);
     }
 
+    /// @notice The proposer gets no shortcut: inside the grace it is refused like any non-owner.
+    function test_unstick_proposerInsideGrace_reverts() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 7 days - 1);
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        governor.unstick(pid);
+    }
+
     /// @notice Once the grace has passed anyone may replay the voted settlement (SHE-472).
     function test_unstick_afterGrace_anyoneSettles() public {
         uint256 pid = _createExecutedProposal(7 days);
