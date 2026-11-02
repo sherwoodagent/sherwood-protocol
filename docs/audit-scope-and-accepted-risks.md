@@ -129,7 +129,7 @@ with per-call caps off and a zero net-outflow budget measured on the vault's pre
   only the owner can unpause, and the management fee keeps accruing (5.14).
 
 An absent owner does not by itself hold a vault in `Executed`: `unstick` is permissionless after
-`executedAt + strategyDuration + UNSTICK_GRACE` (7 d). Three states stay owner-only: a stored
+`executedAt + strategyDuration + UNSTICK_GRACE` (7 d). In three states a post-grace `unstick` still reverts, so only the owner can exit: a stored
 settlement leg that reverts, a strategy still answering `executed() == true` (`StrategyNotSettled`;
 `unstick` replays the same calls), and a vault the owner paused before leaving (no vault dead-man).
 In each the only exit is the bonded emergency path above, so a vault whose owner is gone in that
@@ -308,6 +308,10 @@ and the settler chooses the block. Portfolio sells each token at the Chainlink v
 (`PortfolioStrategy._sellFloor`, `_feedPrice`). CL settle floors on pool spot within
 `maxTwapDeviationBps` ticks (≤ about 10.5%) of a TWAP that may be 300 s long (`_swapToAsset`). Each
 settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The CL strategy is out of the audit scope; available at launch, use at your own risk.
+`settleProposal` is bounded by the declared `maxDrawdownBps`; a post-grace `unstick` (5.1) is bounded
+only by `MAX_STAMP_DRAWDOWN_BPS` (90%), so 7 d after the duration a third party may settle a leg whose
+swap carries no `minOut` down to that backstop (the stranger is paid nothing; the sandwicher captures the
+gap). Guardians SHOULD treat an unbounded settle leg as a block reason at review.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
 reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at

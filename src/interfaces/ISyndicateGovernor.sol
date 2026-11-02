@@ -551,9 +551,9 @@ interface ISyndicateGovernor {
     function settleProposal(uint256 proposalId) external;
 
     // ── Guardian-review emergency settle lifecycle ──
-    // Owner-driven paths: `unstick` (pre-committed calls; anyone once the
-    // grace after the duration has passed) or
-    // `emergencySettleWithCalls` + `finalizeEmergencySettle` (guardian-gated).
+    // `unstick` replays the pre-committed calls: vault owner for `UNSTICK_GRACE`
+    // after the duration, anyone after. `emergencySettleWithCalls` +
+    // `finalizeEmergencySettle` run owner-supplied calls behind a guardian review.
     function unstick(uint256 proposalId) external;
     function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) external;
     function cancelEmergencySettle(uint256 proposalId) external;
@@ -686,6 +686,9 @@ interface ISyndicateGovernor {
     ///         consumer can read the cap that gates it without binding to the
     ///         concrete governor.
     function MAX_STAMP_DRAWDOWN_BPS() external view returns (uint256);
+
+    /// @notice How long after `executedAt + strategyDuration` `unstick` stays owner-only.
+    function UNSTICK_GRACE() external view returns (uint256);
 
     /// @notice The vault price per share recorded at execute, which the
     ///         settle-price floor is measured against.
