@@ -366,7 +366,9 @@ abstract contract SyndicateGovernorHandler is Properties {
             _syndicateGovernor_setVotingPeriod(clampBetween(arg0, 1 hours, 30 days));
         } else {
             if (count == 0) return;
-            _syndicateGovernor_unstick(proposalId);
+            // Owner inside the grace, anyone after it: both callers must reach the gate.
+            address caller = uint160(arg1) % 2 == 0 ? admin : actors[uint256(uint160(arg1)) % actors.length];
+            _syndicateGovernor_unstick(proposalId, caller);
         }
     }
 
@@ -462,7 +464,8 @@ abstract contract SyndicateGovernorHandler is Properties {
         governor.resolveProposalState(proposalId);
     }
 
-    function _syndicateGovernor_unstick(uint256 proposalId) internal asAdmin {
+    function _syndicateGovernor_unstick(uint256 proposalId, address caller) internal {
+        vm.prank(caller);
         governor.unstick(proposalId);
     }
 

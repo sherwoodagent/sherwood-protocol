@@ -45,7 +45,7 @@ abstract contract GovernorEmergency is ProposalLifecycle {
 
     /// @notice How long after `executedAt + strategyDuration` `unstick` stays owner-only.
     ///         Past it anyone may replay the voted settlement, so an absent owner cannot
-    ///         hold the vault in Executed (SHE-472). Same span as the registry dead-man.
+    ///         hold the vault in Executed (SHE-472).
     uint256 public constant UNSTICK_GRACE = 7 days;
 
     // ── Reentrancy modifier (shares status var with SyndicateGovernor) ──

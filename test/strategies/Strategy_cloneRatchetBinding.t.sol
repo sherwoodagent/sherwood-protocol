@@ -360,7 +360,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
     // ── settle requires unwind (NM fix review) ──
 
     /// @notice A settlement leg that never calls `settle()` closes the proposal through neither
-    ///         `settleProposal` nor the owner's `unstick`, which replays the same leg.
+    ///         `settleProposal` nor `unstick`, which replays the same leg.
     function test_settleLegSkippingStrategySettle_reverts_onSettleAndUnstick() public {
         MockFundedStrategy clone = MockFundedStrategy(Clones.clone(address(new MockFundedStrategy())));
         uint256 amount = 10_000e6;

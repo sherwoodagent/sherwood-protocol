@@ -471,6 +471,18 @@ contract GovernorEmergency_zeroEgressBudgetTest is Test {
         assertEq(usdc.balanceOf(address(vault)), TVL, "vault intact");
     }
 
+    /// @notice §5.1 residual: a strategy still answering `executed() == true` refuses a post-grace
+    ///         `unstick` from anyone, the same as the owner's (SHE-472).
+    function test_stuckStrategy_postGraceUnstick_stillRefused() public {
+        uint256 pid = _executedStuck(0);
+        vm.warp(vm.getBlockTimestamp() + governor.UNSTICK_GRACE());
+        address s = governor.getProposal(pid).strategy;
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, s));
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+    }
+
     /// @notice A settlement leg that skips `settle()` defeats the settle race, but the drain still reverts.
     function test_settleLegSkippingSettle_cannotDrainFloat() public {
         address s = _healthy();

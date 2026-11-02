@@ -14,6 +14,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {AssetPuller} from "../mocks/AssetPuller.sol";
@@ -400,6 +401,7 @@ contract GovernorEmergencyTest is Test {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         // Declared 20%, realised 40%: inside the 90% backstop, outside the declared floor.
         deal(address(usdc), address(vault), (usdc.balanceOf(address(vault)) * 60) / 100);
+        uint256 strangerAssets = usdc.balanceOf(random);
 
         vm.prank(random);
         vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
@@ -408,6 +410,7 @@ contract GovernorEmergencyTest is Test {
         vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
         governor.unstick(pid);
         assertTrue(vault.redemptionsLocked(), "owner-only for the grace");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
 
         vm.warp(vm.getBlockTimestamp() + 7 days);
         vm.prank(random);
@@ -417,6 +420,42 @@ contract GovernorEmergencyTest is Test {
         governor.unstick(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertFalse(vault.redemptionsLocked(), "LP flow reopens without the owner");
+        assertEq(usdc.balanceOf(random), strangerAssets, "the caller is paid nothing");
+        assertEq(vault.balanceOf(random), 0, "the caller receives no shares");
+    }
+
+    /// @notice State and duration gates run before the caller gate: a non-owner sees
+    ///         `StrategyDurationNotElapsed` before the duration and `ProposalNotExecuted` off-state.
+    function test_unstick_stranger_stateAndDurationGatesFirst() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationNotElapsed.selector);
+        governor.unstick(pid);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotExecuted.selector);
+        governor.unstick(pid + 1);
+    }
+
+    /// @notice The grace adds callers, it removes none: the owner still settles after it.
+    function test_unstick_ownerAfterGrace_stillSettles() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 7 days);
+        vm.prank(owner);
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice §5.1 residual: a vault the owner paused stays in Executed through a post-grace
+    ///         `unstick` (`executeGovernorBatch` is `whenNotPaused`).
+    function test_unstick_afterGrace_pausedVault_reverts() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.prank(owner);
+        vault.pause();
+        vm.warp(vm.getBlockTimestamp() + 7 days + 7 days);
+        vm.prank(random);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 
     function test_unstick_doesNotRequireOwnerStake() public {

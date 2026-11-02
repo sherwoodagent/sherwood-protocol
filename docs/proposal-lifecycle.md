@@ -188,8 +188,8 @@ Cross-contract timing invariants (all enforced at the setters):
   `_finishSettlement`: `pnl = vault balance − capital snapshot`, management fee →
   performance fee → high-water-mark ratchet → queue settle price stamped →
   `Settled`. Deposits and redemptions unlock; the cooldown arms.
-- Emergency paths (vault owner): `unstick` replays the voted settlement calls after
-  `strategyDuration` (no review needed; anyone may call it after a further
+- Emergency paths: `unstick` replays the voted settlement calls after
+  `strategyDuration` (vault owner; no review needed; anyone may call it after a further
   `UNSTICK_GRACE` of 7 days); `emergencySettleWithCalls` runs
   owner-supplied calls behind a fresh guardian review + owner bond
   (`src/GovernorEmergency.sol`).
