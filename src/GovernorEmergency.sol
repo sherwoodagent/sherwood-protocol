@@ -15,8 +15,9 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
 ///         owned by GuardianRegistry. Governor entrypoints are thin wrappers that
 ///         delegate to the registry and execute calls on the vault.
 ///
-///         - `unstick`: vault owner rescues a proposal stuck in Executed state by
-///           running its pre-committed settlement calls (no guardian review).
+///         - `unstick`: rescues a proposal stuck in Executed state by running its
+///           pre-committed settlement calls (no guardian review). Vault owner for
+///           `UNSTICK_GRACE` after the duration, then anyone.
 ///         - `emergencySettleWithCalls`: vault owner proposes owner-supplied
 ///           settlement calls. Opens a guardian review on the registry.
 ///         - `cancelEmergencySettle`: vault owner withdraws their review.
@@ -42,6 +43,11 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         view
         virtual;
 
+    /// @notice How long after `executedAt + strategyDuration` `unstick` stays owner-only.
+    ///         Past it anyone may replay the voted settlement, so an absent owner cannot
+    ///         hold the vault in Executed (SHE-472). Same span as the registry dead-man.
+    uint256 public constant UNSTICK_GRACE = 7 days;
+
     // ── Reentrancy modifier (shares status var with SyndicateGovernor) ──
 
     modifier emergencyNonReentrant() {
@@ -61,11 +67,13 @@ abstract contract GovernorEmergency is ProposalLifecycle {
     /// @notice Rescues a proposal stuck in Executed state past its duration by
     ///         running the governance-approved pre-committed settlement calls.
     /// @dev Does NOT require active owner stake — the calls were already voted on.
+    ///      Owner-only until `executedAt + strategyDuration + UNSTICK_GRACE`, permissionless after.
     function unstick(uint256 proposalId) external emergencyNonReentrant {
         StrategyProposal storage p = _proposals[proposalId];
-        _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
-        if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
+        uint256 settleFrom = p.executedAt + p.strategyDuration;
+        if (block.timestamp < settleFrom) revert StrategyDurationNotElapsed();
+        if (block.timestamp < settleFrom + UNSTICK_GRACE) _requireVaultOwner(p.vault);
         // Same batch, same zero egress budget as `settleProposal`.
         ISyndicateVault(p.vault)
             .executeGovernorBatch(_getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), 0);

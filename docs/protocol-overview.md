@@ -61,7 +61,7 @@ Only after that window closes does the proposer get their bond back.
    outside the accused cohort carries it, and a window that closes short of that
    quorum burns a fifth of the challenger's bond. Convictions slash at 100% and burn.
 6. **Emergency rails** — owner veto, emergency cancel, `unstick` (replay voted
-   settlement), bonded emergency settle behind a fresh guardian review, registry
+   settlement; owner for 7 d past the duration, then anyone), bonded emergency settle behind a fresh guardian review, registry
    dead-man unpause.
 
 ## Key numbers at a glance

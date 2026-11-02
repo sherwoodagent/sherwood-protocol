@@ -189,7 +189,8 @@ Cross-contract timing invariants (all enforced at the setters):
   performance fee → high-water-mark ratchet → queue settle price stamped →
   `Settled`. Deposits and redemptions unlock; the cooldown arms.
 - Emergency paths (vault owner): `unstick` replays the voted settlement calls after
-  `strategyDuration` (no review needed); `emergencySettleWithCalls` runs
+  `strategyDuration` (no review needed; anyone may call it after a further
+  `UNSTICK_GRACE` of 7 days); `emergencySettleWithCalls` runs
   owner-supplied calls behind a fresh guardian review + owner bond
   (`src/GovernorEmergency.sol`).
 
@@ -213,7 +214,7 @@ A conviction in the challenge game forfeits the whole bond: prosecutor fee
 |---|---|
 | `propose`, `cancelProposal`, self-settle at 1 h | registered agent (proposer) |
 | `vote` | LPs with snapshot voting power |
-| `vetoProposal`, `emergencyCancel`, `unstick`, emergency settle | vault owner |
+| `vetoProposal`, `emergencyCancel`, `unstick` (owner-only for 7 d past the duration, then anyone), emergency settle | vault owner |
 | guardian `voteOnProposal` | active staked guardians |
 | `openReview`, `resolveReview`, `executeProposal`, `settleProposal` (post-duration), `resolveProposalState`, `reclaimProposerBond` | **anyone** (permissionless keepers) |
 | parameter setters | vault owner, frozen while a proposal is open |

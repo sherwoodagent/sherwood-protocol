@@ -4,7 +4,7 @@
 > runbook — per-proposal intake, Approve/Block policy, how to encode the vote —
 > is the `network-guardian` skill in
 > [`sherwoodagent/skill`](https://github.com/sherwoodagent/skill/blob/main/skills/network-guardian/SKILL.md).
-> Vault-owner duties (veto, unstick, emergency settle) are the separate `guardian` skill there.
+> Vault-owner duties (veto, unstick inside its 7-day grace, emergency settle) are the separate `guardian` skill there.
 
 Guardians are staked-WOOD reviewers who inspect every strategy proposal's calldata
 before it can execute, and who underwrite the capital it may extract. Their economics
@@ -477,7 +477,8 @@ Anti-griefing details:
 ## Emergency paths
 
 - `unstick` (`GovernorEmergency.unstick`) — vault owner replays the already-voted
-  settlement calls after `strategyDuration`. No review: the calldata was already
+  settlement calls after `strategyDuration`; anyone may after a further
+  `UNSTICK_GRACE` (7 d), so an absent owner cannot hold the vault. No review: the calldata was already
   reviewed. Caps are the coverage-scaled `effectiveMaxCapital` and settlement
   caps, not the declare-time envelope. It reverts unless the strategy reports it
   has unwound, and it applies `MAX_STAMP_DRAWDOWN_BPS`, a 90% drawdown
