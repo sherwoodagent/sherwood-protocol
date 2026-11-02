@@ -109,9 +109,9 @@ interface IGuardianRegistry {
     ///         second before the proposal entered Pending), with no age discount.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
-    ///         at `resolveReview`. A vote cast once the review window is due but
-    ///         still unopened opens the review itself and then records the vote,
-    ///         so no keeper `openReview` call is needed first.
+    ///         at `resolveReview`. Lands only inside the review window AND while
+    ///         the governor reports GuardianReview; a vote on a due-but-unopened
+    ///         review opens it first, so no keeper `openReview` call is needed.
     /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
     ///         locks behind the proposal; the ledger locks
     ///         `min(lockWood, free budget)`, and rejects the vote when what it
