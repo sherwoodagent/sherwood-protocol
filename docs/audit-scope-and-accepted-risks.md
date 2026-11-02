@@ -326,6 +326,11 @@ liquidity. Both strategies in this item are out of the audit scope; available at
 `rebalanceDelta` or settle. A depeg loosens the floors, or makes them unreachable and settle revert.
 `rebalanceDelta` is proposer-only, with no rate limit, over the routes set in the strategy's
 parameters, each swap floored at feed − `maxSlippageBps`.
+When the venue trades below feed × (1 − `maxSlippageBps`) settle and `unstick` revert, and the
+proposer can only tighten. The exit is `settleWithSlippage(bps)`, vault-only and capped at
+`MAX_EMERGENCY_SLIPPAGE_BPS` (50%), placed in an owner `emergencySettleWithCalls` batch so guardians
+review the tolerance (SHE-474). A proposer may also declare it as a settle leg at propose; guardians
+SHOULD block a declared settle tolerance above the clone's `maxSlippageBps`.
 
 **5.21 CL TWAP grief.** On a low-cardinality pool, anyone can make execute, rerange or settle revert
 `TwapUnavailable` with a few small swaps in separate blocks (`_tryTwapTick`). The permissionless remedy
