@@ -287,13 +287,23 @@ contract GovernorEmergencyTest is Test {
     }
 
     function _createExecutedProposal(uint256 duration) internal returns (uint256 proposalId) {
+        return _createExecutedProposalWithDrawdown(duration, 10_000);
+    }
+
+    /// @dev Same flow as `_createExecutedProposal` with a declared `maxDrawdownBps`.
+    function _createExecutedProposalWithDrawdown(uint256 duration, uint16 maxDrawdownBps)
+        internal
+        returns (uint256 proposalId)
+    {
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        env.maxDrawdownBps = maxDrawdownBps;
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
             address(0),
             "ipfs://emergency",
             duration,
-            GovEnvelope.permissive(address(vault)),
+            env,
             _execCalls(),
             GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
@@ -352,6 +362,52 @@ contract GovernorEmergencyTest is Test {
         vm.prank(random);
         vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
         governor.unstick(pid);
+    }
+
+    /// @notice `unstick` stays owner-only through the last second of the 7-day grace (SHE-472).
+    function test_unstick_strangerInsideGrace_reverts() public {
+        assertEq(governor.UNSTICK_GRACE(), 7 days);
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 7 days - 1);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        governor.unstick(pid);
+    }
+
+    /// @notice Once the grace has passed anyone may replay the voted settlement (SHE-472).
+    function test_unstick_afterGrace_anyoneSettles() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 7 days);
+        vm.prank(random);
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertFalse(vault.redemptionsLocked());
+    }
+
+    /// @notice SHE-472 harm: a loss past the declared floor with an absent owner locks the vault only
+    ///         for the grace, not for good.
+    function test_unstick_afterGrace_strangerClosesSubFloorSettle() public {
+        uint256 pid = _createExecutedProposalWithDrawdown(7 days, 2_000);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        // Declared 20%, realised 40%: inside the 90% backstop, outside the declared floor.
+        deal(address(usdc), address(vault), (usdc.balanceOf(address(vault)) * 60) / 100);
+
+        vm.prank(random);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        governor.unstick(pid);
+        assertTrue(vault.redemptionsLocked(), "owner-only for the grace");
+
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        vm.prank(random);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+        vm.prank(random);
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertFalse(vault.redemptionsLocked(), "LP flow reopens without the owner");
     }
 
     function test_unstick_doesNotRequireOwnerStake() public {

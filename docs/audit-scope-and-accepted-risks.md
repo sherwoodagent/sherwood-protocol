@@ -128,6 +128,11 @@ with per-call caps off and a zero net-outflow budget measured on the vault's pre
   `unstick` and `finalizeEmergencySettle` (all go through `executeGovernorBatch`, `whenNotPaused`);
   only the owner can unpause, and the management fee keeps accruing (5.14).
 
+An absent owner cannot hold a vault in `Executed`: `unstick` is permissionless after
+`executedAt + strategyDuration + UNSTICK_GRACE` (7 d). What remains owner-only is a stored settlement
+leg that reverts (`unstick` replays the same calls), where the only exit is the bonded emergency path
+above; a vault whose owner is gone in that state needs a beacon upgrade by the Safe.
+
 A blocked round burns the whole posted owner bond (`StakedWood.slashOwnerBond`; the bond is at least
 `requiredOwnerBond` = max(`minOwnerStake`, `MIN_OWNER_BOND_FLOOR`)), and the same owner may re-bond and
 retry (`SyndicateFactory.rotateOwner` to itself is allowed mid-proposal). The veto electorate is the

@@ -551,7 +551,8 @@ interface ISyndicateGovernor {
     function settleProposal(uint256 proposalId) external;
 
     // ── Guardian-review emergency settle lifecycle ──
-    // Owner-driven paths: `unstick` (pre-committed calls) or
+    // Owner-driven paths: `unstick` (pre-committed calls; anyone once the
+    // grace after the duration has passed) or
     // `emergencySettleWithCalls` + `finalizeEmergencySettle` (guardian-gated).
     function unstick(uint256 proposalId) external;
     function emergencySettleWithCalls(uint256 proposalId, BatchExecutorLib.Call[] calldata calls) external;

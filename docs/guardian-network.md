@@ -477,7 +477,8 @@ Anti-griefing details:
 ## Emergency paths
 
 - `unstick` (`GovernorEmergency.unstick`) — vault owner replays the already-voted
-  settlement calls after `strategyDuration`. No review: the calldata was already
+  settlement calls after `strategyDuration`; anyone may after a further
+  `UNSTICK_GRACE` (7 d), so an absent owner cannot hold the vault. No review: the calldata was already
   reviewed. Caps are the coverage-scaled `effectiveMaxCapital` and settlement
   caps, not the declare-time envelope. It reverts unless the strategy reports it
   has unwound, and it applies `MAX_STAMP_DRAWDOWN_BPS`, a 90% drawdown
