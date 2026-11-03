@@ -91,7 +91,9 @@ below the floor or above the ceiling. `_updateParams` SHALL revert
 `InvalidSlippage` when a non-zero new tolerance is below the floor or above the
 current value (tighten-only); a zero value keeps the current tolerance. Every
 swap — at execute, at settle and in `rebalanceDelta` — SHALL floor its output at
-the slot's feed price less `maxSlippageBps`.
+the slot's feed price less `maxSlippageBps`. The floor is the only bound on a
+fill: the pool behind a route is proposer data and is not attested, so a
+proposer-controlled venue can fill every leg at the floor (accepted risk 5.18).
 
 `settleWithSlippage(slippageBps)` SHALL be callable only by the vault, SHALL
 revert `InvalidSlippage` unless `maxSlippageBps <= slippageBps <=

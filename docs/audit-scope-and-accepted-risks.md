@@ -312,6 +312,14 @@ settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The C
 only by `MAX_STAMP_DRAWDOWN_BPS` (90%), so 7 d after the duration a third party may settle a leg whose
 swap carries no `minOut` down to that backstop (the stranger is paid nothing; the sandwicher captures the
 gap). Guardians SHOULD treat an unbounded settle leg as a block reason at review.
+Portfolio has no venue anchor: the route (adapter, fee tier, V4 hop list in `swapExtraData`) is
+proposer data, fixed at init, and only the adapter and token-to-feed pairing are attested, never the
+pool. A proposer who routes through a venue it controls fills both execute and settle at the floor.
+It keeps up to `maxSlippageBps` at execute plus the settle tolerance: 2 × `maxSlippageBps` (≤ about 20%;
+19% in the internal review's PoC, SHE-473) on an ordinary settle, or up to `maxSlippageBps` + 50% if a
+`settleWithSlippage` leg runs (5.20). Each `rebalanceDelta` also leaks `maxSlippageBps` of its turnover.
+All of this sits against a bond of 1%. Guardians SHOULD check each route's pool depth at feed price at
+review and block a route they cannot price.
 
 **5.19 Morpho liquidity and liquidation.** `MorphoSupplyStrategy._settle` withdraws all shares and
 reverts while the market lacks liquidity, which also blocks `unstick`. The CL strategy fixes its LTV at
@@ -330,7 +338,7 @@ When the venue trades below feed × (1 − `maxSlippageBps`) settle and `unstick
 proposer can only tighten. The exit is `settleWithSlippage(bps)`, vault-only and capped at
 `MAX_EMERGENCY_SLIPPAGE_BPS` (50%), placed in an owner `emergencySettleWithCalls` batch so guardians
 review the tolerance (SHE-474). It sells through the proposer's fixed routes: when the gap is the
-route's own pool (proposer-controlled, SHE-473), the loose settle pays that gap to the proposer, so the exit
+route's own pool (proposer-controlled, 5.18), the loose settle pays that gap to the proposer, so the exit
 is `rescueTo` of the basket plus `settle()`, then `rescueERC20` to a new clone. A proposer may also
 declare it as a settle leg at propose; anyone may run that leg through `settleProposal` once the
 duration ends, or through `unstick` after the 7 d grace; guardians SHOULD block a declared settle
