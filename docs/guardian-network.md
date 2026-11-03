@@ -597,7 +597,7 @@ following hold:
    or approves, the vault or such a clone.
 3. Every call's `value` is zero.
 4. No call invokes `rescueTo` for a token other than the vault asset (see the
-   exception below). A token pushed to the vault is not counted in the share
+   exception below and clause 6). A token pushed to the vault is not counted in the share
    price, and afterwards only the owner can move it, and only to a strategy
    clone of the vault.
 5. After the batch, `IStrategy(p.strategy).executed()` is false, and the vault's
@@ -607,9 +607,12 @@ following hold:
 6. Any `settleWithSlippage(bps)` call passes `bps` no larger than the venue's
    measured gap below the feed plus a small margin, and the clone's swap routes
    do not run through a pool the proposer controls. If they do, block: the loose
-   settle pays the gap to the proposer, and the exit is `rescueTo` plus a new
-   clone. The same check applies to a `settleWithSlippage` settle leg declared at
-   propose time.
+   settle pays the gap to the proposer. In that case accept, as the exit, a batch
+   of `rescueTo(t)` for every basket token followed by `clone.settle()` (which
+   then sells nothing and leaves the clone settled); the owner later moves the
+   tokens with `rescueERC20` to a new clone. The same check applies to a
+   `settleWithSlippage` settle leg declared at propose time, and to one run by
+   `settleProposal` once the duration ends.
 
 The owner chooses the instant `finalizeEmergencySettle` runs after `reviewEnd`,
 with per-call caps disabled, so judge the batch at the worst market state the

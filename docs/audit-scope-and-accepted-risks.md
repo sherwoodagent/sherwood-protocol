@@ -331,8 +331,9 @@ proposer can only tighten. The exit is `settleWithSlippage(bps)`, vault-only and
 `MAX_EMERGENCY_SLIPPAGE_BPS` (50%), placed in an owner `emergencySettleWithCalls` batch so guardians
 review the tolerance (SHE-474). It sells through the proposer's fixed routes: when the gap is the
 route's own pool (proposer-controlled, SHE-473), the loose settle pays that gap to the proposer, so the exit
-is `rescueTo` plus a new clone instead. A proposer may also declare it as a settle leg at propose, and
-after the 7 d grace anyone may run that leg through `unstick`; guardians SHOULD block a declared settle
+is `rescueTo` of the basket plus `settle()`, then `rescueERC20` to a new clone. A proposer may also
+declare it as a settle leg at propose; anyone may run that leg through `settleProposal` once the
+duration ends, or through `unstick` after the 7 d grace; guardians SHOULD block a declared settle
 tolerance above the clone's `maxSlippageBps`. Governance SHALL NOT class-certify `settleWithSlippage`,
 and a class bound on Portfolio `settle` covers only `maxSlippageBps`, never a declared loose leg.
 

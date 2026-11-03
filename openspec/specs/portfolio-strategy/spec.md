@@ -98,8 +98,8 @@ revert `InvalidSlippage` unless `maxSlippageBps <= slippageBps <=
 MAX_EMERGENCY_SLIPPAGE_BPS` (5_000), and SHALL settle with every sell floored at
 the feed price less `slippageBps`. It is the owner's exit, through a reviewed
 emergency batch, when the venue trades below the ordinary floor. It sells through
-the routes set at init; when the gap is the route's own pool, the exit SHALL be
-`rescueTo` plus a new clone, not `settleWithSlippage`.
+the routes set at init, so when the gap is the route's own pool the exit is
+`rescueTo` of the basket followed by `settle()` (guardian reviewer rule, clause 6).
 
 #### Scenario: Venue below the feed floor
 - **WHEN** the venue trades below feed × (1 − `maxSlippageBps`) after the duration
