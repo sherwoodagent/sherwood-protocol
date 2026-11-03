@@ -1130,6 +1130,14 @@ contract PortfolioStrategyTest is Test {
         assertEq(strategy.maxSlippageBps(), ceiling);
     }
 
+    /// @notice The lower bound is inclusive: the clone's own tolerance settles.
+    function test_settleWithSlippage_atCurrentToleranceSettles() public {
+        _executeStrategy();
+        vm.prank(vault);
+        strategy.settleWithSlippage(MAX_SLIPPAGE);
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
     function test_settleWithSlippage_beforeExecute_reverts() public {
         vm.prank(vault);
         vm.expectRevert(BaseStrategy.NotExecuted.selector);

@@ -604,6 +604,12 @@ following hold:
    asset balance is at least its pre-batch balance plus everything the clones
    released inside the batch. "Released" is the sum of the asset's `Transfer`
    events from the clones permitted by clause 1 to the vault during the batch.
+6. Any `settleWithSlippage(bps)` call passes `bps` no larger than the venue's
+   measured gap below the feed plus a small margin, and the clone's swap routes
+   do not run through a pool the proposer controls. If they do, block: the loose
+   settle pays the gap to the proposer, and the exit is `rescueTo` plus a new
+   clone. The same check applies to a `settleWithSlippage` settle leg declared at
+   propose time.
 
 The owner chooses the instant `finalizeEmergencySettle` runs after `reviewEnd`,
 with per-call caps disabled, so judge the batch at the worst market state the

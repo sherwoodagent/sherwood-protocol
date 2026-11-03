@@ -304,7 +304,7 @@ stamped price. The owner sets the cooldown between proposals (minimum 1 h).
 
 **5.18 Settle can be sandwiched to its floor.** `settleProposal` is permissionless after the duration,
 and the settler chooses the block. Portfolio sells each token at the Chainlink value less
-`maxSlippageBps` (0.5–10%), with feeds up to 26 h old, treating one asset unit as $1
+`maxSlippageBps` (0.5–10%), or the `settleWithSlippage` tolerance (≤ 50%, 5.20), with feeds up to 26 h old, treating one asset unit as $1
 (`PortfolioStrategy._sellFloor`, `_feedPrice`). CL settle floors on pool spot within
 `maxTwapDeviationBps` ticks (≤ about 10.5%) of a TWAP that may be 300 s long (`_swapToAsset`). Each
 settle swap, and each CL rerange (≤ 20), can be sandwiched to its floor. The CL strategy is out of the audit scope; available at launch, use at your own risk.
@@ -329,8 +329,12 @@ parameters, each swap floored at feed − `maxSlippageBps`.
 When the venue trades below feed × (1 − `maxSlippageBps`) settle and `unstick` revert, and the
 proposer can only tighten. The exit is `settleWithSlippage(bps)`, vault-only and capped at
 `MAX_EMERGENCY_SLIPPAGE_BPS` (50%), placed in an owner `emergencySettleWithCalls` batch so guardians
-review the tolerance (SHE-474). A proposer may also declare it as a settle leg at propose; guardians
-SHOULD block a declared settle tolerance above the clone's `maxSlippageBps`.
+review the tolerance (SHE-474). It sells through the proposer's fixed routes: when the gap is the
+route's own pool (proposer-controlled, SHE-473), the loose settle pays that gap to the proposer, so the exit
+is `rescueTo` plus a new clone instead. A proposer may also declare it as a settle leg at propose, and
+after the 7 d grace anyone may run that leg through `unstick`; guardians SHOULD block a declared settle
+tolerance above the clone's `maxSlippageBps`. Governance SHALL NOT class-certify `settleWithSlippage`,
+and a class bound on Portfolio `settle` covers only `maxSlippageBps`, never a declared loose leg.
 
 **5.21 CL TWAP grief.** On a low-cardinality pool, anyone can make execute, rerange or settle revert
 `TwapUnavailable` with a few small swaps in separate blocks (`_tryTwapTick`). The permissionless remedy
