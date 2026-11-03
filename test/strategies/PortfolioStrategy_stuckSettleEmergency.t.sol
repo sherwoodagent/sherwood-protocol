@@ -405,6 +405,50 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         assertEq(tsla.balanceOf(address(vault)), 500e18, "rescue did not land");
     }
 
+    function _looseSettleCalls(address strategy, uint256 bps)
+        internal
+        pure
+        returns (BatchExecutorLib.Call[] memory calls)
+    {
+        calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: strategy, data: abi.encodeCall(PortfolioStrategy.settleWithSlippage, (bps)), value: 0
+        });
+    }
+
+    /// @notice Venue 15% under a live feed: settle, unstick and a proposer loosen all revert; the
+    ///         owner's reviewed `settleWithSlippage(2000)` sells the basket at the venue and closes the proposal.
+    function test_venueBelowFeed_reviewedLooseSettleUnwinds() public {
+        (PortfolioStrategy strategy, uint256 pid) = _executedBasket();
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        adapter.setRate(address(tsla), address(usdc), 85e6); // 1 TSLA -> 85 USDC
+
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        feed.setUpdatedAt(vm.getBlockTimestamp());
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        governor.settleProposal(pid);
+        vm.prank(owner);
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        governor.unstick(pid);
+        bytes memory loosen = abi.encode(new uint256[](0), uint256(1_000), new bytes[](0));
+        vm.prank(agent);
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        strategy.updateParams(loosen);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _looseSettleCalls(address(strategy), 2_000));
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        feed.setUpdatedAt(vm.getBlockTimestamp());
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+        assertEq(tsla.balanceOf(address(strategy)), 0, "basket left on the clone");
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore + 42_500e6, "500 TSLA at the 85 USDC venue");
+        assertFalse(vault.redemptionsLocked());
+    }
+
     /// @notice Control: with a live feed the ordinary `settleProposal` clears at the same point.
     function test_settle_clearsWhenFeedIsLive() public {
         (PortfolioStrategy strategy, uint256 pid) = _executedBasket();
