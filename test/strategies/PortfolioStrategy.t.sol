@@ -1105,6 +1105,65 @@ contract PortfolioStrategyTest is Test {
 
     // ==================== HELPERS ====================
 
+    // ==================== SETTLE WITH SLIPPAGE ====================
+
+    /// @notice Only the vault may loosen the settle tolerance; the proposer cannot.
+    function test_settleWithSlippage_onlyVault() public {
+        _executeStrategy();
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.settleWithSlippage(2_000);
+    }
+
+    /// @notice The tolerance may only loosen, up to `MAX_EMERGENCY_SLIPPAGE_BPS`.
+    function test_settleWithSlippage_bounds() public {
+        _executeStrategy();
+        uint256 ceiling = 5_000;
+        vm.startPrank(vault);
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        strategy.settleWithSlippage(MAX_SLIPPAGE - 1);
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        strategy.settleWithSlippage(ceiling + 1);
+        strategy.settleWithSlippage(ceiling);
+        vm.stopPrank();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+        assertEq(strategy.maxSlippageBps(), ceiling);
+    }
+
+    /// @notice The lower bound is inclusive: the clone's own tolerance settles.
+    function test_settleWithSlippage_atCurrentToleranceSettles() public {
+        _executeStrategy();
+        vm.prank(vault);
+        strategy.settleWithSlippage(MAX_SLIPPAGE);
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    function test_settleWithSlippage_beforeExecute_reverts() public {
+        vm.prank(vault);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.settleWithSlippage(2_000);
+    }
+
+    /// @notice Each sell floors at feed x (1 - the passed tolerance): one bp under reverts, at it clears.
+    function test_settleWithSlippage_floorsAtThePassedTolerance() public {
+        _executeStrategy();
+        uint256 bps = 2_000;
+        uint256 keep = 10_000 - bps;
+        adapter.setRate(address(tsla), address(usd), (0.01e18 * (keep - 1)) / 10_000);
+        adapter.setRate(address(amzn), address(usd), (0.02e18 * keep) / 10_000);
+        adapter.setRate(address(nflx), address(usd), (0.005e18 * keep) / 10_000);
+
+        vm.prank(vault);
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.settleWithSlippage(bps);
+
+        adapter.setRate(address(tsla), address(usd), (0.01e18 * keep) / 10_000);
+        uint256 vaultBefore = usd.balanceOf(vault);
+        vm.prank(vault);
+        strategy.settleWithSlippage(bps);
+        assertEq(usd.balanceOf(vault) - vaultBefore, (TOTAL_AMOUNT * keep) / 10_000);
+    }
+
     function _executeStrategy() internal {
         vm.prank(vault);
         usd.approve(address(strategy), TOTAL_AMOUNT);

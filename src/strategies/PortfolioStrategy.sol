@@ -70,6 +70,8 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     /// @notice Slippage tolerance bounds, at init and on every update.
     uint256 public constant MAX_SLIPPAGE_CEILING_BPS = 1_000;
     uint256 public constant MIN_SLIPPAGE_BPS = 50;
+    /// @notice Ceiling for `settleWithSlippage`, the owner's exit when the venue trades below the feed floor.
+    uint256 public constant MAX_EMERGENCY_SLIPPAGE_BPS = 5_000;
     /// @notice Flat max age of a feed reading on every path: 24h heartbeat + 2h grace.
     uint256 public constant MAX_PUSH_PRICE_AGE = 26 hours;
     /// @notice Floors treat one asset unit as $1, so the ledger must price it within this band.
@@ -219,6 +221,16 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         }
 
         _pushAllToVault(asset);
+    }
+
+    /// @notice Settle at a looser tolerance. Vault-only, so it runs only inside a reviewed governor
+    ///         batch; the proposer cannot loosen (SHE-474).
+    function settleWithSlippage(uint256 slippageBps) external onlyVault {
+        if (slippageBps < maxSlippageBps || slippageBps > MAX_EMERGENCY_SLIPPAGE_BPS) revert InvalidSlippage();
+        if (_state != State.Executed) revert NotExecuted();
+        maxSlippageBps = slippageBps;
+        _state = State.Settled;
+        _settle();
     }
 
     // ── Update params ──

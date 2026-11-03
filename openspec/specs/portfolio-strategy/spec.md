@@ -95,6 +95,18 @@ the slot's feed price less `maxSlippageBps`. The floor is the only bound on a
 fill: the pool behind a route is proposer data and is not attested, so a
 proposer-controlled venue can fill every leg at the floor (accepted risk 5.18).
 
+`settleWithSlippage(slippageBps)` SHALL be callable only by the vault, SHALL
+revert `InvalidSlippage` unless `maxSlippageBps <= slippageBps <=
+MAX_EMERGENCY_SLIPPAGE_BPS` (5_000), and SHALL settle with every sell floored at
+the feed price less `slippageBps`. It is the owner's exit, through a reviewed
+emergency batch, when the venue trades below the ordinary floor. It sells through
+the routes set at init, so when the gap is the route's own pool the exit is
+`rescueTo` of the basket followed by `settle()` (guardian reviewer rule, clause 6).
+
+#### Scenario: Venue below the feed floor
+- **WHEN** the venue trades below feed × (1 − `maxSlippageBps`) after the duration
+- **THEN** `settleProposal` and `unstick` revert, a proposer `updateParams` loosening reverts `InvalidSlippage`, and an owner emergency batch calling `settleWithSlippage` within the venue's gap settles the proposal
+
 #### Scenario: Zero slippage at init rejected
 - **WHEN** a proposer initializes a clone with `maxSlippageBps = 0`
 - **THEN** initialization reverts `InvalidSlippage`
