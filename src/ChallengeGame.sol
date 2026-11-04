@@ -287,7 +287,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     mapping(bytes32 reviewKey => bool) internal _convicted;
 
     /// @dev Whether this proposal's challenge window has already been re-armed
-    ///      by a silent failure. Once per key.
+    ///      by a silent failure. Once per key, and only by a re-arm that extends the deadline.
     mapping(bytes32 reviewKey => bool) internal _rearmed;
 
     /// @dev Bounds the constructed `challengeWindow` against the wired ledger's
@@ -358,6 +358,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 extended = challengeableUntil[key];
         if (extended > deadline) deadline = extended;
         if (block.timestamp > deadline) revert WindowClosed();
+        // Seed the baseline so a re-arm is only spent when it actually extends it (SHE-488).
+        if (extended < deadline) challengeableUntil[key] = deadline;
 
         // The named adapter must appear in the proposal's own stored execute
         // calls — a membership test over data the governor already holds, not
@@ -685,10 +687,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // window close, so a re-filer cycling addresses cannot keep a cohort's
         // coverage pinned indefinitely.
         if (_convicted[rk] || _rearmed[rk]) return;
-        _rearmed[rk] = true;
         uint256 extended = block.timestamp + challengeWindow;
-        if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
-        exposureLedger.pinCoverageUntil(governor, proposalId, challengeableUntil[rk]);
+        // An inert extension (inside the deadline already seeded by `file`) does not spend the re-arm.
+        if (extended <= challengeableUntil[rk]) return;
+        _rearmed[rk] = true;
+        challengeableUntil[rk] = extended;
+        exposureLedger.pinCoverageUntil(governor, proposalId, extended);
     }
 
     function _fail(uint256 challengeId, Challenge storage c) private {

@@ -37,6 +37,10 @@ contract MockChallengeGovernor {
         _proposals[proposalId].proposer = defaultProposer;
     }
 
+    function setStrategyDuration(uint256 proposalId, uint256 duration) external {
+        _proposals[proposalId].strategyDuration = duration;
+    }
+
     function setDefaultCall(address target, bytes4 selector) external {
         defaultTarget = target;
         defaultSelector = selector;
@@ -593,6 +597,13 @@ contract ChallengeGameTest is Test {
 
     function _executedAt(uint256 proposalId) internal view returns (uint256) {
         return gov.getProposal(proposalId).executedAt;
+    }
+
+    /// @dev `file` seeds `challengeableUntil` with this baseline (SHE-488).
+    function _baselineDeadline(uint256 proposalId) internal view returns (uint256) {
+        return
+            gov.getProposal(proposalId).executedAt + gov.getProposal(proposalId).strategyDuration
+                + game.challengeWindow();
     }
 
     function _filedAt(uint256 challengeId) internal view returns (uint256) {
@@ -1855,7 +1866,11 @@ contract ChallengeGameTest is Test {
     ///         reverts.
     function test_challengeableUntil_unsetFallsBackToExecutedAtPlusWindow() public {
         _fileStandard(PROPOSAL);
-        assertEq(game.challengeableUntil(_reviewKeyFor(address(gov), PROPOSAL)), 0, "unset until an unwind");
+        assertEq(
+            game.challengeableUntil(_reviewKeyFor(address(gov), PROPOSAL)),
+            _baselineDeadline(PROPOSAL),
+            "seeded with the baseline, unextended"
+        );
         vm.warp(vm.getBlockTimestamp() + 15 days);
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
         _fileStandardFrom(makeAddr("otherChallenger"), PROPOSAL);
@@ -2486,7 +2501,11 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "a minority convicts nobody");
         assertEq(swood.callCount(), 0, "and nothing was slashed");
-        assertEq(game.challengeableUntil(key), 0, "the acquittal cleared the quorum, so it adjudicated");
+        assertEq(
+            game.challengeableUntil(key),
+            _baselineDeadline(PROPOSAL),
+            "the acquittal cleared the quorum, so it adjudicated"
+        );
     }
 
     function test_anAcquitVoteDoesNotCountTowardTheQuorum() public {
@@ -2505,7 +2524,7 @@ contract ChallengeGameTest is Test {
     function test_silentFailureReArmsTheWindow() public {
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
         uint256 id = _fileStandard(PROPOSAL);
-        assertEq(game.challengeableUntil(key), 0, "nothing re-armed yet");
+        assertEq(game.challengeableUntil(key), _baselineDeadline(PROPOSAL), "nothing re-armed yet");
 
         vm.warp(vm.getBlockTimestamp() + game.voteWindow());
         game.resolve(id);
@@ -2550,6 +2569,31 @@ contract ChallengeGameTest is Test {
         );
         assertEq(game.challengeableUntil(key), rearmed, "the second silent failure buys nothing");
         assertEq(ledger.pinCoverageUntilCallCount(), pinCallsAfterFirst, "and pins nothing further on the ledger");
+    }
+
+    /// @notice SHE-488: an early silent failure whose extension falls inside the baseline does not spend the re-arm.
+    function test_earlySilentFailure_doesNotSpendTheReArm() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        gov.setStrategyDuration(PROPOSAL, 30 days);
+        uint256 early = _fileStandardAt(PROPOSAL, 1 days);
+        uint256 baseline = _baselineDeadline(PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(early).voteWindowAtFiling);
+        game.resolve(early);
+        assertEq(uint8(game.challengeOf(early).status), uint8(IChallengeGame.Status.Failed), "silent failure");
+        assertLt(vm.getBlockTimestamp() + game.challengeWindow(), baseline, "fixture: the extension is inert");
+        assertEq(game.challengeableUntil(key), baseline, "inert extension leaves the baseline");
+
+        vm.warp(baseline - 1);
+        uint256 late = _fileStandardFrom(challenger, PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(late).voteWindowAtFiling);
+        game.resolve(late);
+        assertEq(
+            game.challengeableUntil(key),
+            vm.getBlockTimestamp() + game.challengeWindow(),
+            "the late silent failure still re-arms"
+        );
+        vm.warp(baseline + 1);
+        assertGt(_fileStandardFrom(challenger, PROPOSAL), 0, "filing admitted past the baseline");
     }
 
     /// @notice A DUST ACQUIT IS NOT A VERDICT. Below the quorum the cohort did
@@ -2600,7 +2644,7 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
 
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "acquitted");
-        assertEq(game.challengeableUntil(key), 0, "a verdict on the merits does not re-arm");
+        assertEq(game.challengeableUntil(key), _baselineDeadline(PROPOSAL), "a verdict on the merits does not re-arm");
         assertEq(ledger.pinCoverageUntilCallCount(), pinCallsBefore, "and pins nothing on the ledger");
     }
 
@@ -2611,7 +2655,7 @@ contract ChallengeGameTest is Test {
     function test_missedQuorum_reArmsReChallengeWindowAndPinsTheLedger() public {
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
         uint256 id = _fileStandard(PROPOSAL);
-        assertEq(game.challengeableUntil(key), 0, "sanity: no re-arm has happened yet");
+        assertEq(game.challengeableUntil(key), _baselineDeadline(PROPOSAL), "sanity: no re-arm has happened yet");
 
         vm.warp(vm.getBlockTimestamp() + game.voteWindow());
         uint256 pinCallsBefore = ledger.pinCoverageUntilCallCount();
