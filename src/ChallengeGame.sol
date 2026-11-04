@@ -794,6 +794,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @inheritdoc IChallengeGame
+    /// @dev A policy indicator over live parameters, not per proposal: a diverted or bondless filing earns no fee.
     /// @dev WHY THE SIGN CARRIES THE WHOLE ANSWER: the challenger's payoff on
     ///      the quorum-reached path is the difference of the two products the
     ///      interface names, scaled by coverage and the WOOD price, both of

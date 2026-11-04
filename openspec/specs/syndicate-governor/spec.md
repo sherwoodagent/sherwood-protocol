@@ -466,3 +466,9 @@ The governor SHALL derive, at execute time, an effective capital ceiling from th
 - **WHEN** a proposal executes at 50% coverage
 - **THEN** every execute and settlement call cap is floored to half its declared value, the per-batch sum is re-asserted against `effectiveMaxCapital` after rounding, and the scaled settlement caps are persisted at execute
 
+### Requirement: A registry pause cannot hold a proposal past executeBy
+While the guardian registry is paused and a proposal's review outcome is determinable but not yet resolved, the resolver SHALL report `GuardianReview` only until `executeBy`; once `block.timestamp > executeBy` it SHALL report `Expired`, as the sibling review branches do. A committed `Expired` releases the vault binding; approver slashes remain collectable through the registry's permissionless `resolveReview` after unpause.
+
+#### Scenario: Paused past reviewEnd, the proposal expires at executeBy
+- **WHEN** a proposal is `Approved` after `reviewEnd`, the registry owner pauses the registry, and the clock passes `executeBy`
+- **THEN** `getProposalState` reports `Expired`, and `resolveProposalState` commits `Expired` and frees the vault

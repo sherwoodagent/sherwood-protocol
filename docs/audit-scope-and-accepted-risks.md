@@ -94,7 +94,9 @@ with values from `RobinhoodParams.sol`:
 - **Who may deposit.** `depositsRestricted` is on: `SyndicateVault._depositsOpen` is false, so
   `deposit`, `mint`, `requestDeposit` and `settleDeposit` admit only receivers the vault owner added
   with `approveDepositor`. The check is on the receiver, not the payer (anyone can pay on behalf of an
-  approved receiver), and the owner can approve itself.
+  approved receiver), and the owner can approve itself. `requestDeposit(assets, receiver)` makes the
+  receiver the request's controller (ERC-7540): only the receiver can `cancel`, and a cancel refunds
+  the receiver, not the payer (SHE-484, accepted).
 - **Identity gating.** `createSyndicate` and `SyndicateVault.registerAgent` check ERC-8004 ownership
   against the factory's live `agentRegistry`, at registration time only.
 - **The Safe can relax each flag at once:** `setOwnerOnlyProposals(false)`,
@@ -137,7 +139,8 @@ state needs a beacon upgrade by the Safe.
 
 A blocked round burns the whole posted owner bond (`StakedWood.slashOwnerBond`; the bond is at least
 `requiredOwnerBond` = max(`minOwnerStake`, `MIN_OWNER_BOND_FLOOR`)), and the same owner may re-bond and
-retry (`SyndicateFactory.rotateOwner` to itself is allowed mid-proposal). The veto electorate is the
+retry (`SyndicateFactory.rotateOwner` to itself is allowed mid-proposal; a same-owner rotation keeps
+the vault's agent set, SHE-483). The veto electorate is the
 proposal's propose-time snapshot: `openEmergency` stores `getPastTotalVotes(snapshotAt)` as
 `totalStakeAtOpen` and `snapshotAt` itself as `er.openedAt` (falling back to `block.timestamp − 1` only
 for a review registered before `snapshotAt` existed), and each block vote weighs
@@ -145,6 +148,15 @@ for a review registered before `snapshotAt` existed), and each block vote weighs
 bar, and guardians who have since left still count. Accepted because the path exists to unwind a stuck
 strategy and an on-chain check that the strategy unwound would lock it again. Bounded only by the
 guardian review and the bond. Reviewer rule: `docs/guardian-network.md`, "Reviewer rule".
+
+A blocked round slashes only when it is resolved. Settlement does not resolve an open round, and
+`finalizeEmergencySettle` reverts on a blocked one, rolling its slash back. If nobody calls
+`resolveEmergencyReview` after `reviewEnd`, the owner can `unstick`, `requestUnstakeOwner` and claim
+the bond after the owner cooldown (7 d at launch) against a 24 h review: whoever resolves first wins.
+Accepted (SHE-485): resolution is permissionless, and the guardian daemon SHOULD call
+`resolveEmergencyReview` as soon as a blocked round passes `reviewEnd`. A block vote lands only while
+the governor reports the proposal `Executed` (`voteBlockEmergencySettle`, SHE-486), so a round made
+moot by a third-party settle cannot be blocked afterwards; votes cast before the settle still count.
 
 **5.2 Challenge vote.** A ballot is `min(getPastStake(voter, filedAt − 1), getPastStake(voter,
 snapshotAt))` (`ChallengeGame.voteOnChallenge`), so only stake held at the propose-time snapshot
@@ -159,6 +171,17 @@ at filing; the approvers' slash rates are read at settlement (`_settle` → `sla
 by sWOOD's live `minSlashBps` / `maxSlashBps`. Accepted as the cost of a snapshot electorate; bounded
 by `challengeQuorumBps` (owner-set in [10%, 100%]) and the one-shot re-arm. Documented in the
 challenge-game spec and `docs/guardian-network.md`.
+
+A second correct filing that settles after the verdict was collected is diverted
+(`VerdictAlreadyCollected`): it earns no prosecutor fee and still burns `settleBurnBps` of its bond. A
+correct filing also earns no fee when no proposer bond is locked (no escrow wired, or zero coverage).
+`honestFilingBreaksEven()` is a policy indicator over live parameters, not a per-proposal promise
+(SHE-492, accepted).
+
+A conviction demotes the named `(target, selector)` in `TierRegistry` for every vault until the Safe
+re-certifies it (`ChallengeGame._settle` → `TierRegistry.demoteByChallenge`), so every later proposal
+using it prices at tier 2, and the governor re-reads `tierOf` at execute. Clones are class-certified, so scoping the demotion
+to one clone would not narrow it (SHE-491, accepted).
 
 **5.3 Price outages halt the protocol while the challenge window runs.** A stale vault-asset feed
 makes every `propose` revert (`ExposureLedger.requireWithinCoveredTvlCap` → `coverageUsd` reverts
@@ -218,6 +241,10 @@ any registered strategy (`SyndicateVault._guardBatchCalls`); containment comes f
 rules (`AssetCallRules.spenderOf`, allowances reset after each batch) and guardian review.
 It also requires code and pins the codehash; a proxy keeps its codehash when its implementation is
 swapped, and a registered target need not name the vault whose batch calls it.
+`propose` does not tie the strategy's `proposer()` to `msg.sender`: `proposer()` is self-declared
+and guardians review it. Since the deterministic clone salt binds the deployer (SHE-481), an agent
+proposing another agent's clone does so knowingly, and only once `ownerOnlyProposals` is off (SHE-482,
+accepted).
 
 **5.8 New vaults ship with the capital caps inert.** `maxCapitalBps()` and `tier2CallCapBps()` read
 100% until set, and `minBufferBps` is 0 (`GovernorParameters`, `SyndicateVault.setMinBufferBps`). Only
@@ -277,7 +304,8 @@ whitelisted holder can transfer shares to any address while `depositsRestricted`
 (`SyndicateVault.startManagementAccrual` from `executeProposal`): the whole fund, not the deployed
 capital. It accrues until settle regardless of P&L, including while the vault is paused or settle is
 blocked (`SyndicateGovernor._chargeManagementFee`). At launch the proposer is the owner, so the agent
-share goes to the owner.
+share goes to the owner. The performance fee is measured on the vault's balance delta across the
+proposal, so a third-party donation made while `Executed` is charged as profit (SHE-490, accepted).
 
 **5.15 Guardian review.** Review ballots weigh raw stake at the propose-time snapshot
 (`getPastStake(voter, snapshotAt)`, `GuardianRegistry.voteOnProposal`). There is no age discount;
@@ -286,7 +314,11 @@ votes at full weight. Blockers are uncapped and carry no slash exposure. Block w
 `blockQuorumBps` (30%) of `getPastTotalVotes(snapshotAt)` rejects the proposal and slashes every
 approver at lock rate × severity (`resolveReview`, `_reviewSlashRates`); severity ramps from
 `minSlashBps` to `maxSlashBps` as block weight approaches the supermajority (`_severityBps`). Stake
-that does not vote raises the bar.
+that does not vote raises the bar. `voteOnProposal` does not exclude the proposer, co-proposers or
+owner (`voteOnChallenge` does): an identity exclusion is defeated by a second address, and a
+self-approver's lock stays slashable on both the review and the challenge path. A proposer holding
+most of the stake can approve past any block; that is the capital-dominance residual of 5.2 (SHE-489,
+accepted).
 
 **5.16 Ceremony windows.** Both `ProtocolConfig` fee recipients are seeded to the deployer key
 (`Deploy._seatOwnerWrites`) until the Safe calls `setProtocolFeeRecipient` /
