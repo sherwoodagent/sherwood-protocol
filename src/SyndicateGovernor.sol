@@ -1133,6 +1133,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     function _mirrorBatchLeg(address vault_, address asset_, BatchExecutorLib.Call[] calldata calls_) private view {
         for (uint256 i = 0; i < calls_.length; i++) {
+            if (calls_[i].value != 0) revert ISyndicateVault.CallValueNotAllowed(i);
             address t = calls_[i].target;
             if (t == asset_) AssetCallRules.spenderOf(vault_, calls_[i].data);
             else if (!_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
