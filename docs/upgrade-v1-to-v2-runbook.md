@@ -19,12 +19,21 @@ is the v2 `ChallengeGame` deployed in step 1.
 | `GuardianRegistry` | Upgrade in place: `upgradeToAndCall` (UUPS) | Storage layout unchanged; no `reinitializer` needed |
 | `SyndicateFactory` | None | Byte-identical between the two versions |
 | `StakedWood` | None | Differs only in comments |
-| `SyndicateVault` | None | The Safe cannot: `upgradeVault` is creator-only and needs `upgradesEnabled`. Not needed: v1 and v2 vaults behave the same |
+| `SyndicateVault` | None | The Safe cannot: `upgradeVault` is creator-only and needs `upgradesEnabled`. Live vaults keep v1 behaviour (see below) |
+| `StrategyFactory` | None | Redeploying it unregisters live clones. The live factory keeps the v1 clone salt (see below) |
 | `ChallengeGame` | **Deploy new**, under a NEW CREATE3 salt, on the existing ledger | v2 game is a rewrite; it is not a proxy |
 | `ExposureLedger` | **KEEP the v1 instance** | See below |
 | `ProposerBondEscrow` | **KEEP the v1 instance** | Its ledger is immutable; a new escrow would need a new ledger |
 | `TierRegistry` | Keep (default) or redeploy (optional, §5) | Every function v2 calls on it exists on the v1 registry |
 | `TokenCourt` | Retire after the drain | v2 has no court; keep it running until every old challenge is ruled or timed out |
+
+**SHE-470 fixes that do not reach live 4663 contracts.** Vault-side L-1 (net buffer floor), L-2
+(`Call.value` refused) and L-5 (same-owner rotation keeps agents) apply only to vaults deployed from the
+v2 vault impl. Existing vaults keep v1 behaviour: gross buffer formula, agents drained on every
+rotation, and emergency batches still accept `Call.value` at `finalizeEmergencySettle` (the governor's
+L-2 mirror covers `propose` only). L-3 (sender-bound clone salt) applies only to a newly deployed
+`StrategyFactory`; the live factory keeps `keccak256(abi.encode(vault, salt))`, so SDK
+sherwoodagent/sherwood#737 must not ship while that factory is the one clients talk to.
 
 **Why the ledger and escrow are kept.** A fresh `ExposureLedger` knows none
 of the live approver locks, freezes or pins. Re-pointing staking at it lets the
@@ -155,7 +164,8 @@ the same Safe batch, BEFORE any governor or the new game is pointed at `TR2`:
 1. Deploy `TierRegistry(SAFE)` the same way as the game in step 1b:
    `create3Factory.deploy(keccak256("sherwood.robinhood.v2.tier-registry"), ...)`.
 2. `TR2.setStrategyFactory(<existing StrategyFactory>)` — do not redeploy the
-   StrategyFactory; existing clones must stay registered.
+   StrategyFactory; existing clones must stay registered. The existing factory keeps the
+   v1 clone salt, so SHE-481 (L-3) does not apply on 4663 (§1).
 3. Replay every certification: `TR2.certify(target, selector, tier, boundBps, expectedCodehash)`
    and `TR2.certifyClass(template, selector, tier, boundBps, expectedTemplateCodehash)`.
 4. Replay the counterparty allowlist: `TR2.setCounterpartyAllowed(counterparty, true)`

@@ -139,8 +139,8 @@ state needs a beacon upgrade by the Safe.
 
 A blocked round burns the whole posted owner bond (`StakedWood.slashOwnerBond`; the bond is at least
 `requiredOwnerBond` = max(`minOwnerStake`, `MIN_OWNER_BOND_FLOOR`)), and the same owner may re-bond and
-retry (`SyndicateFactory.rotateOwner` to itself is allowed mid-proposal; a same-owner rotation keeps
-the vault's agent set, SHE-483). The veto electorate is the
+retry (`SyndicateFactory.rotateOwner` to itself is allowed mid-proposal; on v2-impl vaults a same-owner
+rotation keeps the agent set, SHE-483; live v1 vaults still drain it). The veto electorate is the
 proposal's propose-time snapshot: `openEmergency` stores `getPastTotalVotes(snapshotAt)` as
 `totalStakeAtOpen` and `snapshotAt` itself as `er.openedAt` (falling back to `block.timestamp − 1` only
 for a review registered before `snapshotAt` existed), and each block vote weighs
@@ -157,6 +157,8 @@ Accepted (SHE-485): resolution is permissionless, and the guardian daemon SHOULD
 `resolveEmergencyReview` as soon as a blocked round passes `reviewEnd`. A block vote lands only while
 the governor reports the proposal `Executed` (`voteBlockEmergencySettle`, SHE-486), so a round made
 moot by a third-party settle cannot be blocked afterwards; votes cast before the settle still count.
+An emergency call with non-zero `value` is stored at `openEmergency` and refused only at
+`finalizeEmergencySettle` (SHE-480): owner-caused and retryable, so accepted.
 
 **5.2 Challenge vote.** A ballot is `min(getPastStake(voter, filedAt − 1), getPastStake(voter,
 snapshotAt))` (`ChallengeGame.voteOnChallenge`), so only stake held at the propose-time snapshot
@@ -180,8 +182,9 @@ correct filing also earns no fee when no proposer bond is locked (no escrow wire
 
 A conviction demotes the named `(target, selector)` in `TierRegistry` for every vault until the Safe
 re-certifies it (`ChallengeGame._settle` → `TierRegistry.demoteByChallenge`), so every later proposal
-using it prices at tier 2, and the governor re-reads `tierOf` at execute. Clones are class-certified, so scoping the demotion
-to one clone would not narrow it (SHE-491, accepted).
+using it prices at tier 2, and the governor re-reads `tierOf` at execute. Demotion is per address: a
+convicted clone loses its tier alone, and its siblings keep the class tier. A shared address-certified
+adapter is demoted for every vault until the Safe re-certifies it (SHE-491, accepted).
 
 **5.3 Price outages halt the protocol while the challenge window runs.** A stale vault-asset feed
 makes every `propose` revert (`ExposureLedger.requireWithinCoveredTvlCap` → `coverageUsd` reverts
@@ -242,8 +245,8 @@ rules (`AssetCallRules.spenderOf`, allowances reset after each batch) and guardi
 It also requires code and pins the codehash; a proxy keeps its codehash when its implementation is
 swapped, and a registered target need not name the vault whose batch calls it.
 `propose` does not tie the strategy's `proposer()` to `msg.sender`: `proposer()` is self-declared
-and guardians review it. Since the deterministic clone salt binds the deployer (SHE-481), an agent
-proposing another agent's clone does so knowingly, and only once `ownerOnlyProposals` is off (SHE-482,
+and guardians review it. On a factory deployed with SHE-481 the deterministic clone salt binds the
+deployer (the live 4663 factory does not), so an agent proposing another agent's clone does so knowingly, and only once `ownerOnlyProposals` is off (SHE-482,
 accepted).
 
 **5.8 New vaults ship with the capital caps inert.** `maxCapitalBps()` and `tier2CallCapBps()` read

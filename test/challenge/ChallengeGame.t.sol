@@ -1861,10 +1861,8 @@ contract ChallengeGameTest is Test {
         );
     }
 
-    /// @notice With nothing re-arming it, the gate is
-    ///         `executedAt + challengeWindow`, unextended, and filing past it
-    ///         reverts.
-    function test_challengeableUntil_unsetFallsBackToExecutedAtPlusWindow() public {
+    /// @notice The first filing seeds the gate with the unextended baseline, and filing past it reverts.
+    function test_challengeableUntil_seededAtFirstFilingToExecutedAtPlusWindow() public {
         _fileStandard(PROPOSAL);
         assertEq(
             game.challengeableUntil(_reviewKeyFor(address(gov), PROPOSAL)),
@@ -2594,6 +2592,31 @@ contract ChallengeGameTest is Test {
         );
         vm.warp(baseline + 1);
         assertGt(_fileStandardFrom(challenger, PROPOSAL), 0, "filing admitted past the baseline");
+    }
+
+    /// @notice SHE-488: a silent failure whose extension equals the baseline exactly does not spend the re-arm.
+    function test_silentFailureAtBaselineEquality_doesNotSpendTheReArm() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        gov.setStrategyDuration(PROPOSAL, 30 days);
+        uint256 early = _fileStandardAt(PROPOSAL, 1 days);
+        uint256 baseline = _baselineDeadline(PROPOSAL);
+        uint256 pinCallsBefore = ledger.pinCoverageUntilCallCount();
+
+        vm.warp(baseline - game.challengeWindow());
+        game.resolve(early);
+        assertEq(uint8(game.challengeOf(early).status), uint8(IChallengeGame.Status.Failed), "silent failure");
+        assertEq(vm.getBlockTimestamp() + game.challengeWindow(), baseline, "fixture: extension equals the baseline");
+        assertEq(game.challengeableUntil(key), baseline, "deadline unchanged");
+        assertEq(ledger.pinCoverageUntilCallCount(), pinCallsBefore, "an equal extension pins nothing");
+
+        uint256 late = _fileStandardFrom(challenger, PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(late).voteWindowAtFiling);
+        game.resolve(late);
+        assertEq(
+            game.challengeableUntil(key),
+            vm.getBlockTimestamp() + game.challengeWindow(),
+            "the re-arm was not spent, so a later silent failure still extends"
+        );
     }
 
     /// @notice A DUST ACQUIT IS NOT A VERDICT. Below the quorum the cohort did

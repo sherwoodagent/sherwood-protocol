@@ -29,7 +29,15 @@ contract LifecyclePausedExpiryTest is She470Harness {
             "held in review while paused"
         );
 
-        vm.warp(p.governor.getProposal(pid).executeBy + 1);
+        uint256 executeBy = p.governor.getProposal(pid).executeBy;
+        vm.warp(executeBy);
+        assertEq(
+            uint256(p.governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
+            "still in review at executeBy exactly"
+        );
+
+        vm.warp(executeBy + 1);
         assertEq(
             uint256(p.governor.getProposalState(pid)),
             uint256(ISyndicateGovernor.ProposalState.Expired),

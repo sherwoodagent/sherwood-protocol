@@ -10,19 +10,22 @@ pre-batch balance). Batches with `maxNetOutflow == 0` skip it. With the net form
 can never breach (its `balanceAfter ≥ balanceBefore`, and the reserve check already runs), so the skip
 is defence in depth and has no observable mutant; the formula change is what un-wedges a settle after
 an owner raise. Rejected: gating `setMinBufferBps` on an open proposal (not needed once settle cannot
-be wedged); dropping the knob.
+be wedged); dropping the knob. Applies only to vaults deployed from the v2 vault impl; live 4663 vaults keep v1 behaviour.
 
 **L-2 call value (SHE-480).** `CallValueNotAllowed(index)` in the vault guard and in the governor's
 propose-time mirror, so a stored leg still cannot pass propose and revert at settle. The vault has no
 ETH accounting and no `receive`, so nothing legitimate needs value. Rejected: none in the ticket.
+The vault check applies only to v2-impl vaults; on live 4663 vaults only the governor's propose-time
+mirror applies, so emergency batches there still accept value at finalize.
 
 **L-3 clone salt (SHE-481).** `keccak256(abi.encode(vault, msg.sender, salt))`. Since
 `proposer == msg.sender` is already enforced, this binds the predicted address to the proposer. The SDK
 predictor (`effectiveStrategySalt`) must fold the deployer the same way. Rejected: bundling clone and
-propose into one call (a larger interface change for the same result).
+propose into one call (a larger interface change for the same result). Applies only to a newly deployed
+`StrategyFactory`; the live 4663 factory keeps the 2-arg salt, so the SDK change must not ship against it.
 
 **L-5 same-owner rotation (SHE-483).** `rotateOwnership` drains agents only when `newOwner != owner()`.
-A new owner still never inherits an at-cap set. Rejected: none.
+A new owner still never inherits an at-cap set. Rejected: none. Applies only to vaults deployed from the v2 vault impl; live 4663 vaults keep v1 behaviour.
 
 **L-8 moot emergency round (SHE-486).** `voteBlockEmergencySettle` refuses unless the governor reports
 `Executed`. The SHE-471 `_governorInReview` probe is generalized into
@@ -60,8 +63,9 @@ path).
 - **L-12 (SHE-490)** A donation during `Executed` is charged the performance fee. The misleading
   comment in `_chargePerformanceFee` is corrected. Rejected: measuring P&L from batch flows.
 - **L-13 (SHE-491)** A conviction demotes `(target, selector)` protocol-wide until the Safe
-  re-certifies. Clones are class-certified, so per-clone scoping is moot. Rejected: per-clone demotion
-  and a second signal for shared adapters.
+  re-certifies. Demotion is per address: a convicted clone loses its tier alone and its siblings keep the
+  class tier; a shared address-certified adapter is demoted for every vault. Rejected: a second signal
+  for shared adapters.
 - **L-14 (SHE-492)** A diverted or bondless correct filing earns no fee and still burns
   `settleBurnBps`; `honestFilingBreaksEven` is a policy indicator. Rejected: skipping the burn on the
   diverted branch, and a per-key bond read in the view.

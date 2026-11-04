@@ -432,7 +432,8 @@ contract SyndicateVault is
         uint256 reserve = reservedQueueAssets();
         if (balanceAfter < reserve) revert QueueReserveBreached();
         // Idle-liquidity floor: an outflow batch may deploy at most (1 − minBufferBps) of the
-        // float net of the reserve. Zero-budget callers (settle, unstick, emergency) skip it.
+        // float net of the reserve. The zero-budget skip only saves gas: the outflow and reserve
+        // checks above already imply the floor when maxNetOutflow == 0.
         if (maxNetOutflow != 0) {
             uint256 deployable = balanceBefore > reserve ? balanceBefore - reserve : 0;
             if (balanceAfter < reserve + (deployable * minBufferBps) / 10_000) revert BufferBreached();

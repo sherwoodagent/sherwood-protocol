@@ -51,5 +51,8 @@ Documentation (`docs/audit-scope-and-accepted-risks.md`, natspec):
   `src/SyndicateGovernor.sol`, `src/ProposalLifecycle.sol`, `src/GuardianRegistry.sol`,
   `src/ChallengeGame.sol`, `src/StrategyFactory.sol`. No storage layout change.
 - Off-chain: the SDK's `effectiveStrategySalt` must become `keccak256(abi.encode(vault, deployer, salt))`
-  (tracked separately). The guardian daemon SHOULD call `resolveEmergencyReview` once a blocked round
-  passes `reviewEnd` (L-7).
+  (tracked separately), and must not ship while clients talk to the live 4663 factory. The guardian
+  daemon SHOULD call `resolveEmergencyReview` once a blocked round passes `reviewEnd` (L-7).
+- Deployment scope: the vault fixes (L-1, vault-side L-2, L-5) reach only vaults deployed from the v2
+  vault impl, and L-3 only a newly deployed `StrategyFactory`. Live 4663 vaults and the live factory keep
+  v1 behaviour (`docs/upgrade-v1-to-v2-runbook.md` §1).
