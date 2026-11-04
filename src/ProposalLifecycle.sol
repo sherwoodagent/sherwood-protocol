@@ -134,7 +134,9 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         }
         if (reg.paused()) {
             (, bool alreadyResolved,) = reg.getReviewState(address(this), p.id);
-            if (!alreadyResolved) return (ProposalState.GuardianReview, false);
+            if (!alreadyResolved) {
+                return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.GuardianReview, false);
+            }
         }
         if (o == IGuardianRegistry.ReviewOutcome.Blocked) return (ProposalState.Rejected, true);
         return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.Approved, true);
