@@ -576,7 +576,9 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
 
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
-        if (!_governorInReview(governor, proposalId)) revert ReviewNotOpen();
+        if (!_governorReports(governor, proposalId, ISyndicateGovernor.ProposalState.GuardianReview)) {
+            revert ReviewNotOpen();
+        }
         if (!r.opened) _openReview(r, governor, proposalId);
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
@@ -785,9 +787,9 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         emit EmergencyReviewCancelled(proposalId);
     }
 
-    /// @notice Returns true if an emergency review is open (not yet resolved)
-    ///         for the given proposal. Used by the governor's `_finishSettlement`
-    ///         to skip unnecessary `cancelEmergency` calls.
+    /// @notice Returns true if an emergency review is open (not yet resolved) for the given proposal.
+    ///         Read by `cancelEmergencySettle`. Settlement does not resolve an open round; a blocked
+    ///         round slashes only when someone calls `resolveEmergencyReview` (SHE-485).
     function isEmergencyOpen(address governor, uint256 proposalId) external view returns (bool) {
         bytes32 eKey = _reviewKey(governor, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
@@ -843,14 +845,17 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         _openReview(r, governor, proposalId);
     }
 
-    /// @dev SHE-471: a vote only lands while the governor itself reports GuardianReview, so a
-    ///      vetoed, cancelled or still-Pending (`== voteEnd`) proposal cannot seat a slashable approval.
+    /// @dev SHE-471 / SHE-486: a vote only lands while the governor itself reports `expected`.
     ///      Any failed or short read (no getter, revert) keeps the window-only check.
-    function _governorInReview(address governor, uint256 proposalId) private view returns (bool) {
+    function _governorReports(address governor, uint256 proposalId, ISyndicateGovernor.ProposalState expected)
+        private
+        view
+        returns (bool)
+    {
         (bool ok, bytes memory ret) =
             governor.staticcall(abi.encodeCall(ISyndicateGovernor.getProposalState, (proposalId)));
         if (!ok || ret.length < 32) return true;
-        return abi.decode(ret, (uint256)) == uint256(ISyndicateGovernor.ProposalState.GuardianReview);
+        return abi.decode(ret, (uint256)) == uint256(expected);
     }
 
     /// @dev Snapshots stake and the owner-settable thresholds at the open instant.
@@ -1062,6 +1067,8 @@ contract GuardianRegistry is IGuardianRegistry, OwnableUpgradeable, UUPSUpgradea
         // already-resolved review.
         if (er.resolved) revert ReviewNotOpen();
         if (er.reviewEnd == 0 || _effNow(er.clockShiftAtOpen) >= er.reviewEnd) revert ReviewNotOpen();
+        // A settled proposal makes the round moot: its calls can never run, so no new block weight lands.
+        if (!_governorReports(governor, proposalId, ISyndicateGovernor.ProposalState.Executed)) revert ReviewNotOpen();
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
         uint256 round = er.round;
         if (_emergencyBlockVotes[eKey][round][msg.sender]) revert AlreadyVoted();
