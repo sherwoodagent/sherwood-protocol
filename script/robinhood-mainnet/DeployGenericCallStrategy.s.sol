@@ -30,9 +30,9 @@ abstract contract DeployGenericCallStrategy is ScriptBase {
 }
 
 /// @title  DeployGenericCallTemplate
-/// @notice Live-chain path for a chain whose ceremony already handed off (4663): mints the template
-///         only. Approval is the owner's `StrategyFactory.setTemplateApproval(template, true)`, and the
-///         `GENERIC_CALL_TEMPLATE` address-book entry is added by hand; this script does neither.
+/// @notice Live-chain path for 4663, where `DeployAll` must not be re-run after run 2: mints the template
+///         only. The `StrategyFactory` owner (the deployer until a handoff is recorded) approves it, and the
+///         `GENERIC_CALL_TEMPLATE` book entry is added by hand; see the deployment runbook.
 contract DeployGenericCallTemplate is DeployGenericCallStrategy {
     function run() external {
         vm.startBroadcast();
