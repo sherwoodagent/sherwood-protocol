@@ -42,6 +42,12 @@ branch; file and function are cited so each can be checked.
     fund asks for a Morpho or CL strategy, the Safe reviews the market's five parameters and then
     allowlists its id (`TierRegistry.setMorphoMarketAllowed`); this is an on-request step, not a
     launch step.
+  - `src/strategies/GenericCallStrategy.sol`: out of the audit scope, offered on the same "use at your
+    own risk" terms. Unlike the two above, its clone CAN pay any address: it forwards proposer-written
+    calls, so the containment is narrower. The clone holds only the asset it pulled (it may not call
+    `transferFrom` or any extension on the asset), tier-2 coverage prices the full cap, and the
+    guardian review is the only judge of where the funds go. Never certified below tier 2. See
+    [`generic-call-strategy.md`](generic-call-strategy.md).
   - `src/vendor/**`: third-party code, checked against its upstream by
     `script/check-vendor-provenance.sh`.
   - `src/vesting/**`: standalone, not deployed by the ceremony.

@@ -58,14 +58,15 @@ Lane B only, and no current template overrides it).
 |----------|-------|
 | `BaseStrategy.sol` | Abstract base (custody, state machine, proposer-tunable params) |
 | `PortfolioStrategy.sol` | Weighted basket of tokens (e.g. tokenized stocks on Robinhood Chain) — buys to target weights on execute, sells out on settle, drift-only `rebalanceDelta()` off the aggregators bound at init |
+| `GenericCallStrategy.sol` | Any venue: runs a proposer-supplied execute leg and settle leg of calls fixed at init, so agents need no Solidity. Tier 2 forever, unaudited, at the fund's own risk — see [`docs/generic-call-strategy.md`](docs/generic-call-strategy.md) |
 
 #### Audit scope and unaudited strategies
 
 The external audit covers the core protocol: the governor, the vault and its withdrawal queue, the
 batch rules, the factory, the guardian registry and sWOOD, the exposure ledger and proposer bond
 escrow, the challenge game, the tier registry, the strategy factory and base strategy, the Portfolio
-strategy, the swap adapter, and the WOOD price feed. The concentrated-liquidity and Morpho supply
-strategies are not audited. They are available and offered use at your own risk: a fund owner who
+strategy, the swap adapter, and the WOOD price feed. The concentrated-liquidity, Morpho supply and
+generic-call strategies are not audited. They are available and offered use at your own risk: a fund owner who
 proposes one accepts that, and that fund's depositors bear the risk. The full scope and the
 accepted risks are in [`docs/audit-scope-and-accepted-risks.md`](docs/audit-scope-and-accepted-risks.md).
 

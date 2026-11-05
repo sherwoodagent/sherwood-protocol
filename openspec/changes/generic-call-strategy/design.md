@@ -139,4 +139,4 @@ The SHE-209 gate scans `src/strategies/` for token movements whose destination i
 
 ## Migration
 
-None on-chain. The template ships in source and in the ceremony; the live-chain path is a GO item: run the template phase, have the Safe call `StrategyFactory.setTemplateApproval(template, true)` (a `DeployAll` re-run cannot approve it on 4663, because `DeployStrategyFactory.deploy` requires the deployer to still own the TierRegistry), and add `GENERIC_CALL_TEMPLATE` to `chains/4663.json`.
+None on-chain. The template ships in source and in the ceremony; the live-chain path is a GO item: run `script/robinhood-mainnet/DeployGenericCallStrategy.s.sol:DeployGenericCallTemplate` (mints the template only), have the Safe call `StrategyFactory.setTemplateApproval(template, true)` (a `DeployAll` re-run cannot approve it on 4663, because `DeployStrategyFactory.deploy` requires the deployer to still own the TierRegistry), and add `GENERIC_CALL_TEMPLATE` to `chains/4663.json`.
