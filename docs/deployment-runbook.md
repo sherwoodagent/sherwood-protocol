@@ -25,7 +25,7 @@ One script, one broadcast: `script/robinhood-mainnet/DeployAll.s.sol:DeployAll`.
 Its phases run in a fixed order inside that broadcast — Create3Factory bootstrap,
 core (executor lib, vault impl, ProtocolConfig, governor beacon, sWOOD,
 GuardianRegistry, factory, TierRegistry + the launch set), UniswapSwapAdapter and
-the three strategy templates, StrategyFactory, the WOOD price source
+the four strategy templates (Portfolio, Morpho supply, concentrated liquidity, generic call), StrategyFactory, the WOOD price source
 (`WoodPoolFeed`, reading the WOOD/WETH V2 pair and the V3 pool booked beside it),
 Plan B, Plan D, handoff. Every address is `f(DEPLOYER, salt)` under CREATE3,
 so a re-run adopts what is already there instead of minting a second copy.

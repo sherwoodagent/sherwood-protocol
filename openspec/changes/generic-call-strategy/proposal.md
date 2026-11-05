@@ -13,7 +13,7 @@ Since `structural-batch-rules` (SHE-271, PR #315) a proposal batch reaches a thi
 - Recovery: `BaseStrategy.rescueTo(token)` for any ERC-20; new vault-only `rescueERC721To(token, tokenId)`; `onERC721Received` so venues that deliver NFTs with `safeTransferFrom` work.
 - Read-back for guardians: `executeCalls()`, `settleCalls()`, `sweepTokens()`, `grants()`, `pullAmount()`, `asset()`, `pinnedCodehash(target)`, `configHash()`, `name()`.
 - Deploy: a `DeployGenericCallStrategy` template phase in `DeployAll`, a `GENERIC_CALL_TEMPLATE` CREATE3 salt and address-book key, and the key added to `DeployStrategyFactory._templateKeys()`. Nothing is run or deployed by this change.
-- Docs: `docs/generic-call-strategy.md`, the README template table and the audit-scope page list the template as unaudited and at the fund's own risk, tier 2 forever.
+- Docs: `docs/generic-call-strategy.md`, the README template table and the audit-scope page list the template as unaudited and at the syndicate's own risk, tier 2 forever.
 
 ## Capabilities
 

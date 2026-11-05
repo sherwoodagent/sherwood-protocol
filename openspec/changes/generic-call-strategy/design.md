@@ -34,7 +34,7 @@ For every call in both legs:
 3. On the vault asset, the selector is `approve(address,uint256)` or `transfer(address,uint256)` and nothing else (`AssetCallNotAllowed`).
 4. `pinnedCodehash[target] = target.codehash` is recorded (D4).
 
-None of the denied contracts grants the clone a privilege: the clone is not an agent, not the vault and not the governor, and the lifecycle entry points are reentrancy-locked while a batch runs (D7). The denylist exists so a reviewer never has to reason about the clone touching the lifecycle directly. A venue can still call those contracts with its own identity; that confers nothing a stranger lacks. The list is read once at `initialize`: a later re-pointing of these addresses is an owner action, not an adversary.
+None of the denied contracts grants the clone a privilege: the clone is not an agent, not the vault and not the governor, and the lifecycle entry points are reentrancy-locked while a batch runs (D7). The denylist exists so a guardian never has to reason about the clone touching the lifecycle directly. A venue can still call those contracts with its own identity; that confers nothing a stranger lacks. The list is read once at `initialize`: a later re-pointing of these addresses is an owner action, not an adversary.
 
 ### D3 — The asset rule is the load-bearing control
 
@@ -105,7 +105,7 @@ The CLI's guardian walk reads every zero-argument getter whose output holds an a
 
 ### D11 — Tier and coverage
 
-`tierOf(clone, execute.selector)` is `(2, 10_000)`: the clone is uncertified, so coverage is the full declared cap on `clone.execute()`. The template SHALL never be certified, by address or by class: it is the surface `docs/adapter-onboarding-checklist.md` §2.1 refuses at tier 0/1 (an arbitrary-call forwarder whose destinations are fixed by calldata, not code). The template is outside the audit scope and offered at the fund's own risk, like the CL and Morpho templates.
+`tierOf(clone, execute.selector)` is `(2, 10_000)`: the clone is uncertified, so coverage is the full declared cap on `clone.execute()`. The template SHALL never be certified, by address or by class: it is the surface `docs/adapter-onboarding-checklist.md` §2.1 refuses at tier 0/1 (an arbitrary-call forwarder whose destinations are fixed by calldata, not code). The template is outside the audit scope and offered at the syndicate's own risk, like the CL and Morpho templates.
 
 `_scanCalls` refuses a tier-2 call whose cap exceeds `tier2CallCapBps` of TVL (`Tier2CallCapExceedsCeiling`). Arena vaults must keep `tier2CallCapBps` at or above the Arena size cap (8,000 bps) or a generic-call proposal at that size reverts at propose (SHE-407). Nothing here changes that parameter.
 

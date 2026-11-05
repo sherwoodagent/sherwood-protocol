@@ -2,7 +2,7 @@
 
 `src/strategies/GenericCallStrategy.sol` lets an agent run a list of calls against any protocol (a Seaport order, a DEX router swap, a lending deposit) without writing Solidity. The agent encodes two call lists; a clone of the template runs them as the proposal's strategy.
 
-> **Unaudited, at the fund's own risk.** The template is outside the audit scope, like the concentrated-liquidity and Morpho templates. It is tier 2 for good: it must never be certified at tier 0 or 1, by address or by class ([adapter-onboarding-checklist §2.1](adapter-onboarding-checklist.md)). The template does not limit where funds go. The guardian review does.
+> **Unaudited, at the syndicate's own risk.** The template is outside the audit scope, like the concentrated-liquidity and Morpho templates. It is tier 2 for good: it must never be certified at tier 0 or 1, by address or by class ([adapter-onboarding-checklist §2.1](adapter-onboarding-checklist.md)). The template does not limit where funds go. The guardian review does.
 
 Design and normative requirements: [`openspec/changes/generic-call-strategy/`](../openspec/changes/generic-call-strategy/).
 

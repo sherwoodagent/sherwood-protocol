@@ -34,7 +34,7 @@ The protocol addresses SHALL be resolved through raw length-checked staticcalls 
 
 ADVERSARY (asset rule): inside the execute batch the vault's allowance to the clone is live until the batch ends. A clone allowed `transferFrom(vault, …)` or a token extension such as `transferFromBatch` on the asset could spend that allowance beyond `pullAmount`. With only `approve` and `transfer`, both bounded by the clone's own balance, the most the clone can lose is `pullAmount`.
 
-ADVERSARY (denylist): the clone touching the lifecycle contracts directly. None grants the clone a privilege, but the list keeps a reviewer from having to prove it per proposal.
+ADVERSARY (denylist): the clone touching the lifecycle contracts directly. None grants the clone a privilege, but the list keeps a guardian from having to prove it per proposal.
 
 #### Scenario: Vault allowance cannot be widened
 - **WHEN** a clone is initialized with an execute call `asset.transferFrom(vault, attacker, n)`
@@ -130,7 +130,7 @@ ADVERSARY: an execute that lands an NFT, followed by a settle leg that can no lo
 
 ### Requirement: The template is tier 2 and never certified
 
-The generic-call template and its clones SHALL NOT be certified at tier 0 or 1, by address or by class: it is an arbitrary-call forwarder whose destinations are set by calldata, the surface `docs/adapter-onboarding-checklist.md` §2.1 refuses. Its calls SHALL therefore price at `(2, 10_000)` and need full-notional coverage. Its documentation SHALL state that it is outside the audit scope and offered at the fund's own risk, and SHALL list what a guardian checks: provenance (`StrategyFactory.cloneTemplate(clone)` equals the book's `GENERIC_CALL_TEMPLATE`), the two batch shapes, every inner call, and a simulation of both batches.
+The generic-call template and its clones SHALL NOT be certified at tier 0 or 1, by address or by class: it is an arbitrary-call forwarder whose destinations are set by calldata, the surface `docs/adapter-onboarding-checklist.md` §2.1 refuses. Its calls SHALL therefore price at `(2, 10_000)` and need full-notional coverage. Its documentation SHALL state that it is outside the audit scope and offered at the syndicate's own risk, and SHALL list what a guardian checks: provenance (`StrategyFactory.cloneTemplate(clone)` equals the book's `GENERIC_CALL_TEMPLATE`), the two batch shapes, every inner call, and a simulation of both batches.
 
 #### Scenario: A clone prices at full notional
 - **WHEN** a proposal's execute batch calls a generic-call clone's `execute()` with cap `c`
