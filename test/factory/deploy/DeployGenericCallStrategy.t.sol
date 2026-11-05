@@ -8,7 +8,7 @@ import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 import {BaseStrategy} from "../../../src/strategies/BaseStrategy.sol";
 import {GenericCallStrategy} from "../../../src/strategies/GenericCallStrategy.sol";
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
-import {GCRegistryStub, GCGovernorStub, GCVaultStub} from "../../mocks/GenericCallMocks.sol";
+import {GCRegistryStub, GCGovernorStub, GCVaultStub, GCGuardianRegistryStub} from "../../mocks/GenericCallMocks.sol";
 
 /// @title DeployGenericCallStrategy — the template deploy step
 /// @dev   The strategy's behaviour is covered under `test/strategies/GenericCallStrategy*.t.sol`;
@@ -22,6 +22,7 @@ contract DeployGenericCallStrategyTest is Test {
         GCRegistryStub registry = new GCRegistryStub();
         registry.setStrategyFactory(makeAddr("strategyFactory"));
         GCGovernorStub gov = new GCGovernorStub(address(registry));
+        gov.setGuardianRegistry(address(new GCGuardianRegistryStub(makeAddr("swood"))));
         vault = new GCVaultStub(address(new ERC20Mock("USDG", "USDG", 6)), address(gov), makeAddr("factory"));
     }
 
@@ -32,7 +33,13 @@ contract DeployGenericCallStrategyTest is Test {
     }
 
     function _emptyPlan() internal pure returns (bytes memory) {
-        return abi.encode(uint256(0), new BatchExecutorLib.Call[](0), new BatchExecutorLib.Call[](0), new address[](0));
+        return abi.encode(
+            uint256(0),
+            new BatchExecutorLib.Call[](0),
+            new BatchExecutorLib.Call[](0),
+            new GenericCallStrategy.BalancePatch[](0),
+            new address[](0)
+        );
     }
 
     /// @notice The template itself can never be initialized: only its clones can.

@@ -110,6 +110,18 @@ contract MockNftMarket {
     }
 }
 
+contract GCGuardianRegistryStub {
+    address public swood;
+
+    constructor(address swood_) {
+        swood = swood_;
+    }
+
+    function setSwood(address s) external {
+        swood = s;
+    }
+}
+
 contract GCRegistryStub {
     address public strategyFactory;
 
@@ -121,10 +133,20 @@ contract GCRegistryStub {
 /// @notice Governor stand-in: answers the binding walk with one active proposal whose strategy is settable.
 contract GCGovernorStub {
     address public tierRegistry;
+    address public guardianRegistry;
+    address public exposureLedger;
     address public activeStrategy;
 
     constructor(address registry) {
         tierRegistry = registry;
+    }
+
+    function setGuardianRegistry(address r) external {
+        guardianRegistry = r;
+    }
+
+    function setExposureLedger(address l) external {
+        exposureLedger = l;
     }
 
     function setActiveStrategy(address s) external {
@@ -144,6 +166,7 @@ contract GCVaultStub {
     address public asset;
     address public governor;
     address public factory;
+    address public withdrawalQueue;
 
     constructor(address asset_, address governor_, address factory_) {
         asset = asset_;
@@ -159,7 +182,26 @@ contract GCVaultStub {
         factory = f;
     }
 
+    function setWithdrawalQueue(address q) external {
+        withdrawalQueue = q;
+    }
+
     function isAgent(address) external pure returns (bool) {
         return true;
+    }
+}
+
+/// @notice Swap at a settable rate (`out = in * rate / 1e18`), minting the output token.
+contract MockRateSwap {
+    mapping(address tokenIn => mapping(address tokenOut => uint256)) public rate;
+
+    function setRate(address tokenIn, address tokenOut, uint256 r) external {
+        rate[tokenIn][tokenOut] = r;
+    }
+
+    function swap(address tokenIn, address tokenOut, uint256 amountIn) external returns (uint256 out) {
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        out = (amountIn * rate[tokenIn][tokenOut]) / 1e18;
+        ERC20Mock(tokenOut).mint(msg.sender, out);
     }
 }

@@ -210,7 +210,9 @@ contract GenericCallStrategyLifecycleTest is Test {
         returns (GenericCallStrategy c)
     {
         c = GenericCallStrategy(Clones.clone(address(template)));
-        c.initialize(address(vault), agent, abi.encode(PULL, e, s, new address[](0)));
+        c.initialize(
+            address(vault), agent, abi.encode(PULL, e, s, new GenericCallStrategy.BalancePatch[](0), new address[](0))
+        );
     }
 
     /// @dev The batch shape the Arena runner and the CLI emit, with caps [0, PULL] and [0].

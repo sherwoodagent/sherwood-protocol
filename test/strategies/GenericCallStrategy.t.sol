@@ -20,7 +20,9 @@ import {
     MockNftMarket,
     GCRegistryStub,
     GCGovernorStub,
-    GCVaultStub
+    GCVaultStub,
+    GCGuardianRegistryStub,
+    MockRateSwap
 } from "../mocks/GenericCallMocks.sol";
 
 abstract contract GenericCallFixture is Test {
@@ -31,8 +33,12 @@ abstract contract GenericCallFixture is Test {
     GCRegistryStub registry;
     GCGovernorStub gov;
     GCVaultStub vault;
+    GCGuardianRegistryStub guardianRegistry;
     address syndicateFactory = makeAddr("syndicateFactory");
     address strategyFactory = makeAddr("strategyFactory");
+    address swood = makeAddr("swood");
+    address queue = makeAddr("queue");
+    address ledger = makeAddr("ledger");
     MockCallVenue venue;
     GenericCallStrategy template;
 
@@ -44,7 +50,11 @@ abstract contract GenericCallFixture is Test {
         registry = new GCRegistryStub();
         registry.setStrategyFactory(strategyFactory);
         gov = new GCGovernorStub(address(registry));
+        guardianRegistry = new GCGuardianRegistryStub(swood);
+        gov.setGuardianRegistry(address(guardianRegistry));
+        gov.setExposureLedger(ledger);
         vault = new GCVaultStub(address(usdg), address(gov), syndicateFactory);
+        vault.setWithdrawalQueue(queue);
         venue = new MockCallVenue();
         template = new GenericCallStrategy();
         usdg.mint(address(vault), VAULT_FUNDS);
@@ -77,6 +87,10 @@ abstract contract GenericCallFixture is Test {
         return new address[](0);
     }
 
+    function _noPatch() internal pure returns (GenericCallStrategy.BalancePatch[] memory) {
+        return new GenericCallStrategy.BalancePatch[](0);
+    }
+
     /// @dev Default plan: deposit the pull into the venue, withdraw it at settle.
     function _depositLeg(uint256 amount) internal view returns (BatchExecutorLib.Call[] memory) {
         return _two(
@@ -99,9 +113,37 @@ abstract contract GenericCallFixture is Test {
         BatchExecutorLib.Call[] memory s,
         address[] memory sweep
     ) internal returns (GenericCallStrategy c) {
+        c = _initP(pull, e, s, _noPatch(), sweep);
+    }
+
+    function _initP(
+        uint256 pull,
+        BatchExecutorLib.Call[] memory e,
+        BatchExecutorLib.Call[] memory s,
+        GenericCallStrategy.BalancePatch[] memory patches,
+        address[] memory sweep
+    ) internal returns (GenericCallStrategy c) {
         c = _clone();
-        c.initialize(address(vault), proposer, abi.encode(pull, e, s, sweep));
+        c.initialize(address(vault), proposer, abi.encode(pull, e, s, patches, sweep));
         gov.setActiveStrategy(address(c));
+    }
+
+    function _patch(uint256 callIndex, uint256 wordIndex, address token)
+        internal
+        pure
+        returns (GenericCallStrategy.BalancePatch[] memory p)
+    {
+        p = new GenericCallStrategy.BalancePatch[](1);
+        p[0] = GenericCallStrategy.BalancePatch({callIndex: callIndex, wordIndex: wordIndex, token: token});
+    }
+
+    function _expectPatchRevert(BatchExecutorLib.Call[] memory s, GenericCallStrategy.BalancePatch[] memory p)
+        internal
+    {
+        GenericCallStrategy c = _clone();
+        bytes memory data = abi.encode(PULL, _none(), s, p, _noSweep());
+        vm.expectRevert(abi.encodeWithSelector(GenericCallStrategy.InvalidPatch.selector, p.length - 1));
+        c.initialize(address(vault), proposer, data);
     }
 
     function _defaultClone() internal returns (GenericCallStrategy) {
@@ -116,7 +158,7 @@ abstract contract GenericCallFixture is Test {
         address[] memory sweep
     ) internal {
         GenericCallStrategy c = _clone();
-        bytes memory data = abi.encode(pull, e, s, sweep);
+        bytes memory data = abi.encode(pull, e, s, _noPatch(), sweep);
         vm.expectRevert(err);
         c.initialize(address(vault), proposer, data);
     }
@@ -151,7 +193,9 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         assertEq(keccak256(abi.encode(c.settleCalls())), keccak256(abi.encode(s)), "settle calls");
         assertEq(
             c.configHash(),
-            keccak256(abi.encode(c.pullAmount(), c.executeCalls(), c.settleCalls(), c.sweepTokens())),
+            keccak256(
+                abi.encode(c.pullAmount(), c.executeCalls(), c.settleCalls(), c.settlePatches(), c.sweepTokens())
+            ),
             "config hash recomputes from getters"
         );
         assertEq(c.pinnedCodehash(address(venue)), address(venue).codehash);
@@ -166,8 +210,18 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
 
     /// @notice Every lifecycle contract, the clone and zero are refused in both legs.
     function test_init_refusesForbiddenTargets() public {
-        address[6] memory fixedTargets =
-            [address(0), address(vault), address(gov), syndicateFactory, address(registry), strategyFactory];
+        address[10] memory fixedTargets = [
+            address(0),
+            address(vault),
+            address(gov),
+            syndicateFactory,
+            address(registry),
+            strategyFactory,
+            address(guardianRegistry),
+            swood,
+            queue,
+            ledger
+        ];
         for (uint8 leg; leg < 2; ++leg) {
             for (uint256 k; k < fixedTargets.length; ++k) {
                 BatchExecutorLib.Call[] memory bad = _one(_call(fixedTargets[k], hex"12345678"));
@@ -179,8 +233,9 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
             // The clone itself.
             GenericCallStrategy c = _clone();
             BatchExecutorLib.Call[] memory self = _one(_call(address(c), abi.encodeCall(BaseStrategy.settle, ())));
-            bytes memory data =
-                leg == 0 ? abi.encode(0, self, _none(), _noSweep()) : abi.encode(0, _none(), self, _noSweep());
+            bytes memory data = leg == 0
+                ? abi.encode(0, self, _none(), _noPatch(), _noSweep())
+                : abi.encode(0, _none(), self, _noPatch(), _noSweep());
             vm.expectRevert(abi.encodeWithSelector(GenericCallStrategy.ForbiddenTarget.selector, leg, 0, address(c)));
             c.initialize(address(vault), proposer, data);
         }
@@ -227,7 +282,7 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
     function testFuzz_init_assetSelectorRule(bytes4 sel) public {
         bytes memory data = abi.encodePacked(sel, uint256(uint160(address(venue))), uint256(1));
         GenericCallStrategy c = _clone();
-        bytes memory init = abi.encode(0, _one(_call(address(usdg), data)), _none(), _noSweep());
+        bytes memory init = abi.encode(0, _one(_call(address(usdg), data)), _none(), _noPatch(), _noSweep());
         if (sel == IERC20.approve.selector || sel == IERC20.transfer.selector) {
             c.initialize(address(vault), proposer, init);
         } else {
@@ -268,6 +323,15 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
             _noSweep()
         );
         registry.setStrategyFactory(strategyFactory);
+        guardianRegistry.setSwood(address(0));
+        _expectInitRevert(
+            abi.encodeWithSelector(GenericCallStrategy.ProtocolAddressUnresolved.selector),
+            PULL,
+            _depositLeg(PULL),
+            _none(),
+            _noSweep()
+        );
+        guardianRegistry.setSwood(swood);
         vault.setGovernor(makeAddr("codelessGovernor"));
         _expectInitRevert(
             abi.encodeWithSelector(GenericCallStrategy.ProtocolAddressUnresolved.selector),
@@ -325,11 +389,65 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
 
     function test_init_isOneShot() public {
         GenericCallStrategy c = _defaultClone();
-        bytes memory data = abi.encode(0, _none(), _none(), _noSweep());
+        bytes memory data = abi.encode(0, _none(), _none(), _noPatch(), _noSweep());
         vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
         c.initialize(address(vault), stranger, data);
         vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
         template.initialize(address(vault), proposer, data);
+    }
+
+    /// @notice An unset withdrawal queue or ExposureLedger is not a failure: there is nothing to forbid.
+    function test_init_acceptsUnsetQueueAndLedger() public {
+        vault.setWithdrawalQueue(address(0));
+        gov.setExposureLedger(address(0));
+        _defaultClone();
+    }
+
+    /// @notice Patches are part of the plan: stored, readable and in the config hash.
+    function test_init_storesPatches() public {
+        GenericCallStrategy.BalancePatch[] memory p = _patch(0, 1, address(usdg));
+        GenericCallStrategy c = _initP(PULL, _depositLeg(PULL), _withdrawLeg(PULL), p, _noSweep());
+        GenericCallStrategy.BalancePatch[] memory got = c.settlePatches();
+        assertEq(got.length, 1);
+        assertEq(got[0].callIndex, 0);
+        assertEq(got[0].wordIndex, 1);
+        assertEq(got[0].token, address(usdg));
+        assertEq(
+            c.configHash(),
+            keccak256(abi.encode(c.pullAmount(), c.executeCalls(), c.settleCalls(), c.settlePatches(), c.sweepTokens()))
+        );
+    }
+
+    function test_init_refusesPatchOutsideTheSettleLeg() public {
+        _expectPatchRevert(_withdrawLeg(PULL), _patch(1, 1, address(usdg)));
+    }
+
+    /// @notice `withdraw(token, amount)` has two argument words: word 2 is outside the calldata.
+    function test_init_refusesPatchOutsideTheCalldata() public {
+        _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 2, address(usdg)));
+        _expectPatchRevert(_one(_call(address(venue), hex"12345678")), _patch(0, 0, address(usdg)));
+    }
+
+    function test_init_refusesTwoPatchesOnOneCall() public {
+        GenericCallStrategy.BalancePatch[] memory p = new GenericCallStrategy.BalancePatch[](2);
+        p[0] = GenericCallStrategy.BalancePatch({callIndex: 0, wordIndex: 1, token: address(usdg)});
+        p[1] = GenericCallStrategy.BalancePatch({callIndex: 0, wordIndex: 0, token: address(usdg)});
+        _expectPatchRevert(_withdrawLeg(PULL), p);
+    }
+
+    function test_init_refusesForbiddenOrCodelessPatchToken() public {
+        _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, address(0)));
+        _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, address(vault)));
+        _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, makeAddr("codelessToken")));
+    }
+
+    /// @notice Word 0 of an approve is the recorded grant's spender, so it cannot be patched.
+    function test_init_refusesPatchOnGrantSpender() public {
+        BatchExecutorLib.Call[] memory s =
+            _one(_call(address(usdg), abi.encodeCall(IERC20.approve, (address(venue), 1))));
+        _expectPatchRevert(s, _patch(0, 0, address(usdg)));
+        // The amount word is fine.
+        _initP(PULL, _none(), s, _patch(0, 1, address(usdg)), _noSweep());
     }
 
     /// @notice An uncertified clone prices at tier 2, full notional, in a real TierRegistry.
@@ -397,7 +515,7 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
             _call(address(venue), abi.encodeCall(MockCallVenue.deposit, (address(straggler), 5e18)))
         );
         GenericCallStrategy c = _clone();
-        c.initialize(address(v), proposer, abi.encode(0, e, _none(), _noSweep()));
+        c.initialize(address(v), proposer, abi.encode(0, e, _none(), _noPatch(), _noSweep()));
         gov.setActiveStrategy(address(c));
         straggler.mint(address(c), 5e18);
         vm.prank(address(v));
@@ -574,6 +692,56 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS - pull);
         assertEq(usdg.balanceOf(attacker), pull);
         assertEq(usdg.balanceOf(address(c)), 0);
+    }
+
+    /// @notice A settle leg sized at init cannot know what a market-price buy returned: the patch
+    ///         writes the clone's live balance, so the whole position is sold and nothing is stranded.
+    function test_settle_patchSellsTheLiveBalance() public {
+        ERC20Mock stock = new ERC20Mock("STOCK", "STK", 18);
+        MockRateSwap swap = new MockRateSwap();
+        BatchExecutorLib.Call[] memory e = _two(
+            _call(address(usdg), abi.encodeCall(IERC20.approve, (address(swap), PULL))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swap, (address(usdg), address(stock), PULL)))
+        );
+        BatchExecutorLib.Call[] memory s = _two(
+            _call(address(stock), abi.encodeCall(IERC20.approve, (address(swap), type(uint256).max))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swap, (address(stock), address(usdg), 0)))
+        );
+        GenericCallStrategy c = _initP(PULL, e, s, _patch(1, 2, address(stock)), _noSweep());
+
+        // The price is only known after init: 1 USDG buys 0.0137 STOCK.
+        swap.setRate(address(usdg), address(stock), 0.0137e30);
+        swap.setRate(address(stock), address(usdg), 73e6);
+        _execute(c, PULL);
+        uint256 bought = stock.balanceOf(address(c));
+        assertEq(bought, 13.7e18);
+
+        _settle(c);
+        assertEq(stock.balanceOf(address(c)), 0, "position fully sold");
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS - PULL + (bought * 73e6) / 1e18);
+    }
+
+    /// @notice An unpatched settle call runs with the calldata fixed at init.
+    function test_settle_unpatchedCallUsesInitAmount() public {
+        ERC20Mock stock = new ERC20Mock("STOCK", "STK", 18);
+        MockRateSwap swap = new MockRateSwap();
+        swap.setRate(address(usdg), address(stock), 1e30);
+        swap.setRate(address(stock), address(usdg), 1e6);
+        BatchExecutorLib.Call[] memory e = _two(
+            _call(address(usdg), abi.encodeCall(IERC20.approve, (address(swap), PULL))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swap, (address(usdg), address(stock), PULL)))
+        );
+        BatchExecutorLib.Call[] memory s = _two(
+            _call(address(stock), abi.encodeCall(IERC20.approve, (address(swap), type(uint256).max))),
+            _call(address(swap), abi.encodeCall(MockRateSwap.swap, (address(stock), address(usdg), 400e18)))
+        );
+        address[] memory sweep = new address[](1);
+        sweep[0] = address(stock);
+        GenericCallStrategy c = _init(PULL, e, s, sweep);
+        _execute(c, PULL);
+        _settle(c);
+        assertEq(stock.balanceOf(address(vault)), 600e18, "the unsold rest is swept");
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS - PULL + 400e6);
     }
 
     function test_onERC721Received_returnsSelector() public {

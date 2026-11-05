@@ -13,6 +13,10 @@ interface IProtocolPath {
     function factory() external view returns (address);
     function tierRegistry() external view returns (address);
     function strategyFactory() external view returns (address);
+    function guardianRegistry() external view returns (address);
+    function swood() external view returns (address);
+    function withdrawalQueue() external view returns (address);
+    function exposureLedger() external view returns (address);
 }
 
 /**
@@ -20,13 +24,15 @@ interface IProtocolPath {
  * @notice Runs a proposer-supplied execute leg and settle leg of calls, fixed at initialize.
  *         Tier 2 forever, never certified, unaudited: see docs/generic-call-strategy.md.
  *
- *   Init:    abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls, address[] sweepTokens)
+ *   Init:    abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls,
+ *                       BalancePatch[] settlePatches, address[] sweepTokens)
  *   Execute: [asset.approve(strategy, pullAmount), strategy.execute()]
  *   Settle:  [strategy.settle()]
  */
 contract GenericCallStrategy is BaseStrategy {
     uint8 internal constant LEG_EXECUTE = 0;
     uint8 internal constant LEG_SETTLE = 1;
+    uint256 internal constant DENIED = 9;
     uint256 public constant MAX_CALLS_PER_LEG = 16;
     uint256 public constant MAX_LEG_CALLDATA = 16_384;
     uint256 public constant MAX_SWEEP_TOKENS = 16;
@@ -38,6 +44,14 @@ contract GenericCallStrategy is BaseStrategy {
         bool forAll;
     }
 
+    /// @notice At settle, argument word `wordIndex` of settle call `callIndex` becomes the clone's
+    ///         live `token` balance. Byte offset `4 + 32 * wordIndex`; one patch per call.
+    struct BalancePatch {
+        uint256 callIndex;
+        uint256 wordIndex;
+        address token;
+    }
+
     error TooManyCalls(uint8 leg);
     error CalldataTooLarge(uint8 leg);
     error TooManySweepTokens();
@@ -45,6 +59,7 @@ contract GenericCallStrategy is BaseStrategy {
     error ForbiddenTarget(uint8 leg, uint256 index, address target);
     error TargetHasNoCode(uint8 leg, uint256 index, address target);
     error AssetCallNotAllowed(uint8 leg, uint256 index, bytes4 selector);
+    error InvalidPatch(uint256 patchIndex);
     error ProtocolAddressUnresolved();
     error TargetCodeChanged(address target);
     error CallFailed(uint8 leg, uint256 index, bytes reason);
@@ -57,15 +72,18 @@ contract GenericCallStrategy is BaseStrategy {
     address public asset;
     /// @notice Asset pulled from the vault at execute; zero pulls nothing.
     uint256 public pullAmount;
-    /// @notice `keccak256(abi.encode(pullAmount, executeCalls, settleCalls, sweepTokens))`.
+    /// @notice `keccak256` of the decoded init tuple, re-encoded.
     bytes32 public configHash;
     /// @notice Codehash of each target at initialize, re-checked at execute only.
     mapping(address target => bytes32 codehash) public pinnedCodehash;
 
     BatchExecutorLib.Call[] internal _executeCalls;
     BatchExecutorLib.Call[] internal _settleCalls;
+    BalancePatch[] internal _settlePatches;
     address[] internal _sweepTokens;
     Grant[] internal _grants;
+    /// @dev Settle call index -> patch index + 1; zero means unpatched.
+    mapping(uint256 callIndex => uint256 slot) internal _patchSlot;
 
     function name() external pure returns (string memory) {
         return "Generic Call";
@@ -77,6 +95,10 @@ contract GenericCallStrategy is BaseStrategy {
 
     function settleCalls() external view returns (BatchExecutorLib.Call[] memory) {
         return _settleCalls;
+    }
+
+    function settlePatches() external view returns (BalancePatch[] memory) {
+        return _settlePatches;
     }
 
     function sweepTokens() external view returns (address[] memory) {
@@ -105,21 +127,25 @@ contract GenericCallStrategy is BaseStrategy {
             uint256 pull,
             BatchExecutorLib.Call[] memory execCalls,
             BatchExecutorLib.Call[] memory settleCalls_,
+            BalancePatch[] memory patches,
             address[] memory sweep
-        ) = abi.decode(data, (uint256, BatchExecutorLib.Call[], BatchExecutorLib.Call[], address[]));
+        ) = abi.decode(data, (uint256, BatchExecutorLib.Call[], BatchExecutorLib.Call[], BalancePatch[], address[]));
 
         if (sweep.length > MAX_SWEEP_TOKENS) revert TooManySweepTokens();
         address asset_ = IERC4626(vault()).asset();
-        address[5] memory denied = _protocolAddresses();
+        address[DENIED] memory denied = _protocolAddresses();
         _storeLeg(LEG_EXECUTE, execCalls, _executeCalls, asset_, denied);
         _storeLeg(LEG_SETTLE, settleCalls_, _settleCalls, asset_, denied);
+        for (uint256 i; i < patches.length; ++i) {
+            _storePatch(i, patches[i], settleCalls_, denied);
+        }
         for (uint256 i; i < sweep.length; ++i) {
             if (sweep[i] == address(0)) revert ZeroAddress();
             _sweepTokens.push(sweep[i]);
         }
         asset = asset_;
         pullAmount = pull;
-        configHash = keccak256(abi.encode(pull, execCalls, settleCalls_, sweep));
+        configHash = keccak256(abi.encode(pull, execCalls, settleCalls_, patches, sweep));
     }
 
     function _storeLeg(
@@ -127,7 +153,7 @@ contract GenericCallStrategy is BaseStrategy {
         BatchExecutorLib.Call[] memory calls,
         BatchExecutorLib.Call[] storage dst,
         address asset_,
-        address[5] memory denied
+        address[DENIED] memory denied
     ) private {
         if (calls.length > MAX_CALLS_PER_LEG) revert TooManyCalls(leg);
         uint256 size;
@@ -144,16 +170,16 @@ contract GenericCallStrategy is BaseStrategy {
 
     /// @dev On the asset only `approve`/`transfer`: the vault's allowance to this clone is live for the
     ///      whole execute batch, so `transferFrom` or a token extension would spend past `pullAmount`.
-    function _checkCall(uint8 leg, uint256 i, BatchExecutorLib.Call memory c, address asset_, address[5] memory denied)
-        private
-        view
-    {
+    function _checkCall(
+        uint8 leg,
+        uint256 i,
+        BatchExecutorLib.Call memory c,
+        address asset_,
+        address[DENIED] memory denied
+    ) private view {
         if (c.value != 0) revert NativeValueUnsupported(leg, i);
         address t = c.target;
-        if (t == address(0) || t == address(this)) revert ForbiddenTarget(leg, i, t);
-        for (uint256 k; k < 5; ++k) {
-            if (t == denied[k]) revert ForbiddenTarget(leg, i, t);
-        }
+        if (_isForbidden(t, denied)) revert ForbiddenTarget(leg, i, t);
         if (t.code.length == 0) revert TargetHasNoCode(leg, i, t);
         if (t == asset_) {
             bytes4 sel = bytes4(c.data);
@@ -161,6 +187,25 @@ contract GenericCallStrategy is BaseStrategy {
                 revert AssetCallNotAllowed(leg, i, sel);
             }
         }
+    }
+
+    /// @dev Word 0 of an approve / setApprovalForAll is the recorded grant: patching it would hide it.
+    function _storePatch(
+        uint256 i,
+        BalancePatch memory p,
+        BatchExecutorLib.Call[] memory settleCalls_,
+        address[DENIED] memory denied
+    ) private {
+        if (p.callIndex >= settleCalls_.length || _patchSlot[p.callIndex] != 0) revert InvalidPatch(i);
+        bytes memory data = settleCalls_[p.callIndex].data;
+        if (data.length < 36 || p.wordIndex >= (data.length - 4) / 32) revert InvalidPatch(i);
+        if (_isForbidden(p.token, denied) || p.token.code.length == 0) revert InvalidPatch(i);
+        bytes4 sel = bytes4(data);
+        if (p.wordIndex == 0 && (sel == IERC20.approve.selector || sel == IERC721.setApprovalForAll.selector)) {
+            revert InvalidPatch(i);
+        }
+        _patchSlot[p.callIndex] = i + 1;
+        _settlePatches.push(p);
     }
 
     function _recordGrant(address token, bytes memory data) private {
@@ -175,16 +220,29 @@ contract GenericCallStrategy is BaseStrategy {
         _grants.push(Grant({token: token, spender: address(uint160(word)), forAll: forAll}));
     }
 
-    /// @dev vault, governor, SyndicateFactory, TierRegistry, StrategyFactory; fail-closed on any hop.
-    function _protocolAddresses() private view returns (address[5] memory a) {
+    function _isForbidden(address t, address[DENIED] memory denied) private view returns (bool) {
+        if (t == address(0) || t == address(this)) return true;
+        for (uint256 k; k < DENIED; ++k) {
+            if (t == denied[k]) return true;
+        }
+        return false;
+    }
+
+    /// @dev vault, governor, SyndicateFactory, TierRegistry, StrategyFactory, GuardianRegistry, sWOOD
+    ///      (fail-closed), then the withdrawal queue and ExposureLedger, which may be unset.
+    function _protocolAddresses() private view returns (address[DENIED] memory a) {
         a[0] = vault();
         a[1] = _readAddress(a[0], abi.encodeCall(IProtocolPath.governor, ()));
         a[2] = _readAddress(a[0], abi.encodeCall(IProtocolPath.factory, ()));
         a[3] = _readAddress(a[1], abi.encodeCall(IProtocolPath.tierRegistry, ()));
         a[4] = _readAddress(a[3], abi.encodeCall(IProtocolPath.strategyFactory, ()));
-        for (uint256 k = 1; k < 5; ++k) {
+        a[5] = _readAddress(a[1], abi.encodeCall(IProtocolPath.guardianRegistry, ()));
+        a[6] = _readAddress(a[5], abi.encodeCall(IProtocolPath.swood, ()));
+        for (uint256 k = 1; k < 7; ++k) {
             if (a[k] == address(0)) revert ProtocolAddressUnresolved();
         }
+        a[7] = _readAddress(a[0], abi.encodeCall(IProtocolPath.withdrawalQueue, ()));
+        a[8] = _readAddress(a[1], abi.encodeCall(IProtocolPath.exposureLedger, ()));
     }
 
     // ── Execute / settle ──
@@ -221,8 +279,22 @@ contract GenericCallStrategy is BaseStrategy {
     function _runLeg(uint8 leg, BatchExecutorLib.Call[] storage calls) private {
         for (uint256 i; i < calls.length; ++i) {
             BatchExecutorLib.Call storage c = calls[i];
-            (bool ok, bytes memory ret) = c.target.call(c.data);
+            bytes memory data = c.data;
+            if (leg == LEG_SETTLE) _applyPatch(i, data);
+            (bool ok, bytes memory ret) = c.target.call(data);
             if (!ok) revert CallFailed(leg, i, ret);
+        }
+    }
+
+    /// @dev The written amount is the clone's own balance: it can never exceed what the clone holds.
+    function _applyPatch(uint256 callIndex, bytes memory data) private view {
+        uint256 slot = _patchSlot[callIndex];
+        if (slot == 0) return;
+        BalancePatch storage p = _settlePatches[slot - 1];
+        uint256 bal = IERC20(p.token).balanceOf(address(this));
+        uint256 offset = 4 + 32 * p.wordIndex;
+        assembly ("memory-safe") {
+            mstore(add(add(data, 32), offset), bal)
         }
     }
 
