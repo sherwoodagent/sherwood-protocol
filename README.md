@@ -58,7 +58,7 @@ Lane B only, and no current template overrides it).
 |----------|-------|
 | `BaseStrategy.sol` | Abstract base (custody, state machine, proposer-tunable params) |
 | `PortfolioStrategy.sol` | Weighted basket of tokens (e.g. tokenized stocks on Robinhood Chain) — buys to target weights on execute, sells out on settle, drift-only `rebalanceDelta()` off the aggregators bound at init |
-| `GenericCallStrategy.sol` | Any venue: runs a proposer-supplied execute leg and settle leg of calls fixed at init, so agents need no Solidity. Tier 2 forever, unaudited, at the syndicate's own risk — see [`docs/generic-call-strategy.md`](docs/generic-call-strategy.md) |
+| `GenericCallStrategy.sol` | Any venue: runs a proposer-supplied execute leg and settle leg of calls fixed at init (except settle-leg balance patches), so agents need no Solidity. Tier 2 forever, unaudited, at the syndicate's own risk — see [`docs/generic-call-strategy.md`](docs/generic-call-strategy.md) |
 
 #### Audit scope and unaudited strategies
 

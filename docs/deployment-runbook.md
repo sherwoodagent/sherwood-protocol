@@ -133,6 +133,23 @@ Nothing is read from the environment. Every number comes from
    deployer for good. The transfer-only handoff above leaves the recipient alone;
    never point it back at the deployer.
 
+   **Generic-call template (SHE-510), any time after run 2.** Not a launch step;
+   each step is an owner GO. `DeployAll` cannot do it, since it is never re-run.
+   1. Mint the template with the deployer key, which owns the Create3Factory.
+      The script mints only and prints the approval calldata:
+      ```bash
+      forge script script/robinhood-mainnet/DeployGenericCallStrategy.s.sol:DeployGenericCallTemplate \
+        --rpc-url robinhood --account sherwood-deployer --broadcast --slow
+      ```
+   2. Read `StrategyFactory.owner()` on chain. The book names the deployer as
+      `OWNER_MULTISIG` until a handoff is recorded, so today that is the
+      deployer. That owner calls `StrategyFactory.setTemplateApproval(<template>, true)`.
+   3. Add `GENERIC_CALL_TEMPLATE` to `chains/4663.json`. `verify-robinhood.sh`
+      checks the key against the CREATE3 derivation and expects four approved
+      templates once it is there, three while it is absent.
+   4. Verify the source with `script/verify-blockscout.py 4663`, which reads the
+      `DeployGenericCallStrategy.s.sol` broadcast with the ceremony's.
+
    `script/robinhood-mainnet/deploy.sh` wraps steps 2 to 6 and verifies the
    sources on Blockscout; run it once per stage.
 6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it derives the
@@ -354,9 +371,9 @@ Not one-time steps. Nothing below is enforced on-chain.
 
 - **Allowlisting a Morpho market before a strategy uses it.** Done on request,
   when a fund wants a `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy`;
-  not a launch step. Both templates stay approved after the ceremony. The two
-  strategies are not covered by the external audit and are offered use at your
-  own risk. The Safe first reads the market's five parameters with
+  not a launch step. The Morpho and CL templates stay approved after the
+  ceremony. Neither is covered by the external audit (nor is the generic-call
+  template); all three are offered use at your own risk. The Safe first reads the market's five parameters with
   `idToMarketParams` and applies the refusal rules below. Before a
   `MorphoSupplyStrategy` or `ConcentratedLiquidityStrategy` clone is
   initialised, the `TierRegistry` owner allowlists that market BY ID:

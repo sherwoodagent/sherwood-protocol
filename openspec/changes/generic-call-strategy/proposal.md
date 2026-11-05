@@ -33,5 +33,5 @@ The open change `permissionless-tier2-sandbox` was the prior attempt at the same
 - New: `src/strategies/GenericCallStrategy.sol`, `script/robinhood-mainnet/DeployGenericCallStrategy.s.sol`, `test/strategies/GenericCallStrategy*.t.sol`, `docs/generic-call-strategy.md`.
 - Edited: `script/DeploySalts.sol`, `script/robinhood-mainnet/DeployTypes.sol`, `script/robinhood-mainnet/DeployAll.s.sol`, `script/DeployStrategyFactory.s.sol`, the deploy tests pinning the template set, `README.md`, `docs/audit-scope-and-accepted-risks.md`.
 - Untouched: `SyndicateVault`, `SyndicateGovernor`, `StrategyFactory`, `TierRegistry`, `BaseStrategy`, storage-layout goldens, `chains/*.json`.
-- On-chain (owner GO, not this change): deploy the template on 4663, `StrategyFactory.setTemplateApproval(template, true)` from the Safe, and the `GENERIC_CALL_TEMPLATE` address-book entry.
+- On-chain (owner GO, not this change): deploy the template on 4663, `StrategyFactory.setTemplateApproval(template, true)` from the `StrategyFactory` owner (the deployer per `chains/4663.json` until a handoff is recorded), the `GENERIC_CALL_TEMPLATE` address-book entry, and Blockscout verification.
 - Consumers (follow-ups): `sherwood` CLI/SDK/skill encoder and a guardian `TEMPLATE_ABIS` entry; Sherwood Arena catalog entry.

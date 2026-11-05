@@ -31,7 +31,7 @@ The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE`, `CONCENTRATE
 
 `MorphoSupplyStrategy` requires NO Morpho address and NO market params at deploy time. It is an ERC-1167 template: the Morpho singleton, the `MarketParams` tuple and the supply amount all arrive per clone via `_initialize(bytes)`, so they are proposal inputs. The template is deliberately left uninitialized, which is the correct resting state for a clone source.
 
-`GenericCallStrategy` likewise requires NO venue address at deploy time: its call lists, pull amount and sweep tokens arrive per clone via `_initialize(bytes)`, and it binds no counterparty, so it needs no TierRegistry seeding. On a chain whose TierRegistry the deployer no longer owns (4663 after the handoff), the StrategyFactory phase cannot run, so the template reaches the allowlist only through the owner's `setTemplateApproval(template, true)`.
+`GenericCallStrategy` likewise requires NO venue address at deploy time: its call lists, pull amount and sweep tokens arrive per clone via `_initialize(bytes)`, and it binds no counterparty, so it needs no TierRegistry seeding. On a chain where `DeployAll` must not be re-run (4663 after run 2, which a re-run would re-seat), the template reaches the allowlist only through the `StrategyFactory` owner's `setTemplateApproval(template, true)`, after `DeployGenericCallTemplate` mints it.
 
 #### Scenario: Morpho template reaches the allowlist
 - **WHEN** the ceremony completes
