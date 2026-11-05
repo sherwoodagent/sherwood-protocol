@@ -5,6 +5,7 @@ import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {GenericCallStrategy} from "../../src/strategies/GenericCallStrategy.sol";
@@ -22,7 +23,11 @@ import {
     GCGovernorStub,
     GCVaultStub,
     GCGuardianRegistryStub,
-    MockRateSwap
+    GCLedgerStub,
+    MockRateSwap,
+    NoTransferToken,
+    BurnOnRevokeToken,
+    BurnOnReadToken
 } from "../mocks/GenericCallMocks.sol";
 
 abstract contract GenericCallFixture is Test {
@@ -38,7 +43,8 @@ abstract contract GenericCallFixture is Test {
     address strategyFactory = makeAddr("strategyFactory");
     address swood = makeAddr("swood");
     address queue = makeAddr("queue");
-    address ledger = makeAddr("ledger");
+    address challengeGame = makeAddr("challengeGame");
+    GCLedgerStub ledger;
     MockCallVenue venue;
     GenericCallStrategy template;
 
@@ -52,7 +58,8 @@ abstract contract GenericCallFixture is Test {
         gov = new GCGovernorStub(address(registry));
         guardianRegistry = new GCGuardianRegistryStub(swood);
         gov.setGuardianRegistry(address(guardianRegistry));
-        gov.setExposureLedger(ledger);
+        ledger = new GCLedgerStub(challengeGame);
+        gov.setExposureLedger(address(ledger));
         vault = new GCVaultStub(address(usdg), address(gov), syndicateFactory);
         vault.setWithdrawalQueue(queue);
         venue = new MockCallVenue();
@@ -182,7 +189,7 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         BatchExecutorLib.Call[] memory e = _depositLeg(PULL);
         BatchExecutorLib.Call[] memory s = _withdrawLeg(PULL);
         address[] memory sweep = new address[](1);
-        sweep[0] = makeAddr("bonus");
+        sweep[0] = address(new ERC20Mock("BONUS", "BNS", 18));
         GenericCallStrategy c = _init(PULL, e, s, sweep);
 
         assertEq(c.name(), "Generic Call");
@@ -210,7 +217,7 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
 
     /// @notice Every lifecycle contract, the clone and zero are refused in both legs.
     function test_init_refusesForbiddenTargets() public {
-        address[10] memory fixedTargets = [
+        address[11] memory fixedTargets = [
             address(0),
             address(vault),
             address(gov),
@@ -220,7 +227,8 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
             address(guardianRegistry),
             swood,
             queue,
-            ledger
+            address(ledger),
+            challengeGame
         ];
         for (uint8 leg; leg < 2; ++leg) {
             for (uint256 k; k < fixedTargets.length; ++k) {
@@ -383,8 +391,16 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         _expectInitRevert(
             abi.encodeWithSelector(GenericCallStrategy.TooManySweepTokens.selector), 0, _none(), _none(), sweep
         );
-        address[] memory zero = new address[](1);
-        _expectInitRevert(abi.encodeWithSelector(BaseStrategy.ZeroAddress.selector), 0, _none(), _none(), zero);
+        // A sweep token must have code and not be a denied contract; the index names the bad entry.
+        address[3] memory bad = [address(0), makeAddr("codelessToken"), address(vault)];
+        for (uint256 k; k < bad.length; ++k) {
+            address[] memory two = new address[](2);
+            two[0] = address(usdg);
+            two[1] = bad[k];
+            _expectInitRevert(
+                abi.encodeWithSelector(GenericCallStrategy.InvalidSweepToken.selector, 1), 0, _none(), _none(), two
+            );
+        }
     }
 
     function test_init_isOneShot() public {
@@ -396,8 +412,10 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         template.initialize(address(vault), proposer, data);
     }
 
-    /// @notice An unset withdrawal queue or ExposureLedger is not a failure: there is nothing to forbid.
-    function test_init_acceptsUnsetQueueAndLedger() public {
+    /// @notice An unset withdrawal queue, ExposureLedger or ChallengeGame is not a failure: there is nothing to forbid.
+    function test_init_acceptsUnsetQueueLedgerAndGame() public {
+        ledger.setCoverageFreezer(address(0));
+        _defaultClone();
         vault.setWithdrawalQueue(address(0));
         gov.setExposureLedger(address(0));
         _defaultClone();
@@ -435,19 +453,43 @@ contract GenericCallStrategyInitTest is GenericCallFixture {
         _expectPatchRevert(_withdrawLeg(PULL), p);
     }
 
-    function test_init_refusesForbiddenOrCodelessPatchToken() public {
+    /// @notice The patch token must already be in the plan: the asset, a leg target or a sweep token.
+    function test_init_patchTokenMustBeInThePlan() public {
+        ERC20Mock other = new ERC20Mock("OTHER", "OTH", 18);
         _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, address(0)));
         _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, address(vault)));
         _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, makeAddr("codelessToken")));
+        _expectPatchRevert(_withdrawLeg(PULL), _patch(0, 1, address(other)));
+
+        _initP(PULL, _none(), _withdrawLeg(PULL), _patch(0, 1, address(usdg)), _noSweep());
+        _initP(PULL, _none(), _withdrawLeg(PULL), _patch(0, 1, address(venue)), _noSweep());
+        address[] memory sweep = new address[](1);
+        sweep[0] = address(other);
+        _initP(PULL, _none(), _withdrawLeg(PULL), _patch(0, 1, address(other)), sweep);
     }
 
-    /// @notice Word 0 of an approve is the recorded grant's spender, so it cannot be patched.
-    function test_init_refusesPatchOnGrantSpender() public {
-        BatchExecutorLib.Call[] memory s =
-            _one(_call(address(usdg), abi.encodeCall(IERC20.approve, (address(venue), 1))));
-        _expectPatchRevert(s, _patch(0, 0, address(usdg)));
-        // The amount word is fine.
-        _initP(PULL, _none(), s, _patch(0, 1, address(usdg)), _noSweep());
+    /// @notice A balance never lands in a spender, operator, recipient or `from` word; the amount word is fine.
+    function test_init_refusesPatchOnAddressWords() public {
+        ERC20Mock tok = new ERC20Mock("TOK", "TOK", 18);
+        MockNFT nft = new MockNFT();
+        address a = makeAddr("a");
+        bytes[6] memory data = [
+            abi.encodeCall(IERC20.approve, (a, 1)),
+            abi.encodeCall(IERC721.setApprovalForAll, (a, true)),
+            abi.encodeCall(IERC20.transfer, (a, 1)),
+            abi.encodeCall(IERC20.transferFrom, (a, a, 1)),
+            abi.encodeWithSelector(bytes4(0x42842e0e), a, a, 1),
+            abi.encodeWithSelector(bytes4(0xb88d4fde), a, a, 1, bytes(""))
+        ];
+        uint256[6] memory addressWords = [uint256(1), 1, 1, 2, 2, 2];
+        for (uint256 k; k < data.length; ++k) {
+            address target = k < 4 ? address(tok) : address(nft);
+            BatchExecutorLib.Call[] memory s = _one(_call(target, data[k]));
+            for (uint256 w; w < addressWords[k]; ++w) {
+                _expectPatchRevert(s, _patch(0, w, target));
+            }
+            _initP(PULL, _none(), s, _patch(0, addressWords[k], target), _noSweep());
+        }
     }
 
     /// @notice An uncertified clone prices at tier 2, full notional, in a real TierRegistry.
@@ -501,7 +543,7 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         assertEq(usdg.allowance(address(c), address(venue)), 0, "venue allowance revoked");
         assertTrue(c.executed());
 
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(venue), 0, 1));
         venue.pull(address(usdg), address(c), 1);
     }
 
@@ -586,6 +628,64 @@ contract GenericCallStrategyLifecycleUnitTest is GenericCallFixture {
         assertEq(bonus.balanceOf(address(vault)), 3e18, "sweep token delivered");
         assertEq(usdg.balanceOf(address(c)), 0);
         assertEq(bonus.balanceOf(address(c)), 0);
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    /// @notice A sweep token whose transfer reverts is skipped with `SweepFailed`: the asset and the other sweeps still land.
+    function test_settle_failedSweepDoesNotBlockTheAsset() public {
+        NoTransferToken stuck = new NoTransferToken();
+        ERC20Mock bonus = new ERC20Mock("BONUS", "BNS", 18);
+        address[] memory sweep = new address[](2);
+        sweep[0] = address(stuck);
+        sweep[1] = address(bonus);
+        GenericCallStrategy c = _init(PULL, _none(), _none(), sweep);
+        _execute(c, PULL);
+        stuck.mint(address(c), 5e18);
+        bonus.mint(address(c), 3e18);
+
+        vm.expectEmit(address(c));
+        emit GenericCallStrategy.SweepFailed(address(stuck));
+        _settle(c);
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS, "asset home");
+        assertEq(bonus.balanceOf(address(vault)), 3e18, "later sweep still runs");
+        assertEq(stuck.balanceOf(address(c)), 5e18, "left on the clone");
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    /// @notice A sweep token that lost its code, or whose `balanceOf` reverts, reads as zero and is skipped.
+    function test_settle_unreadableSweepTokenIsSkipped() public {
+        ERC20Mock gone = new ERC20Mock("GONE", "GONE", 18);
+        ERC20Mock broken = new ERC20Mock("BROKEN", "BRK", 18);
+        address[] memory sweep = new address[](2);
+        sweep[0] = address(gone);
+        sweep[1] = address(broken);
+        GenericCallStrategy c = _init(PULL, _none(), _none(), sweep);
+        _execute(c, PULL);
+        vm.etch(address(gone), "");
+        vm.mockCallRevert(address(broken), abi.encodeWithSelector(IERC20.balanceOf.selector), "broken");
+        _settle(c);
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS, "asset home");
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
+    }
+
+    /// @notice A token that burns gas on the revoke read or write gets `HYGIENE_GAS` each: settle completes
+    ///         well inside its budget instead of spending 63/64 of it per burner.
+    function test_revoke_gasBurnerCannotStarveSettle() public {
+        BurnOnRevokeToken burnWrite = new BurnOnRevokeToken();
+        BurnOnReadToken burnRead = new BurnOnReadToken();
+        BatchExecutorLib.Call[] memory s = _two(
+            _call(address(burnWrite), abi.encodeCall(IERC20.approve, (address(venue), 1))),
+            _call(address(burnRead), abi.encodeCall(IERC20.approve, (address(venue), 1)))
+        );
+        GenericCallStrategy c = _init(PULL, _none(), s, _noSweep());
+        _execute(c, PULL);
+        vm.expectEmit(address(c));
+        emit GenericCallStrategy.RevokeFailed(address(burnWrite), address(venue));
+        uint256 before = gasleft();
+        vm.prank(address(vault));
+        c.settle{gas: 1_000_000}();
+        assertLt(before - gasleft(), 500_000, "hygiene gas bounded");
+        assertEq(usdg.balanceOf(address(vault)), VAULT_FUNDS, "asset home");
         assertEq(uint256(c.state()), uint256(BaseStrategy.State.Settled));
     }
 

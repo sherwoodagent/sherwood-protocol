@@ -23,6 +23,7 @@ import {StrategyFactory} from "../../../src/StrategyFactory.sol";
 import {ExposureLedger} from "../../../src/ExposureLedger.sol";
 import {ChallengeGame} from "../../../src/ChallengeGame.sol";
 import {IGuardianRegistry} from "../../../src/interfaces/IGuardianRegistry.sol";
+import {IStrategy} from "../../../src/interfaces/IStrategy.sol";
 
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../../mocks/MockAggregatorV3.sol";
@@ -289,6 +290,11 @@ abstract contract DeployAllFixture is Test {
         assertTrue(sf.approvedTemplate(s.concentratedLiquidityTemplate), "CL approved");
         assertTrue(sf.approvedTemplate(s.genericCallTemplate), "generic call approved");
         assertEq(TierRegistry(s.core.tierRegistry).strategyFactory(), s.strategyFactory, "tierRegistry wiring");
+        // The generic-call template is never class-certified: its clones price at tier 2, full notional.
+        (uint8 tier, uint16 bound) =
+            TierRegistry(s.core.tierRegistry).classTierOf(s.genericCallTemplate, IStrategy.execute.selector);
+        assertEq(tier, 2, "generic call class tier");
+        assertEq(bound, 10_000, "generic call class bound");
     }
 
     function _assertCoverageStack(Stack memory s) internal view {

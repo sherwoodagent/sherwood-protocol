@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
@@ -17,11 +18,13 @@ interface IProtocolPath {
     function swood() external view returns (address);
     function withdrawalQueue() external view returns (address);
     function exposureLedger() external view returns (address);
+    function coverageFreezer() external view returns (address);
 }
 
 /**
  * @title GenericCallStrategy
- * @notice Runs a proposer-supplied execute leg and settle leg of calls, fixed at initialize.
+ * @notice Runs a proposer-supplied execute leg and settle leg of calls, fixed at initialize except
+ *         for settle-leg balance patches.
  *         Tier 2 forever, never certified, unaudited: see docs/generic-call-strategy.md.
  *
  *   Init:    abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls,
@@ -30,9 +33,15 @@ interface IProtocolPath {
  *   Settle:  [strategy.settle()]
  */
 contract GenericCallStrategy is BaseStrategy {
+    using SafeERC20 for IERC20;
+
     uint8 internal constant LEG_EXECUTE = 0;
     uint8 internal constant LEG_SETTLE = 1;
-    uint256 internal constant DENIED = 9;
+    uint256 internal constant DENIED = 10;
+    /// @dev Gas for each revoke read and write and each sweep balance read: hygiene cannot starve settle.
+    uint256 internal constant HYGIENE_GAS = 100_000;
+    bytes4 internal constant SAFE_TRANSFER_FROM = 0x42842e0e; // safeTransferFrom(address,address,uint256)
+    bytes4 internal constant SAFE_TRANSFER_FROM_DATA = 0xb88d4fde; // safeTransferFrom(address,address,uint256,bytes)
     uint256 public constant MAX_CALLS_PER_LEG = 16;
     uint256 public constant MAX_LEG_CALLDATA = 16_384;
     uint256 public constant MAX_SWEEP_TOKENS = 16;
@@ -55,6 +64,7 @@ contract GenericCallStrategy is BaseStrategy {
     error TooManyCalls(uint8 leg);
     error CalldataTooLarge(uint8 leg);
     error TooManySweepTokens();
+    error InvalidSweepToken(uint256 index);
     error NativeValueUnsupported(uint8 leg, uint256 index);
     error ForbiddenTarget(uint8 leg, uint256 index, address target);
     error TargetHasNoCode(uint8 leg, uint256 index, address target);
@@ -67,6 +77,8 @@ contract GenericCallStrategy is BaseStrategy {
 
     /// @notice A best-effort revoke that the token refused; nothing else depends on it.
     event RevokeFailed(address indexed token, address indexed spender);
+    /// @notice A sweep token whose transfer failed; it stays on the clone for `rescueTo`.
+    event SweepFailed(address indexed token);
 
     /// @notice The vault asset, read at initialize.
     address public asset;
@@ -115,7 +127,8 @@ contract GenericCallStrategy is BaseStrategy {
     }
 
     /// @notice Push an ERC-721 the clone holds to the vault, in any state.
-    /// @dev Plain `transferFrom`: the vault has no ERC-721 receiver hook.
+    /// @dev Plain `transferFrom`: the recipient is always the vault, an `ERC721Holder`, so the
+    ///      receiver callback would add nothing.
     function rescueERC721To(address token, uint256 tokenId) external onlyVault {
         IERC721(token).transferFrom(address(this), vault(), tokenId);
     }
@@ -136,12 +149,12 @@ contract GenericCallStrategy is BaseStrategy {
         address[DENIED] memory denied = _protocolAddresses();
         _storeLeg(LEG_EXECUTE, execCalls, _executeCalls, asset_, denied);
         _storeLeg(LEG_SETTLE, settleCalls_, _settleCalls, asset_, denied);
-        for (uint256 i; i < patches.length; ++i) {
-            _storePatch(i, patches[i], settleCalls_, denied);
-        }
         for (uint256 i; i < sweep.length; ++i) {
-            if (sweep[i] == address(0)) revert ZeroAddress();
+            if (_isForbidden(sweep[i], denied) || sweep[i].code.length == 0) revert InvalidSweepToken(i);
             _sweepTokens.push(sweep[i]);
+        }
+        for (uint256 i; i < patches.length; ++i) {
+            _storePatch(i, patches[i], settleCalls_, asset_);
         }
         asset = asset_;
         pullAmount = pull;
@@ -189,23 +202,35 @@ contract GenericCallStrategy is BaseStrategy {
         }
     }
 
-    /// @dev Word 0 of an approve / setApprovalForAll is the recorded grant: patching it would hide it.
-    function _storePatch(
-        uint256 i,
-        BalancePatch memory p,
-        BatchExecutorLib.Call[] memory settleCalls_,
-        address[DENIED] memory denied
-    ) private {
+    /// @dev The token must already be in the plan (asset, leg target or sweep token). A balance
+    ///      never lands in the address words of an approve or transfer selector.
+    function _storePatch(uint256 i, BalancePatch memory p, BatchExecutorLib.Call[] memory settleCalls_, address asset_)
+        private
+    {
         if (p.callIndex >= settleCalls_.length || _patchSlot[p.callIndex] != 0) revert InvalidPatch(i);
         bytes memory data = settleCalls_[p.callIndex].data;
         if (data.length < 36 || p.wordIndex >= (data.length - 4) / 32) revert InvalidPatch(i);
-        if (_isForbidden(p.token, denied) || p.token.code.length == 0) revert InvalidPatch(i);
-        bytes4 sel = bytes4(data);
-        if (p.wordIndex == 0 && (sel == IERC20.approve.selector || sel == IERC721.setApprovalForAll.selector)) {
-            revert InvalidPatch(i);
-        }
+        if (p.token != asset_ && pinnedCodehash[p.token] == 0 && !_isSweepToken(p.token)) revert InvalidPatch(i);
+        if (p.wordIndex < _addressWords(bytes4(data))) revert InvalidPatch(i);
         _patchSlot[p.callIndex] = i + 1;
         _settlePatches.push(p);
+    }
+
+    /// @dev Leading address words: the spender or operator, the recipient, or `from` and `to`.
+    function _addressWords(bytes4 sel) private pure returns (uint256) {
+        if (sel == IERC20.approve.selector || sel == IERC721.setApprovalForAll.selector) return 1;
+        if (sel == IERC20.transfer.selector) return 1;
+        if (sel == IERC20.transferFrom.selector || sel == SAFE_TRANSFER_FROM || sel == SAFE_TRANSFER_FROM_DATA) {
+            return 2;
+        }
+        return 0;
+    }
+
+    function _isSweepToken(address t) private view returns (bool) {
+        for (uint256 k; k < _sweepTokens.length; ++k) {
+            if (_sweepTokens[k] == t) return true;
+        }
+        return false;
     }
 
     function _recordGrant(address token, bytes memory data) private {
@@ -229,7 +254,7 @@ contract GenericCallStrategy is BaseStrategy {
     }
 
     /// @dev vault, governor, SyndicateFactory, TierRegistry, StrategyFactory, GuardianRegistry, sWOOD
-    ///      (fail-closed), then the withdrawal queue and ExposureLedger, which may be unset.
+    ///      (fail-closed), then the withdrawal queue, ExposureLedger and ChallengeGame, which may be unset.
     function _protocolAddresses() private view returns (address[DENIED] memory a) {
         a[0] = vault();
         a[1] = _readAddress(a[0], abi.encodeCall(IProtocolPath.governor, ()));
@@ -243,6 +268,7 @@ contract GenericCallStrategy is BaseStrategy {
         }
         a[7] = _readAddress(a[0], abi.encodeCall(IProtocolPath.withdrawalQueue, ()));
         a[8] = _readAddress(a[1], abi.encodeCall(IProtocolPath.exposureLedger, ()));
+        a[9] = _readAddress(a[8], abi.encodeCall(IProtocolPath.coverageFreezer, ()));
     }
 
     // ── Execute / settle ──
@@ -255,13 +281,16 @@ contract GenericCallStrategy is BaseStrategy {
         _revokeGrants();
     }
 
-    /// @dev No codehash check here: a refused settle would wedge the proposal in Executed.
+    /// @dev No codehash check here: a refused settle would wedge the proposal in Executed. The asset
+    ///      push is strict; sweeps are best-effort, so a broken sweep token cannot block it.
     function _settle() internal override {
         _runLeg(LEG_SETTLE, _settleCalls);
         _revokeGrants();
         _pushAllToVault(asset);
         for (uint256 i; i < _sweepTokens.length; ++i) {
-            _pushAllToVault(_sweepTokens[i]);
+            address t = _sweepTokens[i];
+            uint256 bal = _readWord(t, abi.encodeCall(IERC20.balanceOf, (address(this))));
+            if (bal != 0 && !IERC20(t).trySafeTransfer(vault(), bal)) emit SweepFailed(t);
         }
     }
 
@@ -310,15 +339,15 @@ contract GenericCallStrategy is BaseStrategy {
             bytes memory revoke = g.forAll
                 ? abi.encodeCall(IERC721.setApprovalForAll, (g.spender, false))
                 : abi.encodeCall(IERC20.approve, (g.spender, 0));
-            (bool ok,) = g.token.call(revoke);
+            (bool ok,) = g.token.call{gas: HYGIENE_GAS}(revoke);
             if (!ok) emit RevokeFailed(g.token, g.spender);
         }
     }
 
-    /// @dev One-word read; a codeless target, revert or wrong-length return reads as zero.
+    /// @dev One-word read under `HYGIENE_GAS`; a codeless target, revert or wrong-length return reads as zero.
     function _readWord(address target, bytes memory data) private view returns (uint256 word) {
         if (target.code.length == 0) return 0;
-        (bool ok, bytes memory ret) = target.staticcall(data);
+        (bool ok, bytes memory ret) = target.staticcall{gas: HYGIENE_GAS}(data);
         if (!ok || ret.length != 32) return 0;
         assembly ("memory-safe") {
             word := mload(add(ret, 0x20))

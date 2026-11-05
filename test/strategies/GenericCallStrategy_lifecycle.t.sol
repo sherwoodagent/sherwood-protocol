@@ -19,6 +19,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockCallVenue, RevertingVenue, MockNFT, MockNftMarket} from "../mocks/GenericCallMocks.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {PermissiveTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice A venue that, when called from a leg, tries every lifecycle entry point it can reach.
@@ -27,8 +28,8 @@ contract ReenteringVenue {
     SyndicateVault public vault;
     SyndicateGovernor public governor;
     uint256 public pid;
-    uint256 public attempts;
     uint256 public successes;
+    bytes4[] public reasons;
 
     function arm(GenericCallStrategy s, SyndicateVault v, SyndicateGovernor g, uint256 p) external {
         strategy = s;
@@ -47,14 +48,19 @@ contract ReenteringVenue {
             abi.encodeCall(SyndicateVault.executeGovernorBatch, (new BatchExecutorLib.Call[](0), new uint256[](0), 0))
         );
         _try(address(vault), abi.encodeCall(vault.deposit, (1, address(this))));
+        _try(address(vault), abi.encodeCall(SyndicateVault.settleRedeem, (0, 0, address(this))));
         _try(address(governor), abi.encodeCall(SyndicateGovernor.settleProposal, (pid)));
         _try(address(governor), abi.encodeCall(SyndicateGovernor.executeProposal, (pid)));
     }
 
     function _try(address target, bytes memory data) private {
-        attempts++;
-        (bool ok,) = target.call(data);
+        (bool ok, bytes memory ret) = target.call(data);
         if (ok) successes++;
+        reasons.push(bytes4(ret));
+    }
+
+    function attempts() external view returns (uint256) {
+        return reasons.length;
     }
 }
 
@@ -306,7 +312,29 @@ contract GenericCallStrategyLifecycleTest is Test {
         assertEq(uint256(c.state()), uint256(BaseStrategy.State.Pending));
     }
 
-    /// @notice A venue in the execute leg reaches no lifecycle entry point: every attempt reverts.
+    /// @dev The refusal each `poke` attempt must hit, in order; settleRedeem proves the vault lock is held.
+    function _expectedReasons() internal pure returns (bytes4[9] memory) {
+        return [
+            BaseStrategy.NotVault.selector,
+            BaseStrategy.NotVault.selector,
+            BaseStrategy.NotVault.selector,
+            BaseStrategy.NotVault.selector,
+            ISyndicateVault.NotGovernor.selector,
+            ISyndicateVault.DepositsLocked.selector,
+            ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector,
+            ISyndicateGovernor.Reentrancy.selector,
+            ISyndicateGovernor.Reentrancy.selector
+        ];
+    }
+
+    function _assertReasons(ReenteringVenue r, uint256 from) internal view {
+        bytes4[9] memory want = _expectedReasons();
+        for (uint256 k; k < want.length; ++k) {
+            assertEq(bytes32(r.reasons(from + k)), bytes32(want[k]), vm.toString(k));
+        }
+    }
+
+    /// @notice A venue in either leg reaches no lifecycle entry point: each attempt hits its own guard.
     function test_lifecycle_reenteringVenueGetsNothing() public {
         ReenteringVenue r = new ReenteringVenue();
         BatchExecutorLib.Call[] memory e = new BatchExecutorLib.Call[](1);
@@ -319,13 +347,15 @@ contract GenericCallStrategyLifecycleTest is Test {
         _approve(pid);
 
         governor.executeProposal(pid);
-        assertEq(r.attempts(), 8);
+        assertEq(r.attempts(), 9);
         assertEq(r.successes(), 0, "execute leg reached the lifecycle");
+        _assertReasons(r, 0);
 
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
         governor.settleProposal(pid);
-        assertEq(r.attempts(), 16);
+        assertEq(r.attempts(), 18);
         assertEq(r.successes(), 0, "settle leg reached the lifecycle");
+        _assertReasons(r, 9);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
     }
 
@@ -349,7 +379,14 @@ contract GenericCallStrategyLifecycleTest is Test {
 
         market.setClosed(true);
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GenericCallStrategy.CallFailed.selector,
+                uint8(1),
+                1,
+                abi.encodeWithSignature("Error(string)", "market closed")
+            )
+        );
         governor.settleProposal(pid);
 
         BatchExecutorLib.Call[] memory rescue = new BatchExecutorLib.Call[](1);
@@ -361,6 +398,52 @@ contract GenericCallStrategyLifecycleTest is Test {
         governor.finalizeEmergencySettle(pid);
 
         assertEq(nft.ownerOf(7), address(vault), "NFT home");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertFalse(vault.redemptionsLocked());
+    }
+
+    /// @notice A position held inside a venue whose settle leg can never run is lost: `unstick` replays the
+    ///         same leg, and the emergency batch recovers only what the clone itself holds.
+    function test_lifecycle_venueHeldPositionIsLostWhenSettleCannotRun() public {
+        uint256 half = PULL / 2;
+        BatchExecutorLib.Call[] memory e = new BatchExecutorLib.Call[](2);
+        e[0] = _call(address(usdg), abi.encodeCall(IERC20.approve, (address(venue), half)));
+        e[1] = _call(address(venue), abi.encodeCall(MockCallVenue.deposit, (address(usdg), half)));
+        BatchExecutorLib.Call[] memory s = new BatchExecutorLib.Call[](1);
+        s[0] = _call(address(venue), abi.encodeCall(MockCallVenue.withdraw, (address(usdg), half)));
+        GenericCallStrategy c = _clone(e, s);
+        uint256 pid = _propose(c);
+        _approve(pid);
+        uint256 vaultBefore = usdg.balanceOf(address(vault));
+        governor.executeProposal(pid);
+        assertEq(usdg.balanceOf(address(c)), PULL - half, "half kept on the clone");
+
+        venue.setClosed(true);
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        bytes memory closed = abi.encodeWithSelector(
+            GenericCallStrategy.CallFailed.selector,
+            uint8(1),
+            0,
+            abi.encodeWithSelector(MockCallVenue.VenueClosed.selector)
+        );
+        vm.expectRevert(closed);
+        governor.settleProposal(pid);
+        vm.prank(owner);
+        vm.expectRevert(closed);
+        governor.unstick(pid);
+
+        BatchExecutorLib.Call[] memory rescue = new BatchExecutorLib.Call[](1);
+        rescue[0] = _call(address(c), abi.encodeCall(BaseStrategy.rescueTo, (address(usdg))));
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, rescue);
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(usdg.balanceOf(address(vault)), vaultBefore - half, "the clone's half came home");
+        assertEq(venue.deposited(address(usdg), address(c)), half, "the venue's half is stranded");
+        assertEq(usdg.balanceOf(address(c)), 0);
+        assertEq(uint256(c.state()), uint256(BaseStrategy.State.Executed), "clone orphaned");
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertFalse(vault.redemptionsLocked());
     }

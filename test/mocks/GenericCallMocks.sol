@@ -7,7 +7,15 @@ import {ERC20Mock} from "./ERC20Mock.sol";
 
 /// @notice Deposit venue for generic-call tests: pulls on `deposit`, pays back (plus optional yield) on `withdraw`.
 contract MockCallVenue {
+    error VenueClosed();
+
     mapping(address token => mapping(address depositor => uint256)) public deposited;
+    bool public closed;
+
+    /// @notice A closed venue refuses every withdrawal: the position is held here for good.
+    function setClosed(bool c) external {
+        closed = c;
+    }
 
     function deposit(address token, uint256 amount) external {
         IERC20(token).transferFrom(msg.sender, address(this), amount);
@@ -15,12 +23,14 @@ contract MockCallVenue {
     }
 
     function withdraw(address token, uint256 amount) external {
+        if (closed) revert VenueClosed();
         deposited[token][msg.sender] -= amount;
         IERC20(token).transfer(msg.sender, amount);
     }
 
     /// @notice Pays `amount` back plus `yield_` freshly minted `token`.
     function withdrawWithYield(address token, uint256 amount, uint256 yield_) external {
+        if (closed) revert VenueClosed();
         deposited[token][msg.sender] -= amount;
         ERC20Mock(token).mint(msg.sender, yield_);
         IERC20(token).transfer(msg.sender, amount);
@@ -28,6 +38,7 @@ contract MockCallVenue {
 
     /// @notice Pays `amount` of `token` back and `bonus` of a minted `bonusToken`.
     function withdrawWithBonus(address token, uint256 amount, address bonusToken, uint256 bonus) external {
+        if (closed) revert VenueClosed();
         deposited[token][msg.sender] -= amount;
         ERC20Mock(bonusToken).mint(msg.sender, bonus);
         IERC20(token).transfer(msg.sender, amount);
@@ -75,6 +86,34 @@ contract NoZeroTransferToken is ERC20Mock {
     }
 }
 
+/// @notice ERC-20 whose `transfer` always reverts: a sweep of it must not block settle.
+contract NoTransferToken is ERC20Mock {
+    constructor() ERC20Mock("NoTransfer", "NT", 18) {}
+
+    function transfer(address, uint256) public pure override returns (bool) {
+        revert("no transfer");
+    }
+}
+
+/// @notice ERC-20 whose zero `approve` (the revoke) spends all the gas it is given.
+contract BurnOnRevokeToken is ERC20Mock {
+    constructor() ERC20Mock("BurnOnRevoke", "BOR", 18) {}
+
+    function approve(address spender, uint256 value) public override returns (bool) {
+        while (value == 0) {}
+        return super.approve(spender, value);
+    }
+}
+
+/// @notice ERC-20 whose `allowance` read (the revoke check) spends all the gas it is given.
+contract BurnOnReadToken is ERC20Mock {
+    constructor() ERC20Mock("BurnOnRead", "BRD", 18) {}
+
+    function allowance(address, address) public pure override returns (uint256 a) {
+        while (a == 0) {}
+    }
+}
+
 contract MockNFT is ERC721 {
     constructor() ERC721("Mock NFT", "MNFT") {}
 
@@ -119,6 +158,18 @@ contract GCGuardianRegistryStub {
 
     function setSwood(address s) external {
         swood = s;
+    }
+}
+
+contract GCLedgerStub {
+    address public coverageFreezer;
+
+    constructor(address freezer) {
+        coverageFreezer = freezer;
+    }
+
+    function setCoverageFreezer(address f) external {
+        coverageFreezer = f;
     }
 }
 
