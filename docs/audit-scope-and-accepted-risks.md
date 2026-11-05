@@ -42,6 +42,12 @@ branch; file and function are cited so each can be checked.
     fund asks for a Morpho or CL strategy, the Safe reviews the market's five parameters and then
     allowlists its id (`TierRegistry.setMorphoMarketAllowed`); this is an on-request step, not a
     launch step.
+  - `src/strategies/GenericCallStrategy.sol`: out of the audit scope, offered on the same "use at your
+    own risk" terms. Unlike the two above, its clone CAN pay any address: it forwards proposer-written
+    calls, so the containment is narrower. The clone holds only the asset it pulled (it may not call
+    `transferFrom` or any extension on the asset), tier-2 coverage prices the full cap, and the
+    guardian review is the only judge of where the funds go. Never certified below tier 2. See
+    [`generic-call-strategy.md`](generic-call-strategy.md).
   - `src/vendor/**`: third-party code, checked against its upstream by
     `script/check-vendor-provenance.sh`.
   - `src/vesting/**`: standalone, not deployed by the ceremony.
@@ -354,7 +360,8 @@ is `increaseObservationCardinalityNext` on the pool. The strategy is out of the 
 `docs/` describes the code on this branch. `docs/papers/` is design rationale; where it differs from
 the code, the code and `docs/` govern.
 
-`openspec/specs/` is current with the code as of this commit: every change whose behaviour is
+`openspec/specs/` is current with the code as of this commit, except for `generic-call-strategy`
+below: every other change whose behaviour is
 implemented here has been archived into it (`openspec/changes/archive/2026-10-02-*`), with its deltas
 corrected against the code first, and `openspec-sync-corrections` fixed the remaining requirements no
 change had touched. The archive folders are history; their `design.md`, `proposal.md` and `tasks.md`
@@ -363,12 +370,17 @@ archived changes, `wood-price-twap-ceiling` and `propose-time-target-validation`
 applying their deltas because their behaviour shipped in a different shape; each proposal says where
 the normative text lives.
 
-Two change folders remain open under `openspec/changes/`, and neither describes code on this branch:
+Three change folders remain open under `openspec/changes/`:
 
+- `generic-call-strategy`: the generic-call strategy template (SHE-510). Implemented on this
+  branch; its deltas are normative for that template until the change is archived into
+  `openspec/specs/`.
 - `permissionless-tier2-sandbox`: a per-proposal sandbox for arbitrary tier-2 calls. Not
   implemented; no sandbox contract exists.
 - `target-based-batch-gating`: an adapter-allowlist callee gate for governor batches. Not
   implemented; superseded by the registered-strategy batch rule (`SyndicateVault._guardBatchCalls`).
+
+The last two describe no code on this branch.
 
 Known limits of the specs:
 
