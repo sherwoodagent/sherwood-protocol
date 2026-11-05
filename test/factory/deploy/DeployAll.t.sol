@@ -237,6 +237,9 @@ abstract contract DeployAllFixture is Test {
         assertEq(s.portfolioTemplate, Create3.addressOf(c3, DeploySalts.PORTFOLIO_TEMPLATE), "portfolio template");
         assertEq(s.morphoSupplyTemplate, Create3.addressOf(c3, DeploySalts.MORPHO_SUPPLY_TEMPLATE), "morpho template");
         assertEq(s.concentratedLiquidityTemplate, Create3.addressOf(c3, DeploySalts.CL_TEMPLATE), "CL template");
+        assertEq(
+            s.genericCallTemplate, Create3.addressOf(c3, DeploySalts.GENERIC_CALL_TEMPLATE), "generic call template"
+        );
         assertEq(s.strategyFactory, Create3.addressOf(c3, DeploySalts.STRATEGY_FACTORY), "strategy factory");
         bytes32 feedSalt = posture == Posture.Mainnet ? DeploySalts.WOOD_USD_FEED : DeploySalts.FORK_WOOD_FEED;
         assertEq(s.woodUsdFeed, Create3.addressOf(c3, feedSalt), "wood feed");
@@ -284,6 +287,7 @@ abstract contract DeployAllFixture is Test {
         assertTrue(sf.approvedTemplate(s.portfolioTemplate), "portfolio approved");
         assertTrue(sf.approvedTemplate(s.morphoSupplyTemplate), "morpho approved");
         assertTrue(sf.approvedTemplate(s.concentratedLiquidityTemplate), "CL approved");
+        assertTrue(sf.approvedTemplate(s.genericCallTemplate), "generic call approved");
         assertEq(TierRegistry(s.core.tierRegistry).strategyFactory(), s.strategyFactory, "tierRegistry wiring");
     }
 
@@ -695,6 +699,7 @@ contract DeployAllTest is DeployAllFixture {
         assertEq(vm.parseJsonAddress(written, ".TIER_REGISTRY"), s.core.tierRegistry, "TIER_REGISTRY");
         assertEq(vm.parseJsonAddress(written, ".STAKED_WOOD"), s.core.swoodProxy, "STAKED_WOOD");
         assertEq(vm.parseJsonAddress(written, ".STRATEGY_FACTORY"), s.strategyFactory, "STRATEGY_FACTORY");
+        assertEq(vm.parseJsonAddress(written, ".GENERIC_CALL_TEMPLATE"), s.genericCallTemplate, "GENERIC_CALL_TEMPLATE");
         assertEq(vm.parseJsonAddress(written, ".WOOD_USD_FEED"), s.woodUsdFeed, "WOOD_USD_FEED");
         assertEq(vm.parseJsonAddress(written, ".EXPOSURE_LEDGER"), s.exposureLedger, "EXPOSURE_LEDGER");
         assertEq(vm.parseJsonAddress(written, ".PROPOSER_BOND_ESCROW"), s.proposerBondEscrow, "PROPOSER_BOND_ESCROW");

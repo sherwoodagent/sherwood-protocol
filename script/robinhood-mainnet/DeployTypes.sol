@@ -42,6 +42,7 @@ struct Stack {
     address portfolioTemplate;
     address morphoSupplyTemplate;
     address concentratedLiquidityTemplate;
+    address genericCallTemplate;
     address strategyFactory;
     address woodUsdFeed;
     address exposureLedger;
