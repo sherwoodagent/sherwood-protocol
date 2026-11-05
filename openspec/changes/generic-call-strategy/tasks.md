@@ -12,7 +12,9 @@
 - [x] 1.4 `_execute`: codehash re-check over both legs, pull (skip at zero), run leg with `CallFailed`, revoke (D5)
 - [x] 1.5 `_settle`: run leg, revoke, push asset and sweep tokens; no codehash check, no minimum-return floor (D6)
 - [x] 1.6 `_updateParams` reverts `NoTunableParams`; `rescueERC721To`; `onERC721Received`; no `receive`/`fallback`, no ERC-1155 hooks (D1, D9)
-- [x] 1.7 Getters: `name`, `asset`, `pullAmount`, `executeCalls`, `settleCalls`, `sweepTokens`, `grants`, `pinnedCodehash`, `configHash` (D10)
+- [x] 1.7 Getters: `name`, `asset`, `pullAmount`, `executeCalls`, `settleCalls`, `settlePatches`, `sweepTokens`, `grants`, `pinnedCodehash`, `configHash` (D10)
+- [x] 1.9 Settle-leg balance patches: init validation and live-balance write before each patched call (D13)
+- [x] 1.10 Denylist adds the GuardianRegistry and sWOOD (fail-closed) and the withdrawal queue and ExposureLedger (when set); WOOD not denied (D2)
 - [x] 1.8 `script/check-template-destinations.sh` passes; runtime size within the Robinhood limit
 
 ## 2. Tests (`test/strategies/`, mocks only, no fork)
@@ -24,6 +26,7 @@
 - [x] 2.5 Failed inner call reverts `CallFailed` with the callee's data; `TargetCodeChanged` at execute; no check at settle
 - [x] 2.6 Approvals and operator approvals revoked after each leg; ERC-721 `approve` collision skipped
 - [x] 2.7 Sweep tokens and asset returned at settle; NFT rescued by an emergency batch
+- [x] 2.10 Patches: market-price buy sold whole; unpatched call keeps its init amount; every `InvalidPatch` branch
 - [x] 2.8 A reentering venue mock (into the clone, the vault and the governor) and a fuzz test bounding the vault's loss by `pullAmount`
 - [x] 2.9 Each new test names the mutation that breaks it in the PR body
 
@@ -43,4 +46,3 @@
 - [ ] 5.1 `sherwood`: CLI/SDK encoder for the template, a guardian `TEMPLATE_ABIS` entry so the walk reads `executeCalls()`/`settleCalls()`, skill docs
 - [ ] 5.2 `sherwood-arena`: catalog entry for the template
 - [ ] 5.3 Owner GO: deploy the template on 4663, Safe `setTemplateApproval(template, true)`, `GENERIC_CALL_TEMPLATE` in `chains/4663.json`
-- [ ] 5.4 Live-balance calldata substitution, if Arena agents need exits sized at settle time

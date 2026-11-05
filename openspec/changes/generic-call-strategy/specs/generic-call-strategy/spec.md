@@ -2,9 +2,9 @@
 
 ### Requirement: The generic-call plan is fixed at initialize
 
-`GenericCallStrategy._initialize` SHALL decode `abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls, address[] sweepTokens)`, where `Call` is `BatchExecutorLib.Call (address target, bytes data, uint256 value)`, and store it for the clone's life. `_updateParams` SHALL always revert `NoTunableParams()`. The clone SHALL expose `configHash()` equal to `keccak256(abi.encode(pullAmount, executeCalls, settleCalls, sweepTokens))` over the decoded values.
+`GenericCallStrategy._initialize` SHALL decode `abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls, BalancePatch[] settlePatches, address[] sweepTokens)`, where `Call` is `BatchExecutorLib.Call (address target, bytes data, uint256 value)` and `BalancePatch` is `(uint256 callIndex, uint256 wordIndex, address token)`, and store it for the clone's life. `_updateParams` SHALL always revert `NoTunableParams()`. The clone SHALL expose `configHash()` equal to `keccak256(abi.encode(pullAmount, executeCalls, settleCalls, settlePatches, sweepTokens))` over the decoded values.
 
-ADVERSARY: a proposer who could change targets, calldata, the pull or the sweep list after the guardian vote would execute a plan nobody reviewed.
+ADVERSARY: a proposer who could change targets, calldata, the pull, the patches or the sweep list after the guardian vote would execute a plan nobody reviewed.
 
 `_initialize` SHALL revert `TooManyCalls(leg)` when a leg holds more than 16 calls, `CalldataTooLarge(leg)` when a leg's summed calldata exceeds 16,384 bytes, `TooManySweepTokens()` above 16 sweep tokens, and `ZeroAddress()` for a zero sweep token. Empty legs and `pullAmount == 0` SHALL be accepted.
 
@@ -26,22 +26,22 @@ ADVERSARY: a proposer who could change targets, calldata, the pull or the sweep 
 For every call in both legs `_initialize` SHALL revert:
 
 - `NativeValueUnsupported(leg, index)` when `value != 0`;
-- `ForbiddenTarget(leg, index, target)` when `target` is zero, the clone, the vault, the vault's governor, the vault's SyndicateFactory (`vault.factory()`), the governor's TierRegistry or that registry's StrategyFactory;
+- `ForbiddenTarget(leg, index, target)` when `target` is zero, the clone, the vault, the vault's governor, the vault's SyndicateFactory (`vault.factory()`), the governor's TierRegistry, that registry's StrategyFactory, the governor's GuardianRegistry, that registry's sWOOD, or (when set) the vault's withdrawal queue or the governor's ExposureLedger;
 - `TargetHasNoCode(leg, index, target)` when `target` has no code;
 - `AssetCallNotAllowed(leg, index, selector)` when `target` is the vault asset and the selector is not `approve(address,uint256)` or `transfer(address,uint256)`, or the calldata is shorter than 68 bytes.
 
-The protocol addresses SHALL be resolved through raw length-checked staticcalls (`vault.governor()`, `vault.factory()`, `governor.tierRegistry()`, `tierRegistry.strategyFactory()`), and any hop that does not answer a clean address SHALL revert `ProtocolAddressUnresolved()`. The clone SHALL make every forwarded call with `call`, never `delegatecall`, and SHALL have no `receive` or `fallback`.
+The protocol addresses SHALL be resolved through raw length-checked staticcalls (`vault.governor()`, `vault.factory()`, `governor.tierRegistry()`, `tierRegistry.strategyFactory()`, `governor.guardianRegistry()`, `guardianRegistry.swood()`), and any of those hops that does not answer a clean address SHALL revert `ProtocolAddressUnresolved()`. `vault.withdrawalQueue()` and `governor.exposureLedger()` MAY be unset; a zero read denies nothing extra. WOOD SHALL NOT be denied: denying it would only strand WOOD a clone bought through a venue. The clone SHALL make every forwarded call with `call`, never `delegatecall`, and SHALL have no `receive` or `fallback`.
 
 ADVERSARY (asset rule): inside the execute batch the vault's allowance to the clone is live until the batch ends. A clone allowed `transferFrom(vault, …)` or a token extension such as `transferFromBatch` on the asset could spend that allowance beyond `pullAmount`. With only `approve` and `transfer`, both bounded by the clone's own balance, the most the clone can lose is `pullAmount`.
 
-ADVERSARY (denylist): the clone touching the lifecycle contracts directly. None grants the clone a privilege, but the list keeps a guardian from having to prove it per proposal.
+ADVERSARY (denylist): the clone touching the lifecycle contracts directly, queueing vault shares through the withdrawal queue, or staking through sWOOD or the GuardianRegistry with vault capital mid-proposal. None grants the clone a privilege today, but the list keeps a guardian from having to prove it per proposal.
 
 #### Scenario: Vault allowance cannot be widened
 - **WHEN** a clone is initialized with an execute call `asset.transferFrom(vault, attacker, n)`
 - **THEN** initialization reverts `AssetCallNotAllowed(0, index, transferFrom.selector)`
 
 #### Scenario: Lifecycle contract as a target
-- **WHEN** a call in either leg targets the vault, the governor, the SyndicateFactory, the TierRegistry, the StrategyFactory, the clone itself or the zero address
+- **WHEN** a call in either leg targets the vault, the governor, the SyndicateFactory, the TierRegistry, the StrategyFactory, the GuardianRegistry, sWOOD, the withdrawal queue, the ExposureLedger, the clone itself or the zero address
 - **THEN** initialization reverts `ForbiddenTarget(leg, index, target)`
 
 #### Scenario: Native value refused
@@ -94,6 +94,25 @@ Settlement P&L counts only the vault asset. Sweep tokens and ERC-721s returned t
 #### Scenario: Empty settle leg
 - **WHEN** a clone with no settle calls is settled
 - **THEN** it pushes its asset balance and sweep balances to the vault and settles
+
+### Requirement: Settle calls may take the clone's live balance as an argument
+
+A `BalancePatch(callIndex, wordIndex, token)` SHALL make `_settle`, immediately before settle call `callIndex` runs, overwrite the 32-byte word at calldata offset `4 + 32 * wordIndex` with `IERC20(token).balanceOf(address(this))` read at that moment. Patches SHALL apply to the settle leg only. `_initialize` SHALL revert `InvalidPatch(patchIndex)` when `callIndex` is outside the settle leg, when a second patch names the same call, when the word does not lie wholly inside that call's calldata, when `token` has no code or is a denied contract, or when the patch targets word 0 of an `approve(address,uint256)` or `setApprovalForAll(address,bool)` call. `settlePatches()` SHALL return the stored patches.
+
+ADVERSARY: a settle leg sized at init cannot unwind a position whose size is only known after execute (shares, LP tokens, a market-price buy). The position is stranded and settlement, which counts only the vault asset, books it as a total loss. The patched amount is the clone's own balance, so it can never move more than the clone holds. Word 0 of an approve is the spender the revocation step recorded; letting a patch rewrite it would hide the real spender.
+
+#### Scenario: Market-price buy is sold whole at settle
+- **GIVEN** an execute leg that buys a token at a price unknown at init, and a settle sell call patched with that token's balance
+- **WHEN** the settle batch runs
+- **THEN** the sell call receives the clone's whole balance of the token and the clone holds none of it afterwards
+
+#### Scenario: Patch outside the calldata refused
+- **WHEN** a patch names a word past the end of its call's calldata, a call index outside the settle leg, or a second patch on the same call
+- **THEN** initialization reverts `InvalidPatch(patchIndex)`
+
+#### Scenario: Grant spender cannot be patched
+- **WHEN** a patch names word 0 of a settle-leg `approve`
+- **THEN** initialization reverts `InvalidPatch(patchIndex)`
 
 ### Requirement: Approval revocation is best-effort over two named selectors
 

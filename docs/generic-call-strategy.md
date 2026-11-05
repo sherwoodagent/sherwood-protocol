@@ -15,6 +15,7 @@ The clone holds a fixed plan, set once at `initialize`:
 | `pullAmount` | Vault asset (USDG) pulled at execute. Zero pulls nothing. |
 | `executeCalls` | Calls run, in order, after the pull. |
 | `settleCalls` | Calls run, in order, at settle, before custody returns to the vault. |
+| `settlePatches` | Optional: settle-call arguments filled with the clone's live token balance at settle time. |
 | `sweepTokens` | ERC-20s pushed to the vault at settle, in addition to the asset. |
 
 `execute()`:
@@ -43,6 +44,7 @@ data = abi.encode(
     uint256 pullAmount,
     BatchExecutorLib.Call[] executeCalls,   // (address target, bytes data, uint256 value)
     BatchExecutorLib.Call[] settleCalls,
+    GenericCallStrategy.BalancePatch[] settlePatches, // (uint256 callIndex, uint256 wordIndex, address token)
     address[] sweepTokens
 );
 ```
@@ -61,18 +63,24 @@ Then propose with the standard batches:
 | Rule | Error |
 | --- | --- |
 | `value` must be 0. The vault holds no native token and the clone has no `receive`. | `NativeValueUnsupported` |
-| A target may not be zero, the clone, the vault, the governor, the SyndicateFactory, the TierRegistry or the StrategyFactory. | `ForbiddenTarget` |
+| A target may not be zero, the clone, the vault, the governor, the SyndicateFactory, the TierRegistry, the StrategyFactory, the GuardianRegistry or sWOOD. It also may not be the withdrawal queue or the ExposureLedger, when those are set. WOOD itself is allowed, so a clone can sell WOOD it bought. | `ForbiddenTarget` |
 | A target must have code. | `TargetHasNoCode` |
 | On the vault asset, only `approve(address,uint256)` and `transfer(address,uint256)` are allowed. | `AssetCallNotAllowed` |
 | At most 16 calls per leg. | `TooManyCalls` |
 | At most 16,384 bytes of calldata per leg. | `CalldataTooLarge` |
 | At most 16 sweep tokens. | `TooManySweepTokens` |
+| Each settle patch names a settle call, at most one patch per call. The patched word lies inside that call's calldata. The token has code and is not a denied contract. Word 0 of an `approve` or `setApprovalForAll` cannot be patched. | `InvalidPatch` |
 
 The asset rule is what bounds the loss. During the execute batch the vault's allowance to the clone stays live until the batch ends. Without the rule, a `transferFrom(vault, …)` could spend more than the pull. With it, the clone can only ever lose `pullAmount`.
 
 ### Writing legs that work
 
-- **Calldata is fixed when you clone.** Amounts in the settle leg are fixed too. To exit a position whose size you cannot know in advance, either use a venue's "max" sentinel (for example, withdraw `type(uint256).max`) or make execute exact-output so the settle amounts are known.
+- **Calldata is fixed when you clone, except for balance patches.** To exit a position whose size you cannot know in advance (lending shares, LP tokens, a token bought at a market price), add a `BalancePatch`.
+  - **What it does:** just before settle call `callIndex` runs, argument word `wordIndex` (byte offset `4 + 32 * wordIndex`) is overwritten with the clone's `token` balance at that moment. It counts what the earlier settle calls returned.
+  - **Example:** to sell everything bought at execute through `router.swap(tokenIn, tokenOut, amountIn)`, patch `wordIndex = 2` with `token = tokenIn`.
+  - **Which word to patch:** any 32-byte word after the selector can be patched. For a value inside a dynamic struct or array, count its position in the ABI encoding.
+  - **The limit:** the patched amount is what the clone holds, never more.
+  - **Without a patch:** use a venue's "max" sentinel (for example, withdraw `type(uint256).max`), or make execute exact-output so the settle amounts are known.
 - **Approvals are revoked after each leg.** If the settle leg needs a venue approval, grant it in the settle leg.
 - **Settlement counts only USDG.** Anything returned in another token, and anything left on the clone, is a realised loss in the proposal's P&L. Sell back to USDG in the settle leg. List any token you expect to be left over in `sweepTokens`. The vault owner can move swept tokens to a clone of the same vault (`SyndicateVault.rescueERC20`), where a later proposal can sell them with `pullAmount = 0`.
 - **The only price floor is the envelope's.** `settleProposal` refuses a settle below the `maxDrawdownBps` floor. Put venue-level minimums, such as a router's `amountOutMin`, in the calldata.
@@ -85,10 +93,12 @@ Before you vote:
 1. **Provenance.** `StrategyFactory.cloneTemplate(clone)` must equal the address book's `GENERIC_CALL_TEMPLATE`, and `clone.vault()` must be the proposal's vault. A hand-registered look-alike has no `cloneTemplate` entry.
 2. **Batches.** The execute batch must be `[USDG.approve(clone, cap), clone.execute()]` and the settle batch `[clone.settle()]`, with `cap >= pullAmount()`.
 3. **The plan.** Read these getters:
-   - `executeCalls()`, `settleCalls()`, `sweepTokens()`, `pullAmount()`;
+   - `executeCalls()`, `settleCalls()`, `settlePatches()`, `sweepTokens()`, `pullAmount()`;
    - `grants()`: the approvals the template will revoke;
    - `pinnedCodehash(target)`;
-   - `configHash()`, which is `keccak256(abi.encode(pullAmount, executeCalls, settleCalls, sweepTokens))` and can be compared against the proposal's metadata.
+   - `configHash()`, which is `keccak256(abi.encode(pullAmount, executeCalls, settleCalls, settlePatches, sweepTokens))` and can be compared against the proposal's metadata.
+
+   For each patch, decode which argument it overwrites. It should be an amount, not an address or a deadline.
 
    Decode every inner call and ask where funds can go. Both of these pass every template check and are what the review exists to catch:
    - `USDG.transfer(anyone, …)`;
@@ -104,6 +114,7 @@ Before you vote:
 
 - **No destination limit.** The template does not restrict where funds go. Tier-2 coverage and the guardian vote are the controls.
 - **Proxy upgrades are not caught.** A codehash change at a target is caught at execute only. A proxy keeps its codehash when its implementation is swapped, so that swap is not detected. Settle never checks code, so a change can never wedge the return of capital.
+- **A balance patch overwrites one argument word with the clone's balance of one token.** It moves at most what the clone holds. It can still be aimed at the wrong argument, which guardians check.
 - **Approval revocation is best-effort.** It covers ERC-20 `approve` and `setApprovalForAll` only:
   - Permit2, `increaseAllowance` and ERC-777 operators are not revoked;
   - an ERC-721 `approve(to, id)` shares the ERC-20 selector and is skipped.

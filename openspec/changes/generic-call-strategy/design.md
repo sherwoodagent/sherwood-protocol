@@ -9,19 +9,19 @@ The open change `permissionless-tier2-sandbox` (not implemented on `post-audit-v
 ## Goals / Non-Goals
 
 - Goals: an agent reaches any venue by encoding call lists; the clone's maximum loss is `pullAmount` by construction; everything a guardian votes on is fixed at `initialize` and readable on-chain; the clone fits the existing batch shape `[asset.approve(clone, cap), clone.execute()]` / `[clone.settle()]`.
-- Non-Goals: no change to `_guardBatchCalls`, `_mirrorBatchLeg`, `StrategyFactory`, `TierRegistry`, `BaseStrategy` or the governor; no deploy, no `setTemplateApproval`, no address-book entry; no tier 0/1 certification, ever; no native value; no dynamic calldata (live-balance substitution) in this version; no ERC-1155 custody.
+- Non-Goals: no change to `_guardBatchCalls`, `_mirrorBatchLeg`, `StrategyFactory`, `TierRegistry`, `BaseStrategy` or the governor; no deploy, no `setTemplateApproval`, no address-book entry; no tier 0/1 certification, ever; no native value; no dynamic calldata beyond the settle-leg balance patch (D13); no ERC-1155 custody; no residue interface (`IStrategyDelivery` / `hasUnvaluedResidue` / `collectResidue` do not exist on `post-audit-v2`, so a non-asset balance at settle is handled by the sweep list and `rescueTo`, D6/D9).
 
 ## Decisions
 
 ### D1 — Init data, fixed for the clone's life
 
-`abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls, address[] sweepTokens)`, with `Call` the existing `BatchExecutorLib.Call` `(address target, bytes data, uint256 value)`. Reusing the batch struct means the SDK's `BatchCall` type and the CLI's batch encoders/decoders apply unchanged.
+`abi.encode(uint256 pullAmount, Call[] executeCalls, Call[] settleCalls, BalancePatch[] settlePatches, address[] sweepTokens)`, with `Call` the existing `BatchExecutorLib.Call` `(address target, bytes data, uint256 value)`. Reusing the batch struct means the SDK's `BatchCall` type and the CLI's batch encoders/decoders apply unchanged.
 
 - `value` must be zero (`NativeValueUnsupported`). The vault holds USDG, never native; the clone has no `receive`/`fallback`, so a venue cannot refund native to it either.
 - `pullAmount` may be zero: `_execute` then skips `_pullFromVault` (some tokens revert a zero `transferFrom`). A zero-pull clone sells tokens the owner moved onto it with `SyndicateVault.rescueERC20`, which only pays clones of that vault.
 - Legs may be empty. An empty settle leg still pushes the asset and sweep tokens home.
 - `_updateParams` always reverts `NoTunableParams`. Calls, targets, the pull and the sweep list are what guardians approve; a proposer who could edit them after the vote would void the review. No non-call parameter is tunable either: the only candidate, a minimum asset return, is dropped (D6).
-- `configHash = keccak256(abi.encode(pullAmount, executeCalls, settleCalls, sweepTokens))` over the decoded values, so a non-canonical encoding of the same config hashes the same. A proposer can cite it in `metadataURI`; a guardian recomputes it from the getters.
+- `configHash = keccak256(abi.encode(pullAmount, executeCalls, settleCalls, settlePatches, sweepTokens))` over the decoded values, so a non-canonical encoding of the same config hashes the same. A proposer can cite it in `metadataURI`; a guardian recomputes it from the getters.
 
 Caps, to bound the template's own overhead (storage reads per call, loop length): at most 16 calls per leg, at most 16,384 bytes of calldata summed per leg, at most 16 sweep tokens. These do not bound a venue's own gas (D8).
 
@@ -29,7 +29,7 @@ Caps, to bound the template's own overhead (storage reads per call, loop length)
 
 For every call in both legs:
 
-1. `target` is not zero, not `address(this)`, not the vault, not the governor (`vault.governor()`), not the SyndicateFactory (`vault.factory()`), not the TierRegistry (`governor.tierRegistry()`), not the StrategyFactory (`tierRegistry.strategyFactory()`). Each hop is a raw length-checked staticcall; a hop that does not resolve reverts `ProtocolAddressUnresolved` (fail-closed: a clone that cannot name the protocol around it refuses to exist, and `execute()` needs the governor anyway).
+1. `target` is not zero, not `address(this)`, not the vault, not the governor (`vault.governor()`), not the SyndicateFactory (`vault.factory()`), not the TierRegistry (`governor.tierRegistry()`), not the StrategyFactory (`tierRegistry.strategyFactory()`), not the GuardianRegistry (`governor.guardianRegistry()`), not sWOOD (`guardianRegistry.swood()`). Each hop is a raw length-checked staticcall; a hop that does not resolve reverts `ProtocolAddressUnresolved` (fail-closed: a clone that cannot name the protocol around it refuses to exist, and `execute()` needs the governor anyway). The withdrawal queue (`vault.withdrawalQueue()`) and the ExposureLedger (`governor.exposureLedger()`) are denied when set; either may legitimately be unset, so a zero read denies nothing. The queue, ledger, registry and sWOOD entries come from `permissionless-tier2-sandbox`'s list: a clone holding vault capital must not queue vault shares or stake mid-proposal. WOOD itself is NOT denied: refusing it as a direct target would not stop a clone buying WOOD through a venue, only stop it approving or transferring WOOD it holds, stranding the position; the staking risk sits in sWOOD and the registry, which are denied.
 2. `target.code.length != 0` (`TargetHasNoCode`): a call to a codeless address succeeds and does nothing, so a typo'd router would "execute" with the capital idle on the clone.
 3. On the vault asset, the selector is `approve(address,uint256)` or `transfer(address,uint256)` and nothing else (`AssetCallNotAllowed`).
 4. `pinnedCodehash[target] = target.codehash` is recorded (D4).
@@ -92,7 +92,7 @@ The caps in D1 bound the template's own work. A venue's gas is not bounded by th
 
 ### D10 — Guardian reviewability
 
-Getters: `name() == "Generic Call"`, `asset()`, `pullAmount()`, `executeCalls() returns (Call[])`, `settleCalls() returns (Call[])`, `sweepTokens() returns (address[])`, `grants() returns (Grant[])`, `pinnedCodehash(address)`, `configHash()`, plus `BaseStrategy`'s `vault()`, `proposer()`, `state()`, `executed()`.
+Getters: `name() == "Generic Call"`, `asset()`, `pullAmount()`, `executeCalls() returns (Call[])`, `settleCalls() returns (Call[])`, `settlePatches() returns (BalancePatch[])`, `sweepTokens() returns (address[])`, `grants() returns (Grant[])`, `pinnedCodehash(address)`, `configHash()`, plus `BaseStrategy`'s `vault()`, `proposer()`, `state()`, `executed()`.
 
 What a guardian checks before approving:
 
@@ -112,6 +112,19 @@ The CLI's guardian walk reads every zero-argument getter whose output holds an a
 ### D12 — `check-template-destinations.sh`
 
 The SHE-209 gate scans `src/strategies/` for token movements whose destination is not the vault or the clone, and for destination-shaped identifiers. The template's own movements (`_pullFromVault`, `_pushAllToVault`, `rescueERC721To`) pay the vault or the clone and pass. Its forwarded calls are opaque `call`s the gate cannot see, which is why D11 forbids certification: the gate is a backstop for certified templates, and this one is never certified.
+
+### D13 — Settle-leg balance patches
+
+`BalancePatch(uint256 callIndex, uint256 wordIndex, address token)`: before settle call `callIndex` runs, the 32 bytes at calldata offset `4 + 32 * wordIndex` are overwritten with `IERC20(token).balanceOf(address(this))`, read at that moment (after the earlier settle calls). This is what lets a settle leg unwind a position whose size is unknown at init: lending shares, LP tokens, a token bought at a market price. Without it the position is stranded and settlement, which counts only the asset, books it as a total loss.
+
+Scope, checked at `initialize` (`InvalidPatch(patchIndex)` otherwise):
+
+- settle leg only (the execute pull is already known); `callIndex` inside the settle leg; at most one patch per call;
+- the word lies inside the calldata (`wordIndex < (data.length - 4) / 32`), word-aligned by construction;
+- `token` has code and is not a denied contract (D2.1);
+- not word 0 of an `approve` / `setApprovalForAll`: that word is the grant D7 recorded, and patching it would hide the real spender from revocation.
+
+Bound: the written amount is the clone's own balance, so a patch can never move more than the clone holds, and the clone holds only what it pulled plus what its venues returned. A patch does not loosen D3: the asset selector rule is checked on the selector, which a patch never touches. A token whose `balanceOf` reverts reverts the settle; the emergency path recovers (D9). Patches are part of `configHash` and read from `settlePatches()`.
 
 ## Threats
 
@@ -133,7 +146,7 @@ The SHE-209 gate scans `src/strategies/` for token movements whose destination i
 ## Risks / Trade-offs
 
 - The template does not bound where funds go. A leg may `transfer` the pulled asset to any address. That is the definition of the template; tier-2 full-notional coverage and the guardian vote are the controls, as for any hand-written strategy.
-- Calldata is fixed at init, so settle amounts are fixed too. Venues whose exit needs the live position size (redeem-all by shares, sell-whatever-was-bought) work only through a venue's own max sentinel or an exact-output execute. Live-balance substitution is a follow-up, not this change.
+- Calldata is fixed at init except for settle-leg balance patches (D13). An execute-leg amount, or a settle amount that is not a balance the clone holds, stays fixed.
 - Revocation recognises two selectors only (D7).
 - Storing call data costs proposer gas at clone time (about 20k gas per 32 bytes); the 16 KB per-leg cap bounds it.
 
