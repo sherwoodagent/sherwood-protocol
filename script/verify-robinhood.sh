@@ -74,6 +74,11 @@ BOOK_C3=$(a CREATE3_FACTORY)
 [ -z "$BOOK_C3" ] || check "CREATE3_FACTORY (book == derived)" "$BOOK_C3" "$C3"
 # derive <salt name> — the ceremony's address for that salt, straight from the factory.
 derive() { call1 "$C3" 'addressOf(bytes32)(address)' "$(cast keccak "${NS}$1")"; }
+# derive_upgraded <name> — the v2 salt once the v1->v2 upgrade deployed it (runbook §9), else v1.
+derive_upgraded() {
+  local v2; v2=$(call1 "$C3" 'addressOf(bytes32)(address)' "$(cast keccak "sherwood.robinhood.v2.$1")")
+  if [ -n "$v2" ] && [ "$(cast code "$v2" --rpc-url "$RPC" 2>/dev/null)" != "0x" ]; then echo "$v2"; else derive "$1"; fi
+}
 # book_matches <label> <bookKey> <derived> — a recorded key must equal the derivation. An
 # ABSENT key is a FAILURE: `_persist` writes every one of them, so a gap means the book is
 # not the book this deployment wrote, and scoring it a pass made an empty book all-green.
@@ -96,7 +101,7 @@ echo "posture: $POSTURE   final owner: $FINAL"
 
 echo; echo "── Addresses re-derived from CREATE3 (book keys must agree) ──"
 EXECUTOR=$(derive batch-executor-lib);      book_matches "BATCH_EXECUTOR_LIB"   BATCH_EXECUTOR_LIB   "$EXECUTOR"
-VAULTIMPL=$(derive vault-impl);             book_matches "SYNDICATE_VAULT_IMPL" SYNDICATE_VAULT_IMPL "$VAULTIMPL"
+VAULTIMPL=$(derive_upgraded vault-impl);    book_matches "SYNDICATE_VAULT_IMPL" SYNDICATE_VAULT_IMPL "$VAULTIMPL"
 CONFIG=$(derive protocol-config);           book_matches "PROTOCOL_CONFIG"      PROTOCOL_CONFIG      "$CONFIG"
 BEACON=$(derive governor-beacon);           book_matches "GOVERNOR_BEACON"      GOVERNOR_BEACON      "$BEACON"
 SWOOD=$(derive staked-wood-proxy);          book_matches "STAKED_WOOD"          STAKED_WOOD          "$SWOOD"
@@ -110,7 +115,7 @@ CLT=$(derive concentrated-liquidity-template); book_matches "CONCENTRATED_LIQUID
 SFACTORY=$(derive strategy-factory);        book_matches "STRATEGY_FACTORY"     STRATEGY_FACTORY     "$SFACTORY"
 LEDGER=$(derive exposure-ledger);           book_matches "EXPOSURE_LEDGER"      EXPOSURE_LEDGER      "$LEDGER"
 ESCROW=$(derive proposer-bond-escrow);      book_matches "PROPOSER_BOND_ESCROW" PROPOSER_BOND_ESCROW "$ESCROW"
-GAME=$(derive challenge-game);              book_matches "CHALLENGE_GAME"       CHALLENGE_GAME       "$GAME"
+GAME=$(derive_upgraded challenge-game);     book_matches "CHALLENGE_GAME"       CHALLENGE_GAME       "$GAME"
 # Distinct salts, so a fork fixture can never be read as the mainnet feed.
 if [ "$POSTURE" = "mainnet" ]; then WFEED=$(derive wood-pool-feed); else WFEED=$(derive fork-wood-feed-fixture); fi
 book_matches "WOOD_USD_FEED" WOOD_USD_FEED "$WFEED"
