@@ -361,10 +361,8 @@ contract SyndicateFactory_rotateOwner_sameOwnerRebondTest is Test {
         vm.prank(lp1);
         assertGt(vault.redeem(lp1Shares, lp1, lp1), 0, "instant redeem works");
 
-        // rotateOwnership drains the agent set even for the same owner: re-register, then propose again.
-        assertFalse(vault.isAgent(creator), "same-owner rotation drained the agent set");
-        vm.prank(creator);
-        vault.registerAgent(creatorAgentId, creator);
+        // SHE-483: a same-owner rotation keeps the agent set, so the owner proposes again directly.
+        assertTrue(vault.isAgent(creator), "same-owner rotation kept the agent set");
         skip(gov.getGovernorParams().cooldownPeriod + 1);
         RebondStuckStrategy next = new RebondStuckStrategy(address(vault), creator, address(usdc));
         vm.prank(creator);

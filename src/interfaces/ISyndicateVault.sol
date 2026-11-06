@@ -52,9 +52,11 @@ interface ISyndicateVault {
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
     error BufferTooHigh();
-    /// @notice A governor batch left the vault below the idle floor
-    ///         (`reservedQueueAssets + minBufferBps%` of the pre-batch float).
+    /// @notice An outflow batch left the vault below the idle floor
+    ///         (`reservedQueueAssets + minBufferBps%` of the pre-batch float net of that reserve).
     error BufferBreached();
+    /// @notice A governor batch leg carried a non-zero `value`; the vault holds no ETH a batch may spend.
+    error CallValueNotAllowed(uint256 index);
     /// @notice The batch's net asset outflow exceeded the proposal's declared
     ///         maxCapital.
     error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);

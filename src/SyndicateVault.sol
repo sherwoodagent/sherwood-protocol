@@ -325,7 +325,7 @@ contract SyndicateVault is
     ///      registry's `transferOwnerStakeSlot`, so the old owner's slashed or
     ///      unstaked position can be rebound to a fresh operator without
     ///      redeploying the vault.
-    /// @dev Drains `_agentSet` entirely so an at-cap vault does not brick the new
+    /// @dev On a change of owner, drains `_agentSet` entirely so an at-cap vault does not brick the new
     ///      owner — 32 dead entries could otherwise be neither re-registered (cap
     ///      blocks) nor purged (`AgentNotActive` blocks `removeAgent`). Snapshots
     ///      via `.values()` first so the in-loop `remove` does not invalidate
@@ -333,7 +333,8 @@ contract SyndicateVault is
     function rotateOwnership(address newOwner) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newOwner == address(0)) revert ZeroAddress();
-        SyndicateVaultAdminLib.drainAgents(_agents, _agentSet);
+        // A same-owner re-bond keeps the agent set, so a live clone's proposer stays an agent.
+        if (newOwner != owner()) SyndicateVaultAdminLib.drainAgents(_agents, _agentSet);
         _transferOwnership(newOwner);
     }
 
@@ -430,9 +431,13 @@ contract SyndicateVault is
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
         if (balanceAfter < reserve) revert QueueReserveBreached();
-        // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
-        // of the pre-batch float. Inflow (settle) batches pass trivially.
-        if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
+        // Idle-liquidity floor: an outflow batch may deploy at most (1 − minBufferBps) of the
+        // float net of the reserve. The zero-budget skip only saves gas: the outflow and reserve
+        // checks above already imply the floor when maxNetOutflow == 0.
+        if (maxNetOutflow != 0) {
+            uint256 deployable = balanceBefore > reserve ? balanceBefore - reserve : 0;
+            if (balanceAfter < reserve + (deployable * minBufferBps) / 10_000) revert BufferBreached();
+        }
     }
 
     /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its expected
@@ -460,6 +465,7 @@ contract SyndicateVault is
         spenders = new address[](calls.length);
         uint256 n;
         for (uint256 i = 0; i < calls.length; i++) {
+            if (calls[i].value != 0) revert CallValueNotAllowed(i);
             address target = calls[i].target;
             if (target != asset_) {
                 if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);

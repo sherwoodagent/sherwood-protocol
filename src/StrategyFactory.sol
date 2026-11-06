@@ -159,16 +159,9 @@ contract StrategyFactory is Ownable, IStrategyFactory {
     }
 
     /// @notice Deterministic variant — caller can predict the clone address via
-    ///         `Clones.predictDeterministicAddress(template, keccak256(abi.encode(vault, salt)), factory)`.
-    /// @dev See `cloneAndInit` for the `proposer == msg.sender` rationale.
-    /// @dev The CREATE2 salt is bound to `vault`
-    ///      (`keccak256(abi.encode(vault, salt))`) so each vault gets its own
-    ///      address namespace. `salt` is visible in calldata; without this a
-    ///      front-runner could race the deploy and occupy the predicted address
-    ///      with a clone bound to their own vault — a recoverable DoS that would
-    ///      brick a keyless propose referencing it. The off-chain predictor
-    ///      mirrors this byte-for-byte (SDK `effectiveStrategySalt`); the two
-    ///      MUST stay in lockstep or predictions diverge from the deployed address.
+    ///         `Clones.predictDeterministicAddress(template, keccak256(abi.encode(vault, msg.sender, salt)), factory)`.
+    /// @dev The salt binds vault and deployer, so a front-runner replaying `salt` lands elsewhere (SHE-481).
+    ///      The SDK's `effectiveStrategySalt` must mirror this byte-for-byte.
     function cloneAndInitDeterministic(
         address template,
         address vault,
@@ -179,7 +172,7 @@ contract StrategyFactory is Ownable, IStrategyFactory {
         _requireRegisteredVault(vault);
         _authTemplate(template);
         if (proposer != msg.sender) revert ProposerMustBeSender();
-        clone = Clones.cloneDeterministic(template, keccak256(abi.encode(vault, salt)));
+        clone = Clones.cloneDeterministic(template, keccak256(abi.encode(vault, msg.sender, salt)));
         cloneTemplate[clone] = template;
         _register(clone);
         IStrategy(clone).initialize(vault, proposer, data);
