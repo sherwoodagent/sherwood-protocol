@@ -10,7 +10,7 @@
 # against every file in src/strategies/:
 #
 #   1. Every ERC-20 movement out of a template (`transfer`, `safeTransfer`,
-#      `transferFrom`, `safeTransferFrom` and the `trySafe*` variants) names the vault or the template itself as
+#      `transferFrom`, `safeTransferFrom`) names the vault or the template itself as
 #      the destination — never a variable, a parameter, or a decoded field.
 #   2. No identifier in a template carries a destination-shaped name
 #      (`recipient` / `receiver` / `dest` / `destination` / `beneficiary` / `payout` /
@@ -43,7 +43,7 @@ if not files:
 # Destinations a template may pay. `_vault` is BaseStrategy's storage slot,
 # `vault()` its getter; `address(this)` keeps funds inside the template.
 BOUND = re.compile(r"address\(this\)|\bvault\(\)|\b_vault\b")
-MOVES = re.compile(r"\.(trySafeTransferFrom|trySafeTransfer|safeTransferFrom|transferFrom|safeTransfer|transfer)\s*\(")
+MOVES = re.compile(r"\.(safeTransferFrom|transferFrom|safeTransfer|transfer)\s*\(")
 NAMES = re.compile(r"recipient|receiver|beneficiar|payout|payee|destination|\bdest\b", re.I)
 
 

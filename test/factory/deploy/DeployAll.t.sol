@@ -23,7 +23,6 @@ import {StrategyFactory} from "../../../src/StrategyFactory.sol";
 import {ExposureLedger} from "../../../src/ExposureLedger.sol";
 import {ChallengeGame} from "../../../src/ChallengeGame.sol";
 import {IGuardianRegistry} from "../../../src/interfaces/IGuardianRegistry.sol";
-import {IStrategy} from "../../../src/interfaces/IStrategy.sol";
 
 import {ERC20Mock} from "../../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../../mocks/MockAggregatorV3.sol";
@@ -238,9 +237,6 @@ abstract contract DeployAllFixture is Test {
         assertEq(s.portfolioTemplate, Create3.addressOf(c3, DeploySalts.PORTFOLIO_TEMPLATE), "portfolio template");
         assertEq(s.morphoSupplyTemplate, Create3.addressOf(c3, DeploySalts.MORPHO_SUPPLY_TEMPLATE), "morpho template");
         assertEq(s.concentratedLiquidityTemplate, Create3.addressOf(c3, DeploySalts.CL_TEMPLATE), "CL template");
-        assertEq(
-            s.genericCallTemplate, Create3.addressOf(c3, DeploySalts.GENERIC_CALL_TEMPLATE), "generic call template"
-        );
         assertEq(s.strategyFactory, Create3.addressOf(c3, DeploySalts.STRATEGY_FACTORY), "strategy factory");
         bytes32 feedSalt = posture == Posture.Mainnet ? DeploySalts.WOOD_USD_FEED : DeploySalts.FORK_WOOD_FEED;
         assertEq(s.woodUsdFeed, Create3.addressOf(c3, feedSalt), "wood feed");
@@ -288,13 +284,7 @@ abstract contract DeployAllFixture is Test {
         assertTrue(sf.approvedTemplate(s.portfolioTemplate), "portfolio approved");
         assertTrue(sf.approvedTemplate(s.morphoSupplyTemplate), "morpho approved");
         assertTrue(sf.approvedTemplate(s.concentratedLiquidityTemplate), "CL approved");
-        assertTrue(sf.approvedTemplate(s.genericCallTemplate), "generic call approved");
         assertEq(TierRegistry(s.core.tierRegistry).strategyFactory(), s.strategyFactory, "tierRegistry wiring");
-        // The generic-call template is never class-certified: its clones price at tier 2, full notional.
-        (uint8 tier, uint16 bound) =
-            TierRegistry(s.core.tierRegistry).classTierOf(s.genericCallTemplate, IStrategy.execute.selector);
-        assertEq(tier, 2, "generic call class tier");
-        assertEq(bound, 10_000, "generic call class bound");
     }
 
     function _assertCoverageStack(Stack memory s) internal view {
@@ -705,7 +695,6 @@ contract DeployAllTest is DeployAllFixture {
         assertEq(vm.parseJsonAddress(written, ".TIER_REGISTRY"), s.core.tierRegistry, "TIER_REGISTRY");
         assertEq(vm.parseJsonAddress(written, ".STAKED_WOOD"), s.core.swoodProxy, "STAKED_WOOD");
         assertEq(vm.parseJsonAddress(written, ".STRATEGY_FACTORY"), s.strategyFactory, "STRATEGY_FACTORY");
-        assertEq(vm.parseJsonAddress(written, ".GENERIC_CALL_TEMPLATE"), s.genericCallTemplate, "GENERIC_CALL_TEMPLATE");
         assertEq(vm.parseJsonAddress(written, ".WOOD_USD_FEED"), s.woodUsdFeed, "WOOD_USD_FEED");
         assertEq(vm.parseJsonAddress(written, ".EXPOSURE_LEDGER"), s.exposureLedger, "EXPOSURE_LEDGER");
         assertEq(vm.parseJsonAddress(written, ".PROPOSER_BOND_ESCROW"), s.proposerBondEscrow, "PROPOSER_BOND_ESCROW");

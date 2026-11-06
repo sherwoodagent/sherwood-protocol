@@ -10,7 +10,7 @@ import {StrategyFactory} from "../src/StrategyFactory.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 
 /// @title  DeployStrategyFactory
-/// @notice Keyless-clone StrategyFactory: mint it, approve the four canonical templates and
+/// @notice Keyless-clone StrategyFactory: mint it, approve the three canonical templates and
 ///         wire it into the TierRegistry. An abstract mixin — `DeployAll` owns `run()`, the
 ///         broadcast, the handoff and the address book.
 ///
@@ -18,13 +18,12 @@ import {TierRegistry} from "../src/TierRegistry.sol";
 ///         through `TierRegistry.strategyFactory()`; while it is unwired every `propose`
 ///         reverts `StrategyNotRegistered` and every non-asset batch target is refused.
 abstract contract DeployStrategyFactory is ScriptBase {
-    /// @notice The ceremony phase: exactly the four templates this Stack minted.
+    /// @notice The ceremony phase: exactly the three templates this Stack minted.
     function _deployStrategyFactory(Stack memory s) internal {
-        address[] memory templates = new address[](4);
+        address[] memory templates = new address[](3);
         templates[0] = s.portfolioTemplate;
         templates[1] = s.morphoSupplyTemplate;
         templates[2] = s.concentratedLiquidityTemplate;
-        templates[3] = s.genericCallTemplate;
 
         StrategyFactory sf = deploy(s.core.factoryProxy, s.core.tierRegistry, templates);
         s.strategyFactory = address(sf);
@@ -82,10 +81,9 @@ abstract contract DeployStrategyFactory is ScriptBase {
     ///      MOONWELL_SUPPLY / AERODROME_LP / WSTETH_MOONWELL / MAMO_YIELD were removed with
     ///      their contracts (2026-08-04); the exact set is pinned by a test.
     function _templateKeys() internal pure returns (string[] memory keys) {
-        keys = new string[](4);
+        keys = new string[](3);
         keys[0] = "PORTFOLIO_TEMPLATE";
         keys[1] = "MORPHO_SUPPLY_TEMPLATE";
         keys[2] = "CONCENTRATED_LIQUIDITY_TEMPLATE";
-        keys[3] = "GENERIC_CALL_TEMPLATE";
     }
 }
