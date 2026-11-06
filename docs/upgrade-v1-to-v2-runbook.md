@@ -5,8 +5,9 @@ to `post-audit-v2`. Source: the internal review of 2026-10-01.
 The guards this runbook relies on are pinned by
 `test/guardian/Upgrade_keepLedgerRotateGame.t.sol`.
 
-There is no migration script. Every call below is a Safe transaction unless the
-caller column says otherwise. "Old game" is the live v1 `ChallengeGame`; "new game"
+Every call below is a Safe transaction unless the caller column says otherwise. On 4663
+every contract is owned by the deployer EOA, not a Safe; §9 runs the same steps from that
+key with `script/robinhood-mainnet/UpgradeV1ToV2.s.sol`. "Old game" is the live v1 `ChallengeGame`; "new game"
 is the v2 `ChallengeGame` deployed in step 1.
 
 ---
@@ -19,7 +20,7 @@ is the v2 `ChallengeGame` deployed in step 1.
 | `GuardianRegistry` | Upgrade in place: `upgradeToAndCall` (UUPS) | Storage layout unchanged; no `reinitializer` needed |
 | `SyndicateFactory` | None | Byte-identical between the two versions |
 | `StakedWood` | None | Differs only in comments |
-| `SyndicateVault` | None | The Safe cannot: `upgradeVault` is creator-only and needs `upgradesEnabled`. Live vaults keep v1 behaviour (see below) |
+| `SyndicateVault` | §9 seats a v2 impl on the factory and enables upgrades; each creator opts in | The owner cannot upgrade a live vault: `upgradeVault` is creator-only. v1 and v2 storage layouts are identical. A live vault keeps v1 behaviour until its creator calls `upgradeVault` (see below) |
 | `StrategyFactory` | None | Redeploying it unregisters live clones. The live factory keeps the v1 clone salt (see below) |
 | `ChallengeGame` | **Deploy new**, under a NEW CREATE3 salt, on the existing ledger | v2 game is a rewrite; it is not a proxy |
 | `ExposureLedger` | **KEEP the v1 instance** | See below |
@@ -27,11 +28,12 @@ is the v2 `ChallengeGame` deployed in step 1.
 | `TierRegistry` | Keep (default) or redeploy (optional, §5) | Every function v2 calls on it exists on the v1 registry |
 | `TokenCourt` | Retire after the drain | v2 has no court; keep it running until every old challenge is ruled or timed out |
 
-**SHE-470 fixes that do not reach live 4663 contracts.** Vault-side L-1 (net buffer floor), L-2
-(`Call.value` refused) and L-5 (same-owner rotation keeps agents) apply only to vaults deployed from the
-v2 vault impl. Existing vaults keep v1 behaviour: gross buffer formula, agents drained on every
-rotation, and emergency batches still accept `Call.value` at `finalizeEmergencySettle` (the governor's
-L-2 mirror covers `propose` only). L-3 (sender-bound clone salt) applies only to a newly deployed
+**SHE-470 fixes on live 4663 vaults.** Vault-side L-1 (net buffer floor), L-2 (`Call.value` refused)
+and L-5 (same-owner rotation keeps agents) are in the v2 vault impl that §9 phase 1 seats, provided
+phase 1 runs from a `post-audit-v2` checkout that contains #413 (§9). They reach a live vault only
+once its creator calls `upgradeVault`. Until then that vault keeps v1 behaviour: gross buffer
+formula, agents drained on every rotation, and emergency batches still accept `Call.value` at
+`finalizeEmergencySettle` (the governor's L-2 mirror covers `propose` only). L-3 (sender-bound clone salt) applies only to a newly deployed
 `StrategyFactory`; the live factory keeps `keccak256(abi.encode(vault, salt))`, so SDK
 sherwoodagent/sherwood#737 must not ship while that factory is the one clients talk to.
 
@@ -88,7 +90,7 @@ the new game after step 1b). `TierRegistry`, `ExposureLedger`, `ChallengeGame` a
 
 | # | Step | Caller | Call(s) | Assert BEFORE |
 |---|---|---|---|---|
-| 1a | Deploy v2 implementations | deployer | `new SyndicateGovernor(liveMinVoting, liveMinCooldown)`; `new GuardianRegistry(liveMinReviewPeriod)` | Arguments read from the live implementations (§2.4) |
+| 1a | Deploy v2 implementations | deployer | `SyndicateGovernor(liveMinVoting, liveMinCooldown)`, `GuardianRegistry(liveMinReviewPeriod)` and, for opt-in vault upgrades, `SyndicateVault()`. On 4663 §9 deploys all three through `Create3Factory` under v2 salts | Arguments read from the live implementations (§2.4) |
 | 1b | Deploy the v2 game on the EXISTING ledger, via CREATE3 under a new salt | `Create3Factory` owner (deployer) | `create3Factory.deploy(keccak256("sherwood.robinhood.v2.challenge-game"), abi.encodePacked(type(ChallengeGame).creationCode, abi.encode(SAFE, WOOD, existingLedger, tierRegistry)))` — the Safe is `initialOwner` so step 5 is one Safe batch | `create3Factory.addressOf(salt)` has no code and is not any v1 salt's address |
 | 1c | Configure the new game | Safe | `newGame.setChallengeWindow(...)` if needed; `setVoteWindow`, `setChallengeQuorumBps`, `setChallengerBondBps`, `setForfeitBurnBps`, `setSettleBurnBps`, `setProsecutorFeeBps` per `docs/pre-deployment-parameter-review.md` | `newGame.challengeWindow() == oldGame.challengeWindow()` (`≤ ledger.challengeWindow()` is already enforced by the constructor and `setChallengeWindow`). Do not "copy" the old game's parameters: the v1 and v2 setter sets differ |
 | 2 | Upgrade every governor | Safe | `GovernorBeacon.upgradeTo(govImplV2)` | `govImplV2.MIN_VOTING_PERIOD()` / `MIN_COOLDOWN_PERIOD()` equal the live implementation's |
@@ -206,7 +208,7 @@ Morpho market id a live strategy holds.
 - Do not set the factory's `exposureLedger` to zero (§2.3).
 - Do not call `ledger.setCoverageFreezer` while any old-game challenge is live or any
   `oldGame.challengeableUntil` is in the future.
-- Do not split step 5 across transactions.
+- Do not split step 5 across transactions while old-game filings are open (§9).
 - Do not run `DeployAll`, `DeployPlanD` or `verify-robinhood.sh` against the live chain
   as part of this migration (§2.5, §2.6).
 
@@ -240,3 +242,112 @@ new game address by hand; the salt-derived tooling still points at the old one.
 The pinned tests use a v2 game standing in for the live v1 game. The behaviour of the
 v1 game and `TokenCourt` during the drain (live-status view, re-arms, court rulings) is
 verified by reading `origin/v1-deploy` source only, not by running v1 bytecode.
+
+## 9. Running it with the deployer key
+
+On 4663 the deployer EOA `0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` owns every contract
+in §3, so there is no Safe batch. `UpgradeV1ToV2.s.sol` runs §3 in three phases. Each phase
+reads its addresses from `chains/4663.json`, checks that the caller is `owner()` of the factory,
+beacon, guardian registry, tier registry, sWOOD, ledger, old game, `TokenCourt`,
+`StrategyFactory` and `Create3Factory` (not `ProposerBondEscrow`, which has no owner and is
+never called), in phases 1-3 refuses a book whose `CHALLENGE_GAME` already names the new game, and runs the
+§7 checks that apply at that point.
+
+**Run phase 1 from a `post-audit-v2` checkout at or after `98aa2df4` (the merge of #413).**
+The script compiles the governor, registry, vault and game it deploys from the checkout it runs
+in. An older checkout would seat a vault impl without the SHE-470 vault fixes (§1), and creators
+who opt in would need a second `setVaultImpl` and `upgradeVault` to get them.
+
+| Phase | Entry | Does |
+|---|---|---|
+| 1 | `runPhase1()` | Steps 1a–3. Implementation arguments come from the live implementations. Deploys the governor, registry and vault impls and the new game through `Create3Factory` under `sherwood.robinhood.v2.{governor-impl,guardian-registry-impl,vault-impl,challenge-game}` (game owner: deployer), and copies the old game's `filingsPaused`. Then upgrades the beacon and the registry, seats the v2 vault impl and sets `setUpgradesEnabled(true)`. Every deploy is skipped when its address has code and every call when already applied, so re-running after a partial broadcast resumes. Run `verifyPhase1()` (read-only) after the broadcast and before phase 3; after phase 3 it fails by design, because the roles have moved to the new game |
+| 2 | `runPhase2()` | §4 option A: `oldGame.setFilingsPaused(true)`. No-op if already paused (it was on 2026-11-06) |
+| 3 | `runPhase3()` | Refuses unless old filings are paused and 5(a)–(c) hold for every executed proposal. Then step 5 as four transactions, each skipped if already applied, so a re-run resumes |
+| Open | `runOpenProtocol()` | Not part of the upgrade; refuses until phase 3 has rotated the freezer and the new game is unpaused (SHE-361). `factory.setCreationFee(token, 0, recipient)` (token and recipient read from the factory), `setOwnerOnlyProposals(false)`, `setDepositsRestricted(false)`, each skipped if already applied. Keeps `agentRegistry` (ERC-8004 identity is still required to create a vault or be registered as an agent). Run `verifyOpenProtocol()` after the broadcast |
+
+```
+forge script script/robinhood-mainnet/UpgradeV1ToV2.s.sol:UpgradeV1ToV2 --sig "runPhase1()" \
+  --rpc-url "$ROBINHOOD_RPC_URL" --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94 \
+  --slow --interactive --broadcast
+```
+
+Drop `--broadcast` for a dry run. Use the same command with `runPhase2()` and `runPhase3()`,
+and without `--interactive --broadcast` for `verifyPhase1()`. If a phase-1 transaction fails or
+is dropped, re-run `runPhase1()` **from the same commit** (record `git rev-parse HEAD` with the
+phase-1 log): it picks up at the first step not yet applied, and refuses code already at a salt
+that differs from what the current checkout would deploy (immutables masked). Every runtime
+size is under 4663's 98,304-byte limit (governor 36,815), so no code-size flag is needed.
+`--interactive` is a flag and takes no value. The script writes nothing to the address book.
+After phase 3, set `CHALLENGE_GAME` to the new game by hand (§7).
+
+**Opening the protocol (`runOpenProtocol`).** On 2026-11-06 the live factory charges a
+`1e24` WOOD creation fee (invite-only, waived per creator by `creationSponsored`), allows only a
+vault's owner to propose (`ownerOnlyProposals`), and restricts every vault to approved
+depositors (`depositsRestricted`). After the open step:
+
+- anyone with an ERC-8004 identity creates a vault for free (sWOOD `minOwnerStake` is `0`, so no
+  prepared stake is needed);
+- any agent the vault owner registered (`vault.registerAgent`) proposes and co-proposes;
+- deposits follow each vault's own flag: `SyndicateVault._depositsOpen()` is
+  `_openDeposits && !factory.depositsRestricted()`. New vaults set it with
+  `config.openDeposits` at `createSyndicate`. The three live vaults were created with
+  `openDeposits == false`, so they stay whitelist-only until their owner calls
+  `vault.setOpenDeposits(true)`. This is by design, not a gap in the step.
+
+**Order: unpause first, then open.** `runOpenProtocol()` refuses while the new game's filings
+are paused (`OPEN: unpause filings first (SHE-361)`). SHE-352 justified the pause only because
+deposits were whitelisted and only vault owners could propose; opening while paused would let any
+registered agent's proposal execute with nobody able to challenge it. So the sequence is:
+`setFilingsPaused(false)` on the NEW game `0x0d215e4cEd550525fa2F5b2B33E49e671326D72d` (SHE-361),
+then `runOpenProtocol()`.
+
+Free creation also makes subdomains first-come at gas cost: `subdomainToSyndicate` is claimed by
+whoever creates first. `creationSponsored` waivers stay set while the fee is 0, so if the fee is
+ever raised again those creators still get one free creation.
+
+**Creator actions after phase 1 and the open step.** Each vault owner decides, per vault:
+`factory.upgradeVault(vault, expectedImpl)` to move to the v2 vault impl (creator only), and
+`vault.setOpenDeposits(true)` to accept deposits from anyone (vault owner only).
+
+**Vault upgrades stay enabled.** Phase 1 sets `factory.setUpgradesEnabled(true)`, and it stays
+on by decision: the owner wants to be able to upgrade vaults later. Before phase 1 a live vault's
+code was fixed (`upgradesEnabled == false`). After it, the trust model is: the factory owner
+chooses the vault impl with `setVaultImpl`; each creator opts in per vault with
+`upgradeVault(vault, expectedImpl)`, which reverts `VaultImplMismatch` if the owner changed the
+impl in between, `StrategyActive` while a strategy is live, and `ProposalsOpen` while the vault's
+governor has any open proposal. Depositors therefore rely on the owner and the vault's creator
+together for the vault's code.
+
+**Ownership handoff.** The new game is owned by the deployer and is not in
+`DeployAll._handoffAll`, which hands off the salt-derived v1 game. If ownership of the protocol
+ever moves to a Safe, the v2 game needs its own `transferOwnership` (it is `Ownable2Step`: the Safe
+must then `acceptOwnership()`).
+
+**The new game starts paused.** Phase 1 copies the old game's `filingsPaused`, which is `true`
+on 4663 (SHE-352 beta posture), so the new game takes no filing until its owner calls
+`setFilingsPaused(false)` on it. SHE-361's unpause must target the NEW game,
+`0x0d215e4cEd550525fa2F5b2B33E49e671326D72d`, not the old one, and its criteria need restating
+for the v2 vote (7-day vote window, 3000 bps quorum): the SHE-352 rationale was about the v1
+court path, which v2 does not have. Unpausing is not part of this procedure. Until it happens,
+the two executed proposals still inside their filing window cannot be challenged, and their
+windows lapse (`executedAt + strategyDuration + 14d`):
+
+| Governor | Proposal | Filing window closes |
+|---|---|---|
+| `0x01FA20667Cb4A27DdA5FfE375a1cece3e61B35aD` (syndicate 2) | 5 | 2026-11-13 18:26 UTC (`1794594417`) |
+| `0x6b52ED9FB522AC17e6c6FD199b0Ffb7B314871C5` (syndicate 1) | 8 | 2026-11-18 21:33 UTC (`1795037602`) |
+
+**Step 5 without the batch.** §3 asks for one transaction because a `file` landing between
+the slasher grant and the freezer rotation wedges the freezer call. Old filings are paused
+before phase 3, so that `file` reverts with `FilingsPaused`. A filing on the new game reverts
+with `ZeroAddress` until `setStakedWood` runs, and with `NotCoverageFreezer` until the
+freezer rotation runs; the fork test checks this with the new game unpaused, the worst case.
+No challenge exists on either game, so `resolve`, `dispute` and `TokenCourt.refer` have nothing to act on, and nothing else
+can freeze a key or re-arm a window. Pinned on a 4663 fork by
+`test/fork/UpgradeV1ToV2Fork.t.sol`:
+`test_fork_gap_noFilingLandsBetweenRotationSteps` (no filing lands in any gap, with the new
+game unpaused), `test_fork_gap_openOldFilingsWedgeFreezerRotation` (the hazard when old
+filings are open), and `test_fork_gap_phase3RefusesWhileOldFilingsOpen`.
+
+The fork suite runs only with `ROBINHOOD_RPC_URL` on an archive node and `UPGRADE_FORK_ARCHIVE=true`
+(the block is pinned and the public RPC prunes history), so the weekly `fork-tests.yml` run skips it.
