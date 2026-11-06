@@ -107,13 +107,6 @@ ADAPTER=$(derive uniswap-swap-adapter);     book_matches "UNISWAP_SWAP_ADAPTER" 
 PORTFOLIO=$(derive portfolio-template);     book_matches "PORTFOLIO_TEMPLATE"   PORTFOLIO_TEMPLATE   "$PORTFOLIO"
 MORPHOT=$(derive morpho-supply-template);   book_matches "MORPHO_SUPPLY_TEMPLATE" MORPHO_SUPPLY_TEMPLATE "$MORPHOT"
 CLT=$(derive concentrated-liquidity-template); book_matches "CONCENTRATED_LIQUIDITY_TEMPLATE" CONCENTRATED_LIQUIDITY_TEMPLATE "$CLT"
-# GENERIC_CALL_TEMPLATE is checked once booked: on 4663 it lands by an owner GO after run 2 (SHE-510).
-GCT=""
-if [ -n "$(a GENERIC_CALL_TEMPLATE)" ]; then
-  GCT=$(derive generic-call-template); book_matches "GENERIC_CALL_TEMPLATE" GENERIC_CALL_TEMPLATE "$GCT"
-else
-  printf '  \033[33mWARN\033[0m %-46s %s\n' "GENERIC_CALL_TEMPLATE not booked" "generic-call checks skipped"
-fi
 SFACTORY=$(derive strategy-factory);        book_matches "STRATEGY_FACTORY"     STRATEGY_FACTORY     "$SFACTORY"
 LEDGER=$(derive exposure-ledger);           book_matches "EXPOSURE_LEDGER"      EXPOSURE_LEDGER      "$LEDGER"
 ESCROW=$(derive proposer-bond-escrow);      book_matches "PROPOSER_BOND_ESCROW" PROPOSER_BOND_ESCROW "$ESCROW"
@@ -225,18 +218,12 @@ else
   check "router.pendingOwner (none)" "$(call "$ROUTER" 'pendingOwner()(address)')" "$ZERO"
 fi
 
-echo; echo "── Strategy templates (the allowlist IS _templateKeys; generic call only once booked) ──"
-APPROVED=0; WANT=3
-[ -z "$GCT" ] || WANT=4
-for t in "$PORTFOLIO" "$MORPHOT" "$CLT" $GCT; do
+echo; echo "── Strategy templates (the allowlist IS _templateKeys) ──"
+APPROVED=0
+for t in "$PORTFOLIO" "$MORPHOT" "$CLT"; do
   [ "$(call1 "$SFACTORY" 'approvedTemplate(address)(bool)' "$t")" = "true" ] && APPROVED=$((APPROVED+1))
 done
-check "strategyFactory approvals == $WANT" "$APPROVED" "$WANT"
-if [ -n "$GCT" ]; then
-  # Never certified: a class grant would price every clone below full notional.
-  check "tiers.classTierOf(genericCall, execute)" \
-    "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$GCT" 0x61461954 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "2/10000"
-fi
+check "strategyFactory approvals == 3" "$APPROVED" "3"
 check "tiers.strategyFactory"         "$(call "$TIERS" 'strategyFactory()(address)')"   "$SFACTORY"
 check "tiers.counterpartyAllowed(adapter)" "$(call1 "$TIERS" 'isCounterpartyAllowed(address)(bool)' "$ADAPTER")" "true"
 

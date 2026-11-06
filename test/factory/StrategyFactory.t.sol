@@ -171,9 +171,8 @@ contract StrategyFactoryTest is Test {
     function test_cloneAndInitDeterministic_predictableAddress() public {
         bytes32 salt = keccak256("strategy.salt.1");
         bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
-        // #387 — the factory binds the salt to the vault; the predictor must fold
-        // the same way (keccak256(abi.encode(vault, salt))).
-        bytes32 effSalt = keccak256(abi.encode(address(vault), salt));
+        // #387 / SHE-481 — the factory binds the salt to the vault and the deployer.
+        bytes32 effSalt = keccak256(abi.encode(address(vault), vaultOwner, salt));
         address predicted = Clones.predictDeterministicAddress(address(template), effSalt, address(factory));
         vm.prank(vaultOwner);
         address clone = factory.cloneAndInitDeterministic(address(template), address(vault), vaultOwner, initData, salt);
@@ -203,14 +202,32 @@ contract StrategyFactoryTest is Test {
         assertEq(
             cloneA,
             Clones.predictDeterministicAddress(
-                address(template), keccak256(abi.encode(address(vault), salt)), address(factory)
+                address(template), keccak256(abi.encode(address(vault), vaultOwner, salt)), address(factory)
             )
         );
         assertEq(
             cloneB,
             Clones.predictDeterministicAddress(
-                address(template), keccak256(abi.encode(address(vaultB), salt)), address(factory)
+                address(template), keccak256(abi.encode(address(vaultB), vaultOwner, salt)), address(factory)
             )
         );
+    }
+
+    /// @notice SHE-481: a stranger replaying the salt lands elsewhere; the proposer still gets its predicted address.
+    function test_cloneAndInitDeterministic_frontRunLandsElsewhere() public {
+        bytes32 salt = keccak256("owner.salt");
+        bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
+        address predicted = Clones.predictDeterministicAddress(
+            address(template), keccak256(abi.encode(address(vault), vaultOwner, salt)), address(factory)
+        );
+
+        vm.prank(attacker);
+        address seated = factory.cloneAndInitDeterministic(address(template), address(vault), attacker, initData, salt);
+        assertTrue(seated != predicted, "front-run lands at a different address");
+
+        vm.prank(vaultOwner);
+        address clone = factory.cloneAndInitDeterministic(address(template), address(vault), vaultOwner, initData, salt);
+        assertEq(clone, predicted);
+        assertEq(MockStrategy(payable(clone)).proposer(), vaultOwner);
     }
 }

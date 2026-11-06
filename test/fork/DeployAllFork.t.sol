@@ -192,7 +192,6 @@ contract DeployAllForkTest is Test {
         assertTrue(sf.approvedTemplate(s.portfolioTemplate), "portfolio approved");
         assertTrue(sf.approvedTemplate(s.morphoSupplyTemplate), "morpho approved");
         assertTrue(sf.approvedTemplate(s.concentratedLiquidityTemplate), "CL approved");
-        assertTrue(sf.approvedTemplate(s.genericCallTemplate), "generic call approved");
         assertEq(TierRegistry(s.core.tierRegistry).strategyFactory(), s.strategyFactory, "tierRegistry wiring");
     }
 

@@ -1133,6 +1133,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     function _mirrorBatchLeg(address vault_, address asset_, BatchExecutorLib.Call[] calldata calls_) private view {
         for (uint256 i = 0; i < calls_.length; i++) {
+            if (calls_[i].value != 0) revert ISyndicateVault.CallValueNotAllowed(i);
             address t = calls_[i].target;
             if (t == asset_) AssetCallRules.spenderOf(vault_, calls_[i].data);
             else if (!_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
@@ -1634,9 +1635,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // proposal's own starting balance — a fund that fell and recovered has
         // already paid for this ground.
         uint256 base = ISyndicateVault(vault).aboveHighWaterMark();
-        // Never more than this proposal earned: `pnl` is the pre-management-fee balance
-        // delta and `base` is post-fee, net of reserves; the min keeps a stale mark from
-        // charging principal or a donation as performance.
+        // Never more than this proposal earned: the min keeps a stale mark or a pre-execute donation
+        // out of the fee. A donation made while Executed is inside `pnl` and IS charged (SHE-490).
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 earned = pnl > 0 ? uint256(pnl) : 0;
         if (base > earned) base = earned;

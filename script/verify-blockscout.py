@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify every contract a DeployAll, DeployProtocolFeeRouter or DeployGenericCallStrategy broadcast minted, on Blockscout's v2 API.
+"""Verify every contract a DeployAll or DeployProtocolFeeRouter broadcast minted, on Blockscout's v2 API.
 
 Names and constructor args are DERIVED from the broadcast: each minted contract's
 initcode is matched against the compiled artifacts in out/, and whatever follows the
@@ -20,8 +20,8 @@ import time
 HOST = os.environ.get("BLOCKSCOUT_URL", "https://robinhoodchain.blockscout.com")
 SOLC = "v0.8.28+commit.7893614a"
 CREATE2_DEPLOYER = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
-# The ceremony, plus what is minted after run 2: the fee router (SHE-239) and the generic-call template (SHE-510).
-SCRIPTS = ["DeployAll.s.sol", "DeployProtocolFeeRouter.s.sol", "DeployGenericCallStrategy.s.sol"]
+# The ceremony, plus the fee router minted after run 2 (SHE-239).
+SCRIPTS = ["DeployAll.s.sol", "DeployProtocolFeeRouter.s.sol"]
 # Cloudflare 403s a browser UA sent without its client hints.
 HEADERS = [
     "Accept: application/json",
