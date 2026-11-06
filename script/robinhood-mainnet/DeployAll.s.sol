@@ -12,7 +12,6 @@ import {DeployRobinhoodMainnet} from "./Deploy.s.sol";
 import {DeployPortfolioStrategy} from "./DeployPortfolioStrategy.s.sol";
 import {DeployMorphoStrategy} from "./DeployMorphoStrategy.s.sol";
 import {DeployConcentratedLiquidityStrategy} from "./DeployConcentratedLiquidityStrategy.s.sol";
-import {DeployGenericCallStrategy} from "./DeployGenericCallStrategy.s.sol";
 import {DeployStrategyFactory} from "../DeployStrategyFactory.s.sol";
 import {DeployWoodPoolFeed} from "../DeployWoodPoolFeed.s.sol";
 import {DeployPlanB} from "../DeployPlanB.s.sol";
@@ -74,7 +73,6 @@ contract DeployAll is
     DeployPortfolioStrategy,
     DeployMorphoStrategy,
     DeployConcentratedLiquidityStrategy,
-    DeployGenericCallStrategy,
     DeployStrategyFactory,
     DeployWoodPoolFeed,
     DeployPlanB,
@@ -129,7 +127,6 @@ contract DeployAll is
         _deployPortfolio(s, i);
         _deployMorpho(s);
         _deployCL(s, i);
-        _deployGenericCall(s);
         _deployStrategyFactory(s);
 
         if (i.posture == Posture.Mainnet) {
@@ -198,7 +195,6 @@ contract DeployAll is
         _checkAddr("portfolioTemplate", s.portfolioTemplate, _predict(c3, DeploySalts.PORTFOLIO_TEMPLATE));
         _checkAddr("morphoTemplate", s.morphoSupplyTemplate, _predict(c3, DeploySalts.MORPHO_SUPPLY_TEMPLATE));
         _checkAddr("clTemplate", s.concentratedLiquidityTemplate, _predict(c3, DeploySalts.CL_TEMPLATE));
-        _checkAddr("genericCallTemplate", s.genericCallTemplate, _predict(c3, DeploySalts.GENERIC_CALL_TEMPLATE));
         _checkAddr("strategyFactory", s.strategyFactory, _predict(c3, DeploySalts.STRATEGY_FACTORY));
         _checkAddr(
             "woodUsdFeed",
@@ -228,7 +224,6 @@ contract DeployAll is
         s.portfolioTemplate = _predict(c3, DeploySalts.PORTFOLIO_TEMPLATE);
         s.morphoSupplyTemplate = _predict(c3, DeploySalts.MORPHO_SUPPLY_TEMPLATE);
         s.concentratedLiquidityTemplate = _predict(c3, DeploySalts.CL_TEMPLATE);
-        s.genericCallTemplate = _predict(c3, DeploySalts.GENERIC_CALL_TEMPLATE);
         s.strategyFactory = _predict(c3, DeploySalts.STRATEGY_FACTORY);
 
         // Distinct salts: a fork fixture can never be adopted as the mainnet feed.
@@ -255,7 +250,6 @@ contract DeployAll is
         if (
             s.uniswapSwapAdapter.code.length == 0 || s.portfolioTemplate.code.length == 0
                 || s.morphoSupplyTemplate.code.length == 0 || s.concentratedLiquidityTemplate.code.length == 0
-                || s.genericCallTemplate.code.length == 0
         ) return Stage.Templates;
         if (s.strategyFactory.code.length == 0) return Stage.StrategyFactory;
         if (s.woodUsdFeed.code.length == 0) return Stage.WoodFeed;
@@ -489,7 +483,6 @@ contract DeployAll is
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.portfolioTemplate), "template: portfolio");
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.morphoSupplyTemplate), "template: morpho");
         require(StrategyFactory(s.strategyFactory).approvedTemplate(s.concentratedLiquidityTemplate), "template: CL");
-        require(StrategyFactory(s.strategyFactory).approvedTemplate(s.genericCallTemplate), "template: generic call");
 
         if (cp == Checkpoint.AwaitingWoodFeed) {
             require(s.woodUsdFeed.code.length != 0, "the WOOD feed was not minted");
@@ -558,7 +551,6 @@ contract DeployAll is
         _patchAddress(templateKeys[0], s.portfolioTemplate);
         _patchAddress(templateKeys[1], s.morphoSupplyTemplate);
         _patchAddress(templateKeys[2], s.concentratedLiquidityTemplate);
-        _patchAddress(templateKeys[3], s.genericCallTemplate);
         _patchAddress("STRATEGY_FACTORY", s.strategyFactory);
         _patchAddress("WOOD_USD_FEED", s.woodUsdFeed);
 

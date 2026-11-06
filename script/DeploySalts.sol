@@ -35,7 +35,6 @@ library DeploySalts {
     bytes32 internal constant PORTFOLIO_TEMPLATE = keccak256("sherwood.robinhood.v1.portfolio-template");
     bytes32 internal constant MORPHO_SUPPLY_TEMPLATE = keccak256("sherwood.robinhood.v1.morpho-supply-template");
     bytes32 internal constant CL_TEMPLATE = keccak256("sherwood.robinhood.v1.concentrated-liquidity-template");
-    bytes32 internal constant GENERIC_CALL_TEMPLATE = keccak256("sherwood.robinhood.v1.generic-call-template");
     bytes32 internal constant STRATEGY_FACTORY = keccak256("sherwood.robinhood.v1.strategy-factory");
 
     // Pricing. Distinct salts so a fork book can never be mistaken for a mainnet feed.
