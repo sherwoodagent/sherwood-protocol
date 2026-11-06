@@ -154,15 +154,22 @@ contract UpgradeV1ToV2 is ScriptBase {
         _deployOnce(
             b,
             GOVERNOR_IMPL_SALT,
-            abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(minVoting, minCooldown))
+            abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(minVoting, minCooldown)),
+            "SyndicateGovernor.sol:SyndicateGovernor"
         );
-        _deployOnce(b, REGISTRY_IMPL_SALT, abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(minReview)));
-        _deployOnce(b, VAULT_IMPL_SALT, type(SyndicateVault).creationCode);
+        _deployOnce(
+            b,
+            REGISTRY_IMPL_SALT,
+            abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(minReview)),
+            "GuardianRegistry.sol:GuardianRegistry"
+        );
+        _deployOnce(b, VAULT_IMPL_SALT, type(SyndicateVault).creationCode, "SyndicateVault.sol:SyndicateVault");
         // 1b: the v2 game on the EXISTING ledger and tier registry, owned by the deployer.
         _deployOnce(
             b,
             GAME_SALT,
-            abi.encodePacked(type(ChallengeGame).creationCode, abi.encode(owner, b.wood, b.ledger, b.tierRegistry))
+            abi.encodePacked(type(ChallengeGame).creationCode, abi.encode(owner, b.wood, b.ledger, b.tierRegistry)),
+            "ChallengeGame.sol:ChallengeGame"
         );
         // Also covers an impl left by an earlier, partial run.
         require(
@@ -264,6 +271,8 @@ contract UpgradeV1ToV2 is ScriptBase {
     function openProtocol(Book memory b, address owner) public {
         _requireOwners(b, owner);
         require(IV1Live(b.ledger).coverageFreezer() == newGameAddress(b), "OPEN: run phase 3 first");
+        // SHE-352 kept filings paused only because deposits and proposals were closed (runbook §9).
+        require(!ChallengeGame(newGameAddress(b)).filingsPaused(), "OPEN: unpause filings first (SHE-361)");
         SyndicateFactory f = SyndicateFactory(b.factory);
         if (f.creationFee() != 0) f.setCreationFee(address(f.creationFeeToken()), 0, f.creationFeeRecipient());
         if (f.ownerOnlyProposals()) f.setOwnerOnlyProposals(false);
@@ -279,6 +288,7 @@ contract UpgradeV1ToV2 is ScriptBase {
         require(!f.ownerOnlyProposals(), "OPEN: proposals still owner-only");
         require(!f.depositsRestricted(), "OPEN: deposits still restricted");
         require(address(f.agentRegistry()) != address(0), "OPEN: ERC-8004 identity gating off");
+        require(!ChallengeGame(newGameAddress(b)).filingsPaused(), "OPEN: new game filings paused");
         _requireRolesHeldBy(b, newGameAddress(b));
     }
 
@@ -381,10 +391,36 @@ contract UpgradeV1ToV2 is ScriptBase {
         d.newGame = c3.addressOf(GAME_SALT);
     }
 
-    function _deployOnce(Book memory b, bytes32 salt, bytes memory initcode) internal {
+    function _deployOnce(Book memory b, bytes32 salt, bytes memory initcode, string memory artifact) internal {
         address target = Create3Factory(b.create3).addressOf(salt);
-        if (target.code.length != 0) return;
+        if (target.code.length != 0) {
+            // A resumed run reuses code only if it is what this checkout would deploy.
+            require(
+                _sameRuntime(target.code, vm.getDeployedCode(artifact)),
+                string.concat("PHASE1: code at salt differs from this checkout: ", artifact)
+            );
+            return;
+        }
         require(Create3Factory(b.create3).deploy(salt, initcode) == target, "PHASE1: CREATE3 address drift");
+    }
+
+    /// @dev Byte compare with immutables masked: the artifact holds zeros where immutables are written.
+    function _sameRuntime(bytes memory code, bytes memory artifact) internal pure returns (bool) {
+        if (code.length != artifact.length) return false;
+        for (uint256 i = 0; i < code.length; i += 32) {
+            if (_word(code, i) == _word(artifact, i)) continue;
+            uint256 end = i + 32 < code.length ? i + 32 : code.length;
+            for (uint256 j = i; j < end; j++) {
+                if (artifact[j] != 0 && code[j] != artifact[j]) return false;
+            }
+        }
+        return true;
+    }
+
+    function _word(bytes memory data, uint256 offset) internal pure returns (bytes32 w) {
+        assembly ("memory-safe") {
+            w := mload(add(add(data, 32), offset))
+        }
     }
 
     /// @dev Global precondition of runbook §3: `owner()` (not `pendingOwner()`) is the caller everywhere.

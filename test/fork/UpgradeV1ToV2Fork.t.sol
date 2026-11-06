@@ -9,6 +9,7 @@ import {SyndicateFactory} from "src/SyndicateFactory.sol";
 import {SyndicateVault} from "src/SyndicateVault.sol";
 import {GovernorBeacon} from "src/GovernorBeacon.sol";
 import {SyndicateGovernor} from "src/SyndicateGovernor.sol";
+import {GuardianRegistry} from "src/GuardianRegistry.sol";
 import {Create3Factory} from "script/utils/Create3Factory.sol";
 import {ChallengeGame} from "src/ChallengeGame.sol";
 import {IChallengeGame} from "src/interfaces/IChallengeGame.sol";
@@ -258,6 +259,44 @@ contract UpgradeV1ToV2ForkTest is Test {
         up.phase1(b, DEPLOYER);
     }
 
+    /// @notice A resumed phase 1 refuses code at a salt that this checkout would not deploy.
+    function test_fork_phase1_refusesForeignCodeAtImplSalt() public {
+        if (!_fork()) return;
+        bytes32 salt = up.VAULT_IMPL_SALT();
+        vm.prank(DEPLOYER);
+        Create3Factory(b.create3)
+            .deploy(salt, abi.encodePacked(type(Create3Factory).creationCode, abi.encode(DEPLOYER)));
+        vm.expectRevert(bytes("PHASE1: code at salt differs from this checkout: SyndicateVault.sol:SyndicateVault"));
+        up.phase1(b, DEPLOYER);
+    }
+
+    /// @notice A governor impl at the salt with other floors than the live impl is refused.
+    function test_fork_phase1_refusesGovernorWithOtherFloors() public {
+        if (!_fork()) return;
+        SyndicateGovernor live = SyndicateGovernor(GovernorBeacon(b.beacon).implementation());
+        uint256 minVoting = live.MIN_VOTING_PERIOD() + 1;
+        uint256 minCooldown = live.MIN_COOLDOWN_PERIOD();
+        bytes32 salt = up.GOVERNOR_IMPL_SALT();
+        vm.prank(DEPLOYER);
+        Create3Factory(b.create3)
+            .deploy(salt, abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(minVoting, minCooldown)));
+        vm.expectRevert(bytes("PHASE1: governor impl floors differ from live"));
+        up.phase1(b, DEPLOYER);
+    }
+
+    /// @notice A registry impl at the salt with another review floor than the live impl is refused.
+    function test_fork_phase1_refusesRegistryWithOtherFloor() public {
+        if (!_fork()) return;
+        uint256 minReview =
+            GuardianRegistry(address(uint160(uint256(vm.load(b.registry, IMPL_SLOT))))).minReviewPeriod() + 1;
+        bytes32 salt = up.REGISTRY_IMPL_SALT();
+        vm.prank(DEPLOYER);
+        Create3Factory(b.create3)
+            .deploy(salt, abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(minReview)));
+        vm.expectRevert(bytes("PHASE1: registry floor differs from live"));
+        up.phase1(b, DEPLOYER);
+    }
+
     /// @notice Each phase, run from a key that does not own the contracts, stops at the owner preflight.
     function test_fork_eachPhaseRefusesNonOwner() public {
         if (!_fork()) return;
@@ -297,10 +336,13 @@ contract UpgradeV1ToV2ForkTest is Test {
 
     // ── Opening the protocol (after phase 3) ──
 
+    /// @dev Phases 1-3, then the SHE-361 unpause of the new game that the open step requires.
     function _upgradeAll() internal {
         up.phase1(b, DEPLOYER);
         up.phase2(b, DEPLOYER);
-        up.phase3(b, DEPLOYER);
+        address game = up.phase3(b, DEPLOYER);
+        vm.prank(DEPLOYER);
+        ChallengeGame(game).setFilingsPaused(false);
     }
 
     function _identity(address who) internal returns (uint256 agentId) {
@@ -447,7 +489,11 @@ contract UpgradeV1ToV2ForkTest is Test {
         vm.expectRevert(bytes("OPEN: run phase 3 first"));
         up.openProtocol(b, DEPLOYER);
         up.phase2(b, DEPLOYER);
-        up.phase3(b, DEPLOYER);
+        address game = up.phase3(b, DEPLOYER);
+        vm.expectRevert(bytes("OPEN: unpause filings first (SHE-361)"));
+        up.openProtocol(b, DEPLOYER);
+        vm.prank(DEPLOYER);
+        ChallengeGame(game).setFilingsPaused(false);
 
         address outsider = makeAddr("outsider");
         vm.etch(outsider, address(up).code);
