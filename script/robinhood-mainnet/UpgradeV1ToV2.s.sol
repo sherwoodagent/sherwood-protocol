@@ -41,12 +41,16 @@ interface IV1Live {
  * @notice Live 4663 upgrade `v1-deploy` -> `post-audit-v2`, per `docs/upgrade-v1-to-v2-runbook.md`, run by
  *         the deployer EOA that owns every contract. Three entry points, days apart:
  *         `runPhase1` (impls, new game, upgrades), `runPhase2` (pause old filings), `runPhase3` (rotate roles).
+ *         Each phase resumes after a partial broadcast; `verifyPhase1` re-checks phase 1 against the chain.
  * @dev    Phase 3 is four EOA transactions, not one Safe batch; see the runbook's "Running it with the
  *         deployer key" for why the gaps are closed with old filings paused.
  */
 contract UpgradeV1ToV2 is ScriptBase {
     bytes32 internal constant IMPL_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
     bytes32 public constant GAME_SALT = keccak256("sherwood.robinhood.v2.challenge-game");
+    bytes32 public constant GOVERNOR_IMPL_SALT = keccak256("sherwood.robinhood.v2.governor-impl");
+    bytes32 public constant REGISTRY_IMPL_SALT = keccak256("sherwood.robinhood.v2.guardian-registry-impl");
+    bytes32 public constant VAULT_IMPL_SALT = keccak256("sherwood.robinhood.v2.vault-impl");
     uint256 public constant ROTATION_STEPS = 4;
 
     struct Book {
@@ -93,6 +97,13 @@ contract UpgradeV1ToV2 is ScriptBase {
         console.log("challenge game v2 (CHALLENGE_GAME after phase 3): %s", d.newGame);
     }
 
+    /// @notice Read-only: the post-phase-1 state, read from the chain. Run after the phase-1 broadcast.
+    function verifyPhase1() external view {
+        Book memory b = book();
+        _requireOwners(b, msg.sender);
+        postPhase1(b, deployedAddresses(b), msg.sender);
+    }
+
     function runPhase2() external {
         Book memory b = book();
         vm.startBroadcast();
@@ -109,13 +120,29 @@ contract UpgradeV1ToV2 is ScriptBase {
         console.log("roles rotated to %s; update CHALLENGE_GAME in the book by hand", newGame);
     }
 
+    function runOpenProtocol() external {
+        Book memory b = book();
+        vm.startBroadcast();
+        openProtocol(b, msg.sender);
+        vm.stopBroadcast();
+        console.log("protocol open: free vault creation, any registered agent proposes, deposits per vault");
+    }
+
+    /// @notice Read-only: the post-open state, read from the chain.
+    function verifyOpenProtocol() external view {
+        Book memory b = book();
+        _requireOwners(b, msg.sender);
+        postOpenProtocol(b);
+    }
+
     // ── Phases (public so the fork test drives them) ──
 
     /// @notice Runbook steps 1a, 1b, 1c, 2, 3, plus the v2 vault impl for new syndicates and opt-in upgrades.
+    /// @dev    Every deploy is CREATE3 and every call is skipped once applied, so a re-run resumes a partial broadcast.
     function phase1(Book memory b, address owner) public returns (Deployed memory d) {
         _requireOwners(b, owner);
-        d.newGame = newGameAddress(b);
-        require(d.newGame.code.length == 0, "PHASE1: the v2 game salt already holds code");
+        _requireBookNamesOldGame(b);
+        d = deployedAddresses(b);
 
         // §2.4: constructor arguments come from the live implementations, never from constants.
         SyndicateGovernor liveGov = SyndicateGovernor(GovernorBeacon(b.beacon).implementation());
@@ -124,39 +151,52 @@ contract UpgradeV1ToV2 is ScriptBase {
         uint256 minReview = GuardianRegistry(_registryImpl(b.registry)).minReviewPeriod();
         RegistrySnapshot memory before = _registrySnapshot(b.registry);
 
-        d.govImpl = address(new SyndicateGovernor(minVoting, minCooldown));
-        d.regImpl = address(new GuardianRegistry(minReview));
+        _deployOnce(
+            b,
+            GOVERNOR_IMPL_SALT,
+            abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(minVoting, minCooldown))
+        );
+        _deployOnce(b, REGISTRY_IMPL_SALT, abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(minReview)));
+        _deployOnce(b, VAULT_IMPL_SALT, type(SyndicateVault).creationCode);
+        // 1b: the v2 game on the EXISTING ledger and tier registry, owned by the deployer.
+        _deployOnce(
+            b,
+            GAME_SALT,
+            abi.encodePacked(type(ChallengeGame).creationCode, abi.encode(owner, b.wood, b.ledger, b.tierRegistry))
+        );
+        // Also covers an impl left by an earlier, partial run.
         require(
             SyndicateGovernor(d.govImpl).MIN_VOTING_PERIOD() == minVoting
                 && SyndicateGovernor(d.govImpl).MIN_COOLDOWN_PERIOD() == minCooldown,
             "PHASE1: governor impl floors differ from live"
         );
         require(GuardianRegistry(d.regImpl).minReviewPeriod() == minReview, "PHASE1: registry floor differs from live");
-
-        // 1b: the v2 game on the EXISTING ledger and tier registry, owned by the deployer.
-        bytes memory initcode =
-            abi.encodePacked(type(ChallengeGame).creationCode, abi.encode(owner, b.wood, b.ledger, b.tierRegistry));
-        require(Create3Factory(b.create3).deploy(GAME_SALT, initcode) == d.newGame, "PHASE1: game address drift");
+        _requireNewGame(b, d.newGame, owner);
 
         // 1c: the reviewed values are the v2 constructor defaults; only the window and the filing posture are pinned.
         ChallengeGame game = ChallengeGame(d.newGame);
-        require(game.challengeWindow() == IV1Live(b.oldGame).challengeWindow(), "PHASE1: new game window != old game");
-        if (IV1Live(b.oldGame).filingsPaused()) game.setFilingsPaused(true);
+        bool oldPaused = IV1Live(b.oldGame).filingsPaused();
+        if (game.filingsPaused() != oldPaused) game.setFilingsPaused(oldPaused);
 
-        GovernorBeacon(b.beacon).upgradeTo(d.govImpl);
-        UUPSUpgradeable(b.registry).upgradeToAndCall(d.regImpl, "");
+        if (GovernorBeacon(b.beacon).implementation() != d.govImpl) GovernorBeacon(b.beacon).upgradeTo(d.govImpl);
+        if (_registryImpl(b.registry) != d.regImpl) UUPSUpgradeable(b.registry).upgradeToAndCall(d.regImpl, "");
 
         // v1 and v2 vault layouts are identical (PR body); creators opt in through `upgradeVault`.
-        d.vaultImpl = address(new SyndicateVault());
-        SyndicateFactory(b.factory).setVaultImpl(d.vaultImpl);
-        SyndicateFactory(b.factory).setUpgradesEnabled(true);
+        SyndicateFactory f = SyndicateFactory(b.factory);
+        if (f.vaultImpl() != d.vaultImpl) f.setVaultImpl(d.vaultImpl);
+        if (!f.upgradesEnabled()) f.setUpgradesEnabled(true);
 
-        postPhase1(b, d, owner, minVoting, minCooldown, minReview, before);
+        postPhase1(b, d, owner);
+        require(
+            keccak256(abi.encode(before)) == keccak256(abi.encode(_registrySnapshot(b.registry))),
+            "POST1: registry storage moved"
+        );
     }
 
     /// @notice Runbook §4 option A: stop new old-game filings so the drain is bounded.
     function phase2(Book memory b, address owner) public {
-        require(IV1Live(b.oldGame).owner() == owner, "PHASE2: old game owner");
+        _requireOwners(b, owner);
+        _requireBookNamesOldGame(b);
         if (!IV1Live(b.oldGame).filingsPaused()) IV1Live(b.oldGame).setFilingsPaused(true);
         require(IV1Live(b.oldGame).filingsPaused(), "POST2: old game filings open");
     }
@@ -173,6 +213,7 @@ contract UpgradeV1ToV2 is ScriptBase {
     /// @notice Runbook 5(a)-(c), plus old-game filings paused: what makes the four-transaction rotation safe.
     function phase3Preflight(Book memory b, address owner) public view returns (address newGame) {
         _requireOwners(b, owner);
+        _requireBookNamesOldGame(b);
         newGame = newGameAddress(b);
         require(newGame.code.length != 0, "PHASE3: run phase 1 first");
         require(ChallengeGame(newGame).owner() == owner, "PHASE3: new game owner");
@@ -218,37 +259,37 @@ contract UpgradeV1ToV2 is ScriptBase {
         }
     }
 
+    /// @notice After phase 3: vault creation is free (ERC-8004 identity still required), any registered agent
+    ///         proposes and co-proposes, and each vault's own `openDeposits` decides who deposits.
+    function openProtocol(Book memory b, address owner) public {
+        _requireOwners(b, owner);
+        require(IV1Live(b.ledger).coverageFreezer() == newGameAddress(b), "OPEN: run phase 3 first");
+        SyndicateFactory f = SyndicateFactory(b.factory);
+        if (f.creationFee() != 0) f.setCreationFee(address(f.creationFeeToken()), 0, f.creationFeeRecipient());
+        if (f.ownerOnlyProposals()) f.setOwnerOnlyProposals(false);
+        if (f.depositsRestricted()) f.setDepositsRestricted(false);
+        postOpenProtocol(b);
+    }
+
     // ── Post-checks (runbook §7) ──
 
-    function postPhase1(
-        Book memory b,
-        Deployed memory d,
-        address owner,
-        uint256 minVoting,
-        uint256 minCooldown,
-        uint256 minReview,
-        RegistrySnapshot memory before
-    ) public view {
-        require(GovernorBeacon(b.beacon).implementation() == d.govImpl, "POST1: beacon impl");
-        require(_registryImpl(b.registry) == d.regImpl, "POST1: registry impl");
-        SyndicateGovernor served = SyndicateGovernor(d.govImpl);
-        require(
-            served.MIN_VOTING_PERIOD() == minVoting && served.MIN_COOLDOWN_PERIOD() == minCooldown,
-            "POST1: governor floors moved"
-        );
-        require(GuardianRegistry(b.registry).minReviewPeriod() == minReview, "POST1: registry floor moved");
-        require(
-            keccak256(abi.encode(before)) == keccak256(abi.encode(_registrySnapshot(b.registry))),
-            "POST1: registry storage moved"
-        );
+    function postOpenProtocol(Book memory b) public view {
+        SyndicateFactory f = SyndicateFactory(b.factory);
+        require(f.creationFee() == 0, "OPEN: creation fee still charged");
+        require(!f.ownerOnlyProposals(), "OPEN: proposals still owner-only");
+        require(!f.depositsRestricted(), "OPEN: deposits still restricted");
+        require(address(f.agentRegistry()) != address(0), "OPEN: ERC-8004 identity gating off");
+        _requireRolesHeldBy(b, newGameAddress(b));
+    }
 
-        ChallengeGame game = ChallengeGame(d.newGame);
-        require(game.owner() == owner, "POST1: new game owner");
-        require(address(game.exposureLedger()) == b.ledger, "POST1: new game ledger");
-        require(address(game.tierRegistry()) == b.tierRegistry, "POST1: new game tier registry");
-        require(address(game.stakedWood()) == address(0), "POST1: new game sWOOD set early");
-        require(game.challengeWindow() == IV1Live(b.ledger).challengeWindow(), "POST1: new game window != ledger");
-        require(game.filingsPaused() == IV1Live(b.oldGame).filingsPaused(), "POST1: filing posture differs");
+    function postPhase1(Book memory b, Deployed memory d, address owner) public view {
+        _requireImpls(b, d);
+        _requireNewGame(b, d.newGame, owner);
+        require(address(ChallengeGame(d.newGame).stakedWood()) == address(0), "POST1: new game sWOOD set early");
+        require(
+            ChallengeGame(d.newGame).filingsPaused() == IV1Live(b.oldGame).filingsPaused(),
+            "POST1: filing posture differs"
+        );
 
         // Until phase 3 every role stays with the old game.
         _requireRolesHeldBy(b, b.oldGame);
@@ -258,15 +299,30 @@ contract UpgradeV1ToV2 is ScriptBase {
     }
 
     function postPhase3(Book memory b, address newGame, address owner) public view {
-        ChallengeGame game = ChallengeGame(newGame);
+        Deployed memory d = deployedAddresses(b);
+        require(newGame == d.newGame, "POST3: not the phase-1 game");
+        _requireImpls(b, d);
+        _requireNewGame(b, newGame, owner);
         _requireRolesHeldBy(b, newGame);
-        require(address(game.stakedWood()) == b.swood, "POST3: new game sWOOD");
-        require(address(game.exposureLedger()) == b.ledger, "POST3: new game ledger");
-        require(address(game.tierRegistry()) == b.tierRegistry, "POST3: new game tier registry");
-        require(game.owner() == owner, "POST3: new game owner");
-        require(game.challengeWindow() == IV1Live(b.ledger).challengeWindow(), "POST3: new game window != ledger");
+        require(address(ChallengeGame(newGame).stakedWood()) == b.swood, "POST3: new game sWOOD");
         require(IV1Live(b.ledger).frozenCoverageCount() == 0, "POST3: a key is frozen");
         _requireWiringKept(b);
+    }
+
+    /// @dev §7 rows 1-2: the beacon and the registry proxy serve the v2 impls.
+    function _requireImpls(Book memory b, Deployed memory d) internal view {
+        require(GovernorBeacon(b.beacon).implementation() == d.govImpl, "POST: beacon impl");
+        require(_registryImpl(b.registry) == d.regImpl, "POST: registry impl");
+    }
+
+    function _requireNewGame(Book memory b, address game, address owner) internal view {
+        ChallengeGame g = ChallengeGame(game);
+        require(g.owner() == owner, "new game: owner");
+        require(address(g.wood()) == b.wood, "new game: WOOD");
+        require(address(g.exposureLedger()) == b.ledger, "new game: ledger");
+        require(address(g.tierRegistry()) == b.tierRegistry, "new game: tier registry");
+        require(g.challengeWindow() == IV1Live(b.oldGame).challengeWindow(), "new game: window != old game");
+        require(g.challengeWindow() == IV1Live(b.ledger).challengeWindow(), "new game: window != ledger");
     }
 
     function _requireRolesHeldBy(Book memory b, address game) internal view {
@@ -316,6 +372,21 @@ contract UpgradeV1ToV2 is ScriptBase {
         return Create3Factory(b.create3).addressOf(GAME_SALT);
     }
 
+    /// @notice Every phase-1 address is CREATE3, so it is known before, during and after the broadcast.
+    function deployedAddresses(Book memory b) public view returns (Deployed memory d) {
+        Create3Factory c3 = Create3Factory(b.create3);
+        d.govImpl = c3.addressOf(GOVERNOR_IMPL_SALT);
+        d.regImpl = c3.addressOf(REGISTRY_IMPL_SALT);
+        d.vaultImpl = c3.addressOf(VAULT_IMPL_SALT);
+        d.newGame = c3.addressOf(GAME_SALT);
+    }
+
+    function _deployOnce(Book memory b, bytes32 salt, bytes memory initcode) internal {
+        address target = Create3Factory(b.create3).addressOf(salt);
+        if (target.code.length != 0) return;
+        require(Create3Factory(b.create3).deploy(salt, initcode) == target, "PHASE1: CREATE3 address drift");
+    }
+
     /// @dev Global precondition of runbook §3: `owner()` (not `pendingOwner()`) is the caller everywhere.
     function _requireOwners(Book memory b, address owner) internal view {
         require(owner != address(0), "owner unset");
@@ -329,6 +400,11 @@ contract UpgradeV1ToV2 is ScriptBase {
         _requireOwner("TokenCourt", b.court, owner);
         _requireOwner("StrategyFactory", b.strategyFactory, owner);
         _requireOwner("Create3Factory", b.create3, owner);
+    }
+
+    /// @dev A book already edited to the v2 game would make every old-game check read the new game.
+    function _requireBookNamesOldGame(Book memory b) internal view {
+        require(b.oldGame != newGameAddress(b), "book CHALLENGE_GAME already points at the v2 game");
     }
 
     function _requireOwner(string memory label, address target, address owner) internal view {
