@@ -5,8 +5,9 @@ to `post-audit-v2`. Source: the internal review of 2026-10-01.
 The guards this runbook relies on are pinned by
 `test/guardian/Upgrade_keepLedgerRotateGame.t.sol`.
 
-There is no migration script. Every call below is a Safe transaction unless the
-caller column says otherwise. "Old game" is the live v1 `ChallengeGame`; "new game"
+Every call below is a Safe transaction unless the caller column says otherwise. On 4663
+every contract is owned by the deployer EOA, not a Safe; §9 runs the same steps from that
+key with `script/robinhood-mainnet/UpgradeV1ToV2.s.sol`. "Old game" is the live v1 `ChallengeGame`; "new game"
 is the v2 `ChallengeGame` deployed in step 1.
 
 ---
@@ -19,7 +20,7 @@ is the v2 `ChallengeGame` deployed in step 1.
 | `GuardianRegistry` | Upgrade in place: `upgradeToAndCall` (UUPS) | Storage layout unchanged; no `reinitializer` needed |
 | `SyndicateFactory` | None | Byte-identical between the two versions |
 | `StakedWood` | None | Differs only in comments |
-| `SyndicateVault` | None | The Safe cannot: `upgradeVault` is creator-only and needs `upgradesEnabled`. Not needed: v1 and v2 vaults behave the same |
+| `SyndicateVault` | §9 seats a v2 impl on the factory and enables upgrades; creators opt in | The owner cannot upgrade a live vault: `upgradeVault` is creator-only. v1 and v2 storage layouts are identical |
 | `ChallengeGame` | **Deploy new**, under a NEW CREATE3 salt, on the existing ledger | v2 game is a rewrite; it is not a proxy |
 | `ExposureLedger` | **KEEP the v1 instance** | See below |
 | `ProposerBondEscrow` | **KEEP the v1 instance** | Its ledger is immutable; a new escrow would need a new ledger |
@@ -196,7 +197,7 @@ Morpho market id a live strategy holds.
 - Do not set the factory's `exposureLedger` to zero (§2.3).
 - Do not call `ledger.setCoverageFreezer` while any old-game challenge is live or any
   `oldGame.challengeableUntil` is in the future.
-- Do not split step 5 across transactions.
+- Do not split step 5 across transactions while old-game filings are open (§9).
 - Do not run `DeployAll`, `DeployPlanD` or `verify-robinhood.sh` against the live chain
   as part of this migration (§2.5, §2.6).
 
@@ -230,3 +231,39 @@ new game address by hand; the salt-derived tooling still points at the old one.
 The pinned tests use a v2 game standing in for the live v1 game. The behaviour of the
 v1 game and `TokenCourt` during the drain (live-status view, re-arms, court rulings) is
 verified by reading `origin/v1-deploy` source only, not by running v1 bytecode.
+
+## 9. Running it with the deployer key
+
+On 4663 the deployer EOA `0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` owns every contract
+in §3, so there is no Safe batch. `UpgradeV1ToV2.s.sol` runs §3 in three phases. Each phase
+re-checks `owner()` on every contract, reads its addresses from `chains/4663.json`, and runs
+the §7 checks that apply at that point.
+
+| Phase | Entry | Does |
+|---|---|---|
+| 1 | `runPhase1()` | Steps 1a–3. Implementation arguments come from the live implementations. Deploys the new game at `sherwood.robinhood.v2.challenge-game` (owner: deployer) and copies the old game's `filingsPaused`. Also seats a v2 `SyndicateVault` impl and `setUpgradesEnabled(true)`: the v1 and v2 storage layouts are identical, and creators opt in through `upgradeVault` |
+| 2 | `runPhase2()` | §4 option A: `oldGame.setFilingsPaused(true)`. No-op if already paused (it was on 2026-11-06) |
+| 3 | `runPhase3()` | Refuses unless old filings are paused and 5(a)–(c) hold for every executed proposal. Then step 5 as four transactions, each skipped if already applied, so a re-run resumes |
+
+```
+forge script script/robinhood-mainnet/UpgradeV1ToV2.s.sol:UpgradeV1ToV2 --sig "runPhase1()" \
+  --rpc-url "$ROBINHOOD_RPC_URL" --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94 \
+  --disable-code-size-limit --slow --interactive --broadcast
+```
+
+Drop `--broadcast` for a dry run. Use the same command with `runPhase2()` and `runPhase3()`.
+`--disable-code-size-limit` lets the simulation create the 36.8 KB governor; 4663's limit
+is 98,304. `--interactive` is a flag and takes no value. The script writes nothing to the
+address book. After phase 3, set `CHALLENGE_GAME` to the new game by hand (§7).
+
+**Step 5 without the batch.** §3 asks for one transaction because a `file` landing between
+the slasher grant and the freezer rotation wedges the freezer call. Old filings are paused
+before phase 3, so that `file` reverts with `FilingsPaused`. A filing on the new game reverts
+with `ZeroAddress` until `setStakedWood` runs, and with `NotCoverageFreezer` until the
+freezer rotation runs, even when the new game is unpaused. No challenge exists on either
+game, so `resolve`, `dispute` and `TokenCourt.refer` have nothing to act on, and nothing else
+can freeze a key or re-arm a window. Pinned on a 4663 fork by
+`test/fork/UpgradeV1ToV2Fork.t.sol`:
+`test_fork_gap_noFilingLandsBetweenRotationSteps` (no filing lands in any gap, with the new
+game unpaused), `test_fork_gap_openOldFilingsWedgeFreezerRotation` (the hazard when old
+filings are open), and `test_fork_gap_phase3RefusesWhileOldFilingsOpen`.
